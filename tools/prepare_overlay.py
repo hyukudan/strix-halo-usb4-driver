@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -26,14 +27,20 @@ def materialize(output: Path, repo: Path = REPO) -> None:
     with tempfile.TemporaryDirectory(prefix='.usb4-', dir=output.parent) as tmp:
         tree = Path(tmp) / 'source'
         shutil.copytree(repo / 'overlay', tree)
+        # Never inherit a surrounding repository: git apply otherwise silently
+        # skips these paths when output is a subdirectory of the checkout.
+        env = os.environ.copy()
+        for key in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'):
+            env.pop(key, None)
+        env['GIT_CEILING_DIRECTORIES'] = str(tree.parent)
         for name in (repo / 'patches/audit-series').read_text().splitlines():
             if not name or name.startswith('#'):
                 continue
             if Path(name).name != name:
                 raise ValueError(f'Invalid patch name: {name}')
             patch = repo / 'patches' / name
-            subprocess.run(['git', 'apply', '--check', str(patch)], cwd=tree, check=True)
-            subprocess.run(['git', 'apply', '--whitespace=error-all', str(patch)], cwd=tree, check=True)
+            subprocess.run(['git', 'apply', '--check', str(patch)], cwd=tree, env=env, check=True)
+            subprocess.run(['git', 'apply', '--whitespace=error-all', str(patch)], cwd=tree, env=env, check=True)
         shutil.move(str(tree), str(output))
     print(f'Audited overlay: {output}')
 

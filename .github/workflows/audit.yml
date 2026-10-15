@@ -1,5 +1,9 @@
 name: USB4 audit validation
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -11,7 +15,7 @@ jobs:
         with:
           persist-credentials: false
       - run: python3 tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source"
-      - run: python3 tests/test_audit.py
+      - run: python3 -m unittest discover -s tests -v
         env:
           USB4_SOURCE_TREE: ${{ runner.temp }}/usb4-source
   kernel-objects:
