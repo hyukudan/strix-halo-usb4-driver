@@ -1,0 +1,39 @@
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -66,4 +66,5 @@
+ static void sgu_fence_free(struct dma_fence *fence)
+ {
+-    kfree(container_of(fence, struct sgu_dma_fence, base));
++    /* base is the first member; reservation readers require an RCU grace period. */
++    dma_fence_free(fence);
+ }
+@@ -495,3 +496,10 @@
+     ctx->lifetime.paths_removed = !ctx->armed;
+-    if (!sgu_controller_stopped(&ctx->lifetime))
++    /* tb_ring_stop() can return early while the NHI is going away. Callback
++     * accounting alone must not authorise freeing an enabled DMA ring. */
++    if (sgu_ring_running(sdev->tx_ring.ring) ||
++        sgu_ring_running(sdev->rx_ring.ring)) {
++        ctx->lifetime.stop_confirmed = 0;
+         WRITE_ONCE(ctx->failed, true);
++    } else if (!sgu_controller_stopped(&ctx->lifetime)) {
++        WRITE_ONCE(ctx->failed, true);
++    }
+diff --git a/drivers/thunderbolt/gpu_stream_logic.h b/drivers/thunderbolt/gpu_stream_logic.h
+--- a/drivers/thunderbolt/gpu_stream_logic.h
++++ b/drivers/thunderbolt/gpu_stream_logic.h
+@@ -6,4 +6,4 @@
+ #include <linux/string.h>
+ #else
+-#include "strix/linux_direct_gpu_stream_uapi.h"
++#include <linux/strix_gpu_stream.h>
+ #include <string.h>
+diff --git a/include/uapi/linux/strix_gpu_stream.h b/include/uapi/linux/strix_gpu_stream.h
+--- a/include/uapi/linux/strix_gpu_stream.h
++++ b/include/uapi/linux/strix_gpu_stream.h
+@@ -116,2 +116,3 @@
+  * RX_REPOST physically enqueues the slots; RETIRE keeps standby DMA retained.
+- * The next RX PREPARE drains/rearms standby slots before changing geometry. */
++ * The next RX PREPARE must preserve pool_offset and payload frame count.
++ * Changed slot geometry requires STOP/RELEASE and a coordinated fresh import. */
