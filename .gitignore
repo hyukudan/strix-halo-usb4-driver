@@ -1,0 +1,14 @@
+/build/
+/linux-*/
+*.ko
+*.o
+*.a
+*.cmd
+*.mod
+*.mod.c
+*.pem
+*.key
+*.priv
+Module.symvers
+modules.order
+__pycache__/

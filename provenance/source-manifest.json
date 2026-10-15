@@ -1,0 +1,99 @@
+{
+  "schema": "strix-halo-usb4-driver-source-backup-v1",
+  "capture_date": "2026-10-16",
+  "upstream": {
+    "repository": "https://github.com/torvalds/linux",
+    "commit": "72d3fcf802c45d00b300f25b848a93c3a2bd7c7e",
+    "archive_sha256": "f265c0eeb342d2f697c0ede885dcca5292e89bd6100ea3265fed409c589e537d"
+  },
+  "source_state": "extracted-tree-with-local-changes-no-git",
+  "comparison_scope": [
+    "drivers/thunderbolt/**",
+    "drivers/net/thunderbolt/**",
+    "include/linux/thunderbolt.h",
+    "include/uapi/linux/strix_gpu_stream.h"
+  ],
+  "modified_files": [
+    {
+      "path": "drivers/thunderbolt/Kconfig",
+      "upstream_sha256": "e9217e080dd7e3ec3f33a0225d6134581de9a2c2fd4799527c7cba6dc4dc7004",
+      "snapshot_sha256": "6355ef333de527a968aa029e143588303e4742daaa5b55ebae88077fe1916d40",
+      "bytes": 3121
+    },
+    {
+      "path": "drivers/thunderbolt/domain.c",
+      "upstream_sha256": "ee653e2f49143f5844bb823b6d7af043c3db13e89d027a205144e8f4f7719823",
+      "snapshot_sha256": "0eee4613cb197c09271193e28bce5e81f222b3e533d0ccd01f8a5a99886781a0",
+      "bytes": 21960
+    },
+    {
+      "path": "drivers/thunderbolt/gpu_stream.c",
+      "upstream_sha256": null,
+      "snapshot_sha256": "07d0d621960d13b9720aa7a51c284f779eea2a5dd9be31a5e6745f0fc995475f",
+      "bytes": 36344
+    },
+    {
+      "path": "drivers/thunderbolt/gpu_stream.h",
+      "upstream_sha256": null,
+      "snapshot_sha256": "5e0bb2dc1e5dec37c5ada597096f420e8d9c5e523694e298dae7a5c595153dd0",
+      "bytes": 629
+    },
+    {
+      "path": "drivers/thunderbolt/gpu_stream_logic.h",
+      "upstream_sha256": null,
+      "snapshot_sha256": "f5acd26c6d0bdcb372afc86b20ab8228ac05c8fe42408269563fa2e59603ad32",
+      "bytes": 4867
+    },
+    {
+      "path": "drivers/thunderbolt/nhi.c",
+      "upstream_sha256": "84c45cb3082dd0eadd316c52d20bac63e320fe1316e7ebe56125a00dcd4a58da",
+      "snapshot_sha256": "6a83947ff5f2676feaad54f0e56f8863e7b7b458758e7350f5df5ccd1fc5ebd9",
+      "bytes": 33370
+    },
+    {
+      "path": "drivers/thunderbolt/nhi.h",
+      "upstream_sha256": "b753cec7956bf0191f0ef31f056fc778e04e2efce0a51bf38f2b54075ac4b592",
+      "snapshot_sha256": "f0026407a0005510e34cb331dba9b4a360bb93bdb5c63cd0cec0f2273fdc1e5c",
+      "bytes": 5122
+    },
+    {
+      "path": "drivers/thunderbolt/nhi_regs.h",
+      "upstream_sha256": "9cea99e2a9d6881bdec51e9bf8d8eb554bf8bdb2c14d6e2b5c4d4057606745db",
+      "snapshot_sha256": "e98150dae51b46c1d83d92c0de0fe2b925e61e220a1a14d8cd200a153fc81e45",
+      "bytes": 5065
+    },
+    {
+      "path": "drivers/thunderbolt/pci.c",
+      "upstream_sha256": "a5f4dc546a601d36d929a7001e34720f935bee80ff683f091cc02dcbbf33be80",
+      "snapshot_sha256": "6a0269d971c416f3021b6b14176c776e81bd0fe42018ae559458007520c1d650",
+      "bytes": 17702
+    },
+    {
+      "path": "drivers/thunderbolt/stream.c",
+      "upstream_sha256": "94598012d67f3225af3b572fc7f1ee5471daa00e1c0a4752cac908b1b0d7251d",
+      "snapshot_sha256": "7941c0d1804d54df0344e2106a8b0447e74ac58e023bb79547cf4284cb3344fc",
+      "bytes": 49832
+    },
+    {
+      "path": "drivers/thunderbolt/tunnel.c",
+      "upstream_sha256": "0e15c2dce494b3563adfdad28561540d359b38903c9e996695732c96444c8127",
+      "snapshot_sha256": "e8a4223cf576a8e887a89a2c4c7599492bd44dbb60d3479145874861cf2fb7f6",
+      "bytes": 69679
+    },
+    {
+      "path": "drivers/thunderbolt/xdomain.c",
+      "upstream_sha256": "950c098bc989c44e44b3ad1e14b145fd847a0232b40c618e6ae7077bf90453d5",
+      "snapshot_sha256": "49ae496967aa5c324782f5572094ca7a6a817b20cb1bbde674e310d990d61a38",
+      "bytes": 72017
+    },
+    {
+      "path": "include/uapi/linux/strix_gpu_stream.h",
+      "upstream_sha256": null,
+      "snapshot_sha256": "ad0a6f8ac017a6224b09950ce0c356c1ead1441b9bca72b3428361bb41084249",
+      "bytes": 5453
+    }
+  ],
+  "combined_patch_sha256": "3e1df1d15b0a9049d8ef1dcddcf42ae4ce04c9f92f5a184eeb024c9e58035f83",
+  "excluded": "Build artifacts, editor/revert backups, complete upstream tree, credentials, keys and private logs",
+  "build_or_runtime_validation_performed": false
+}
