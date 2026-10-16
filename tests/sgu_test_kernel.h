@@ -29,6 +29,22 @@ typedef unsigned int __poll_t;
 typedef int poll_table;
 #define __user
 #define GFP_KERNEL 0
+static _Thread_local unsigned signalling_depth;
+static bool dma_fence_begin_signalling(void) { ++signalling_depth; return true; }
+static void dma_fence_end_signalling(bool cookie) { assert(cookie && signalling_depth); --signalling_depth; }
+#define lockdep_assert_held(lock) ((void)(lock))
+#define CAP_SYS_ADMIN 21
+static bool admin = true;
+static bool capable(int capability) { assert(capability == CAP_SYS_ADMIN); return admin; }
+#define WQ_UNBOUND 1
+#define WQ_MEM_RECLAIM 2
+struct workqueue_struct { int placeholder; };
+static int workqueues;
+static struct workqueue_struct *alloc_workqueue(const char *name, unsigned flags, int n) {
+    (void)name; (void)n; assert((flags & WQ_MEM_RECLAIM) && !signalling_depth);
+    struct workqueue_struct *w = calloc(1, sizeof(*w)); if (w) ++workqueues; return w;
+}
+static void destroy_workqueue(struct workqueue_struct *w) { assert(w && workqueues > 0); --workqueues; free(w); }
 #define NSEC_PER_MSEC 1000000ULL
 #define U64_MAX (~(u64)0)
 #define ERESTARTSYS 512
@@ -59,8 +75,11 @@ static int kstrtouint(const char *s, unsigned int base, unsigned int *out) {
     *out=v; return 0;
 }
 static int alloc_fail_after=-1;
+static void (*allocation_hook)(void);
 static void *kzalloc(size_t n, int flags) {
     (void)flags;
+    assert(!signalling_depth);
+    if (allocation_hook) allocation_hook();
     if (alloc_fail_after==0) { alloc_fail_after=-1; return NULL; }
     if (alloc_fail_after>0) --alloc_fail_after;
     return calloc(1,n);
@@ -152,7 +171,11 @@ static void dma_fence_free(struct dma_fence *f) { free(f); }
 static void dma_fence_put(struct dma_fence *f) { if(f&&atomic_fetch_sub(&f->refs,1)==1)f->ops->release(f); }
 static bool dma_fence_is_signaled(struct dma_fence *f) { return atomic_load(&f->signaled); }
 static void dma_fence_set_error(struct dma_fence *f,int err) { assert(!dma_fence_is_signaled(f));f->error=err; }
-static int dma_fence_signal(struct dma_fence *f) { return atomic_exchange(&f->signaled,true)?-EINVAL:0; }
+static void (*signal_hook)(struct dma_fence *);
+static int dma_fence_signal(struct dma_fence *f) {
+    if (signal_hook) signal_hook(f);
+    return atomic_exchange(&f->signaled,true)?-EINVAL:0;
+}
 static long dma_fence_wait_timeout(struct dma_fence *f,bool interruptible,unsigned long ticks) {
     unsigned long until=jiffies+ticks;long ret=0;(void)interruptible;
     atomic_fetch_add(&fence_waiters,1);
@@ -168,7 +191,7 @@ static u64 dma_fence_context_alloc(unsigned n) { u64 v=next_fence_context;next_f
 enum dma_resv_usage { DMA_RESV_USAGE_KERNEL, DMA_RESV_USAGE_WRITE, DMA_RESV_USAGE_READ, DMA_RESV_USAGE_BOOKKEEP };
 struct dma_resv { struct mutex lock; unsigned count; struct dma_fence *fences[64];enum dma_resv_usage usages[64]; };
 struct dma_resv_iter { struct dma_resv *resv; unsigned index;enum dma_resv_usage usage; };
-static bool dma_resv_trylock(struct dma_resv *r) { return mutex_trylock(&r->lock); }
+static bool dma_resv_trylock(struct dma_resv *r) { assert(!signalling_depth); return mutex_trylock(&r->lock); }
 static void dma_resv_unlock(struct dma_resv *r) { mutex_unlock(&r->lock); }
 static int reserve_fail;
 static int dma_resv_reserve_fences(struct dma_resv *r,unsigned n) { (void)n;if(reserve_fail){reserve_fail=0;return -ENOMEM;}return r->count<64?0:-ENOMEM; }
@@ -241,7 +264,7 @@ static void uuid_gen(uuid_t *u) { static u32 n=1;memset(u,0,sizeof(*u));memcpy(u
 struct tb_ring;
 struct ring_frame { struct list_head list;dma_addr_t buffer_phy;unsigned flags,sof,eof,size;void (*callback)(struct tb_ring *,struct ring_frame *,bool); };
 struct tb_nhi { struct device dev; };
-struct tb_ring { spinlock_t lock;bool running,is_tx;unsigned hop,size;struct list_head queue;struct tb_nhi *nhi; };
+struct tb_ring { struct work_struct work; spinlock_t lock;bool running,is_tx;unsigned hop,size;struct list_head queue;struct tb_nhi *nhi; };
 #define RING_DESC_CRC_ERROR 1U
 #define RING_DESC_BUFFER_OVERRUN 2U
 #define RING_FLAG_FRAME 1U
@@ -267,6 +290,12 @@ static void tb_ring_stop(struct tb_ring *r) {
         list_del_init(&f->list);f->callback(r,f,true);
     }
 }
+static bool flush_work(struct work_struct *work) {
+    struct tb_ring *ring = container_of(work, struct tb_ring, work);
+    if (!ring->running && !stop_fails)
+        tb_ring_stop(ring);
+    return true;
+}
 static void tb_ring_free(struct tb_ring *r) { assert(!r->running&&list_empty(&r->queue));pthread_mutex_destroy(&r->lock.m);free(r); }
 static int tb_ring_throttling(struct tb_ring *r,unsigned interval) { (void)r;(void)interval;return 0; }
 static int enqueue_fail;
@@ -282,13 +311,21 @@ struct tb_xdomain { struct tb *tb;uuid_t *local_uuid,*remote_uuid;struct device 
 struct tb_service { struct device dev;struct tb_xdomain *xd; };
 struct tbstream { struct tb_service *svc; };
 struct tbstream_gpu_context;
-struct tbstream_dev { struct mutex lock;struct tbstream *stream;struct { struct tb_ring *ring; } tx_ring,rx_ring;struct tbstream_gpu_context *gpu_context;unsigned ring_size,throttling,in_hopid,out_hopid;bool busy_poll,removed;u64 gpu_last_epoch;int wait,refs; };
+struct tbstream_dev { struct mutex lock;struct tbstream *stream;struct { struct tb_ring *ring; } tx_ring,rx_ring;struct tbstream_gpu_context *gpu_context;unsigned ring_size,throttling,in_hopid,out_hopid;bool busy_poll,removed;u64 gpu_last_epoch;int wait,refs,users; };
 static struct tb_xdomain *tbstream_dev_xdomain(struct tbstream_dev *s) { return s->stream?s->stream->svc->xd:NULL; }
 static struct tbstream *tbstream_get(struct tbstream *s) { return s; }
 static void tbstream_put(struct tbstream *s) { (void)s; }
 static void tbstream_dev_get(struct tbstream_dev *s) { ++s->refs; }
+static void tbstream_dev_put(struct tbstream_dev *s) { assert(s->refs > 0); --s->refs; }
 static int tbstream_dev_valid(struct tbstream_dev *s) { return (!s->stream||s->removed)?-ENODEV:0; }
 static struct tbstream_dev *to_tbstream_dev(void *p) { return p; }
+static int reset_error, reset_calls;
+static int tb_domain_reset_dma(struct tb *tb, struct tb_ring *tx, struct tb_ring *rx) {
+    (void)tb; assert(!signalling_depth);
+    assert(!tx || (!tx->running && list_empty(&tx->queue)));
+    assert(!rx || (!rx->running && list_empty(&rx->queue)));
+    ++reset_calls; return reset_error;
+}
 static int enable_fail,disable_fail;
 static int tb_xdomain_enable_paths(struct tb_xdomain *x,int a,int b,int c,int d) { (void)x;(void)a;(void)b;(void)c;(void)d;return enable_fail?-EIO:0; }
 static int tb_xdomain_disable_paths(struct tb_xdomain *x,int a,int b,int c,int d) { (void)x;(void)a;(void)b;(void)c;(void)d;return disable_fail?-EIO:0; }

@@ -1,0 +1,1176 @@
+diff --git a/drivers/thunderbolt/dma_recovery.c b/drivers/thunderbolt/dma_recovery.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/thunderbolt/dma_recovery.c
+@@ -0,0 +1,199 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Included by domain.c. Explicit, exclusive NHI-v1 DMA recovery, never an
++ * automatic teardown quirk or a host-router/PCI reset. */
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/pci.h>
++#include "nhi.h"
++#include "nhi_regs.h"
++
++#define TB_DMA_INTERFACE_RESET 0x39858
++#define TB_DMA_INTERFACE_RESET_RST BIT(0)
++
++static bool nhi_dma_idle_ring(struct tb_ring *ring)
++{
++	bool idle;
++
++	spin_lock(&ring->lock);
++	idle = !ring->running && list_empty(&ring->queue) &&
++	       list_empty(&ring->in_flight);
++	spin_unlock(&ring->lock);
++	return idle;
++}
++
++/* Paired with the same nhi->lock gate in ring allocation and ring start.
++ * Allocated-but-idle sibling rings are intentionally not considered free. */
++static int nhi_dma_reset_begin(struct tb_nhi *nhi,
++			       struct tb_ring *tx, struct tb_ring *rx)
++{
++	unsigned long flags;
++	unsigned int i;
++	int ret = 0;
++
++	spin_lock_irqsave(&nhi->lock, flags);
++	if (nhi->going_away || nhi->dma_shutdown) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	if (nhi->dma_resetting) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++	if ((tx && (!tx->is_tx || tx->nhi != nhi || tx->hop <= 0 ||
++		    tx->hop >= nhi->hop_count || nhi->tx_rings[tx->hop] != tx)) ||
++	    (rx && (rx->is_tx || rx->nhi != nhi || rx->hop <= 0 ||
++		    rx->hop >= nhi->hop_count || nhi->rx_rings[rx->hop] != rx))) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++	for (i = 1; i < nhi->hop_count; ++i) {
++		struct tb_ring *ring = nhi->tx_rings[i];
++
++		if (ring && (ring != tx || !nhi_dma_idle_ring(ring))) {
++			ret = -EBUSY;
++			goto unlock;
++		}
++		ring = nhi->rx_rings[i];
++		if (ring && (ring != rx || !nhi_dma_idle_ring(ring))) {
++			ret = -EBUSY;
++			goto unlock;
++		}
++	}
++	nhi->dma_resetting = true;
++unlock:
++	spin_unlock_irqrestore(&nhi->lock, flags);
++	return ret;
++}
++
++static void nhi_dma_reset_end(struct tb_nhi *nhi)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&nhi->lock, flags);
++	nhi->dma_resetting = false;
++	spin_unlock_irqrestore(&nhi->lock, flags);
++}
++
++/* Same AMD families as the pinned upstream reset-on-teardown workaround.
++ * Other vendors and unsupported NHI versions must not receive this write. */
++static bool nhi_dma_reset_supported(struct tb_nhi *nhi)
++{
++	struct pci_dev *pdev;
++
++	if (!dev_is_pci(nhi->dev))
++		return false;
++	pdev = to_pci_dev(nhi->dev);
++	if (pdev->vendor != PCI_VENDOR_ID_AMD)
++		return false;
++	switch (pdev->device) {
++	case PCI_DEVICE_ID_AMD_1AH_M60H_NHI0:
++	case PCI_DEVICE_ID_AMD_1AH_M60H_NHI1:
++	case PCI_DEVICE_ID_AMD_1AH_M68H_NHI0:
++	case PCI_DEVICE_ID_AMD_1AH_M68H_NHI1:
++	case PCI_DEVICE_ID_AMD_1AH_M80H_NHI0:
++	case PCI_DEVICE_ID_AMD_1AH_M80H_NHI1:
++	case PCI_DEVICE_ID_AMD_1AH_M80H_NHI2:
++	case PCI_DEVICE_ID_AMD_1AH_M24H_NHI0:
++	case PCI_DEVICE_ID_AMD_1AH_M24H_NHI1:
++	case PCI_DEVICE_ID_AMD_1AH_M70H_NHI0:
++	case PCI_DEVICE_ID_AMD_1AH_M70H_NHI1:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool nhi_dma_control_running(struct tb_nhi *nhi)
++{
++	unsigned long flags;
++	struct tb_ring *tx, *rx;
++	bool running = false;
++
++	spin_lock_irqsave(&nhi->lock, flags);
++	tx = nhi->tx_rings[0];
++	rx = nhi->rx_rings[0];
++	if (tx && rx && !nhi->going_away && !nhi->dma_shutdown) {
++		/* Starts/stops also need nhi->lock; inspect the same-class ring
++		 * locks one at a time instead of nesting two of them. */
++		spin_lock(&tx->lock);
++		running = tx->running;
++		spin_unlock(&tx->lock);
++		spin_lock(&rx->lock);
++		running = running && rx->running;
++		spin_unlock(&rx->lock);
++	}
++	spin_unlock_irqrestore(&nhi->lock, flags);
++	return running;
++}
++
++/**
++ * tb_domain_reset_dma() - Reset an exclusively idle, supported AMD NHI
++ * @tb: Domain whose control channel is restarted over the reset
++ * @tx: Optional caller-owned stopped transmit ring
++ * @rx: Optional caller-owned stopped receive ring
++ *
++ * The caller must serialize its own ring lifetime/start/stop and remove its
++ * DMA paths first. Every other allocated non-control ring causes -EBUSY.
++ * A gate prevents new ring allocations and starts while the domain lock and
++ * runtime-PM reference serialize control-plane/power transitions. Nothing is
++ * forcibly stopped on behalf of another consumer. A failed post-reset read
++ * leaves admission closed until reprobe rather than asserting recovery.
++ */
++int tb_domain_reset_dma(struct tb *tb, struct tb_ring *tx, struct tb_ring *rx)
++{
++	struct tb_nhi *nhi = tb->nhi;
++	struct pci_dev *pdev;
++	u32 caps;
++	int ret;
++
++	if (!nhi_dma_reset_supported(nhi))
++		return -EOPNOTSUPP;
++	pdev = to_pci_dev(nhi->dev);
++	ret = pm_runtime_resume_and_get(nhi->dev);
++	if (ret < 0)
++		return ret;
++	mutex_lock(&tb->lock);
++	if (!device_is_registered(&tb->dev) || !pci_device_is_present(pdev) ||
++	    READ_ONCE(nhi->going_away) || READ_ONCE(nhi->dma_shutdown)) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	caps = ioread32(nhi->iobase + REG_CAPS);
++	if (caps == ~0U || !(caps & 0x3ff)) {
++		ret = -ENODEV;
++		goto unlock;
++	}
++	if (FIELD_GET(REG_CAPS_VERSION_MASK, caps) >= REG_CAPS_VERSION_2) {
++		ret = -EOPNOTSUPP;
++		goto unlock;
++	}
++	ret = nhi_dma_reset_begin(nhi, tx, rx);
++	if (ret)
++		goto unlock;
++
++	/* NHI-v1 reset affects ring registers and E2E credits, not PHY training.
++	 * Control HopID 0 is the only ring permitted to restart inside the gate. */
++	tb_ctl_stop(tb->ctl);
++	iowrite32(TB_DMA_INTERFACE_RESET_RST, nhi->iobase + TB_DMA_INTERFACE_RESET);
++	/* Posted-write flush followed by tHIReset, as in the pinned backend. */
++	ioread32(nhi->iobase + REG_CAPS);
++	usleep_range(10000, 20000);
++	if (!pci_device_is_present(pdev) || ioread32(nhi->iobase + REG_CAPS) != caps) {
++		ret = -EIO;
++		goto unlock; /* Keep dma_resetting: hardware state is not trusted. */
++	}
++	tb_ctl_start(tb->ctl);
++	if (!nhi_dma_control_running(nhi)) {
++		tb_ctl_stop(tb->ctl);
++		ret = -EIO;
++		goto unlock;
++	}
++	nhi_dma_reset_end(nhi);
++	ret = 0;
++unlock:
++	mutex_unlock(&tb->lock);
++	pm_runtime_mark_last_busy(nhi->dev);
++	pm_runtime_put_autosuspend(nhi->dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(tb_domain_reset_dma);
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -13,6 +13,7 @@
+ #include <linux/sched/signal.h>
+ #include <linux/sync_file.h>
+ #include <linux/workqueue.h>
++#include <linux/capability.h>
+ #include "tb.h"
+ #include "nhi.h"
+ #include "gpu_stream_logic.h"
+@@ -46,7 +47,7 @@
+ MODULE_PARM_DESC(gpu_standby_timeout_ms, "GPU legacy RX standby deadline in ms (100..3600000, default 300000)");
+ 
+ enum sgu_op_phase { SGU_OP_EMPTY, SGU_OP_PREPARED, SGU_OP_PENDING,
+-                    SGU_OP_COMPLETE, SGU_OP_TAKEN, SGU_OP_STANDBY };
++                    SGU_OP_COMPLETE, SGU_OP_TAKEN, SGU_OP_STANDBY, SGU_OP_FINISHING };
+ struct sgu_hw_operation;
+ struct sgu_hw_frame {
+     struct ring_frame frame;
+@@ -73,12 +74,17 @@
+     struct dma_fence *fence;
+     enum sgu_op_phase phase;
+     u32 payload_frames, total_frames, remaining, event_cursor, error_flags;
+-    u64 completion_ns, deadline_ns;
++    u64 completion_ns, deadline_ns, submitted_ns;
+     bool event_pending, retired, canceled, reuse_rx;
+ };
+ struct tbstream_gpu_context {
+     struct tbstream_dev *sdev;
+-    spinlock_t lock; /* callbacks never acquire sdev->lock */
++    spinlock_t lock; /* callbacks never acquire either process-context mutex */
++    /* No allocation, user access, reservation wait or path operation under this
++     * mutex. The watchdog deliberately never acquires sdev->lock. */
++    struct mutex dma_lock;
++    struct workqueue_struct *watchdog_wq;
++    struct sgu_stats stats;
+     struct sgu_fence identity;
+     struct sgu_window windows[2];
+     struct sgu_hw_operation operations[2][SGU_MAX_QUEUE_DEPTH];
+@@ -172,12 +178,48 @@
+         *error = op->error_flags ? -EIO : 0; /* unused standby canceled by explicit reconfiguration */
+         return;
+     }
+-    op->phase = SGU_OP_COMPLETE;
++    /* Keep the operation unretirable until the fence has actually signalled. */
++    op->phase = SGU_OP_FINISHING;
+     op->event_cursor = 0;
+-    op->event_pending = true;
++    op->event_pending = false;
+     *signal = dma_fence_get(op->fence);
+     *error = op->error_flags & SGU_FRAME_ERROR_TIMEOUT ? -ETIMEDOUT :
+              op->error_flags ? -EIO : op->canceled ? -ECANCELED : 0;
++}
++
++/* A FINISHING operation cannot be retired/reused by EVENT or PREPARE. STOP
++ * drains the callback source before RELEASE can destroy its storage. */
++static bool sgu_finish_signal(struct tbstream_gpu_context *ctx,
++                             struct sgu_hw_operation *op,
++                             struct dma_fence *signal, int error)
++{
++    unsigned long flags;
++    bool ready = false;
++    u64 elapsed;
++    u32 direction;
++
++    if (!signal)
++        return false;
++    sgu_signal(signal, error);
++    spin_lock_irqsave(&ctx->lock, flags);
++    if (op->phase == SGU_OP_FINISHING) {
++        op->completion_ns = ktime_get_ns();
++        direction = op->request.direction;
++        elapsed = op->completion_ns - op->submitted_ns;
++        ctx->stats.last_dma_ns[direction] = elapsed;
++        if (elapsed > ctx->stats.max_dma_ns[direction])
++            ctx->stats.max_dma_ns[direction] = elapsed;
++        ++ctx->stats.completions[direction];
++        if (error)
++            ++ctx->stats.errors[direction];
++        else
++            ctx->stats.payload_bytes[direction] += op->request.payload_bytes;
++        op->phase = SGU_OP_COMPLETE;
++        op->event_pending = true;
++        ready = true;
++    }
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    return ready;
+ }
+ 
+ static void sgu_callback(struct tb_ring *ring, struct ring_frame *frame, bool canceled)
+@@ -188,7 +230,7 @@
+     struct dma_fence *signal = NULL;
+     unsigned long flags;
+     int error = 0;
+-    bool wake;
++    bool wake, cookie = dma_fence_begin_signalling();
+ 
+     spin_lock_irqsave(&ctx->lock, flags);
+     if (!f->queued || !op || !op->remaining || !sgu_controller_callback(&ctx->lifetime)) {
+@@ -229,11 +271,12 @@
+     /* EVENT is readable only after the whole operation; errors wake early. */
+     wake = READ_ONCE(ctx->failed) || (op && op->event_pending);
+     spin_unlock_irqrestore(&ctx->lock, flags);
+-    sgu_signal(signal, error);
++    wake |= sgu_finish_signal(ctx, op, signal, error);
+     if (wake)
+         wake_up_interruptible_poll(&ctx->sdev->wait, EPOLLIN | EPOLLRDNORM | EPOLLERR);
+     if (READ_ONCE(ctx->failed) && !READ_ONCE(ctx->closing))
+-        mod_delayed_work(system_wq, &ctx->watchdog, 0);
++        mod_delayed_work(ctx->watchdog_wq, &ctx->watchdog, 0);
++    dma_fence_end_signalling(cookie);
+ }
+ 
+ static void sgu_window_free(struct sgu_window *w)
+@@ -365,7 +408,7 @@
+ }
+ 
+ static int sgu_publish_fence(struct tbstream_gpu_context *ctx, struct sgu_hw_operation *op,
+-                             struct dma_fence **dependency)
++                             bool standby, struct dma_fence **dependency, bool *cookie)
+ {
+     struct dma_resv *resv = ctx->windows[op->request.direction].buffer->resv;
+     struct sgu_dma_fence *f;
+@@ -378,7 +421,6 @@
+     unsigned long flags;
+     int ret;
+ 
+-    /* Never wait on GPU work or the reservation mutex under sdev->lock. */
+     if (!dma_resv_trylock(resv))
+         return -EAGAIN;
+     dma_resv_for_each_fence(&cursor, resv, wait_usage, fence) {
+@@ -403,20 +445,32 @@
+     dma_fence_init(&f->base, &sgu_fence_ops, &f->lock,
+         ctx->fence_context + op->request.direction * SGU_MAX_QUEUE_DEPTH + slot, ++*sequence);
+     ret = dma_resv_reserve_fences(resv, 1);
+-    if (ret) {
+-        dma_fence_put(&f->base);
+-        goto unlock;
+-    }
+-    /* Own slots were checked for overlap at PREPARE and keep independent
+-     * timelines. External readers/writers must still wait for every slot. */
++    if (ret)
++        goto put;
++
++    /* All potentially reclaiming allocation is over. Reserve publication and
++     * the complete descriptor enqueue against watchdog STOP as one transaction.
++     * No completion path acquires resv or sdev->lock in the reverse direction. */
++    mutex_lock(&ctx->dma_lock);
++    spin_lock_irqsave(&ctx->lock, flags);
++    if (READ_ONCE(ctx->failed) || ctx->stopped || !ctx->started || !ctx->armed ||
++        READ_ONCE(ctx->closing) || op->remaining ||
++        op->phase != (standby ? SGU_OP_TAKEN : SGU_OP_PREPARED)) {
++        spin_unlock_irqrestore(&ctx->lock, flags);
++        mutex_unlock(&ctx->dma_lock);
++        ret = -ESHUTDOWN;
++        goto put;
++    }
++    previous = op->fence;
++    op->fence = &f->base;
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    *cookie = dma_fence_begin_signalling();
+     dma_resv_add_fence(resv, &f->base, own_usage);
+     dma_resv_unlock(resv);
+-    spin_lock_irqsave(&ctx->lock, flags);
+-    previous = op->fence;
+-    op->fence = &f->base;
+-    spin_unlock_irqrestore(&ctx->lock, flags);
+     dma_fence_put(previous);
+-    return 0;
++    return 0; /* sgu_enqueue owns dma_lock and the signalling annotation */
++put:
++    dma_fence_put(&f->base);
+ unlock:
+     dma_resv_unlock(resv);
+     return ret;
+@@ -432,13 +486,15 @@
+     LIST_HEAD(frames);
+     int ret, error = 0;
+     u32 i;
+-
+-    ret = sgu_publish_fence(ctx, op, dependency);
++    bool cookie;
++
++    ret = sgu_publish_fence(ctx, op, standby, dependency, &cookie);
+     if (ret)
+         return ret;
+     dma_sync_sgtable_for_device(w->device, w->mapping, w->direction);
+     spin_lock_irqsave(&ctx->lock, flags);
+-    op->deadline_ns = ktime_get_ns() + (u64)(standby ? READ_ONCE(gpu_standby_timeout_ms) :
++    op->submitted_ns = ktime_get_ns();
++    op->deadline_ns = op->submitted_ns + (u64)(standby ? READ_ONCE(gpu_standby_timeout_ms) :
+                                           READ_ONCE(gpu_dma_timeout_ms)) * NSEC_PER_MSEC;
+     op->phase = standby ? SGU_OP_STANDBY : SGU_OP_PENDING;
+     op->remaining = op->total_frames;
+@@ -457,11 +513,14 @@
+         f->frame.size = op->request.direction == SGU_DIRECTION_RX ? 0 :
+                         f->result.expected_bytes == SGU_FRAME_BYTES ? 0 : f->result.expected_bytes;
+     }
++    ++ctx->stats.submissions[op->request.direction];
+     /* Account for the entire operation before any callback can run. */
+     if (!sgu_controller_queue_batch(&ctx->lifetime, op->total_frames)) {
+         ret = -EIO;
+         goto cancel_locked;
+     }
++    if (ctx->lifetime.pending_callbacks > ctx->stats.peak_callbacks)
++        ctx->stats.peak_callbacks = ctx->lifetime.pending_callbacks;
+     for (i = 0; i < op->total_frames; ++i) {
+         struct sgu_hw_frame *f = sgu_frame_at(ctx, op, i);
+ 
+@@ -473,7 +532,9 @@
+     ret = __tb_ring_enqueue_list(ring, &frames);
+     if (!ret) {
+         /* New traffic must not push out an older operation's watchdog. */
+-        queue_delayed_work(system_wq, &ctx->watchdog, msecs_to_jiffies(100));
++        queue_delayed_work(ctx->watchdog_wq, &ctx->watchdog, msecs_to_jiffies(100));
++        mutex_unlock(&ctx->dma_lock);
++        dma_fence_end_signalling(cookie);
+         return 0;
+     }
+ 
+@@ -499,9 +560,11 @@
+     op->remaining = 0;
+     sgu_complete_locked(ctx, op, &signal, &error);
+     spin_unlock_irqrestore(&ctx->lock, flags);
+-    sgu_signal(signal, error);
++    sgu_finish_signal(ctx, op, signal, error);
+     wake_up_interruptible_poll(&ctx->sdev->wait, EPOLLIN | EPOLLRDNORM | EPOLLERR);
+-    mod_delayed_work(system_wq, &ctx->watchdog, 0);
++    mod_delayed_work(ctx->watchdog_wq, &ctx->watchdog, 0);
++    mutex_unlock(&ctx->dma_lock);
++    dma_fence_end_signalling(cookie);
+     return ret;
+ }
+ 
+@@ -509,7 +572,7 @@
+ {
+     if (!sgu_fence_equal(fence, &ctx->identity) || !ctx->imported)
+         return -ESTALE;
+-    if (!cleanup && (READ_ONCE(ctx->failed) || ctx->stopped || tbstream_dev_valid(ctx->sdev)))
++    if (!cleanup && (READ_ONCE(ctx->failed) || READ_ONCE(ctx->stopped) || tbstream_dev_valid(ctx->sdev)))
+         return -ESHUTDOWN;
+     return 0;
+ }
+@@ -529,7 +592,13 @@
+     ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+     if (!ctx)
+         return -ENOMEM;
++    ctx->watchdog_wq = alloc_workqueue("tbstream_gpu", WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
++    if (!ctx->watchdog_wq) {
++        kfree(ctx);
++        return -ENOMEM;
++    }
+     ctx->sdev = sdev;
++    mutex_init(&ctx->dma_lock);
+     spin_lock_init(&ctx->lock);
+     ctx->lifetime.stop_confirmed = 1;
+     ctx->lifetime.paths_removed = 1;
+@@ -570,66 +639,87 @@
+     put_device(ctx->xdomain_owner);
+     put_device(ctx->service_owner);
+     tbstream_put(ctx->stream_owner);
++    destroy_workqueue(ctx->watchdog_wq);
+     kfree(ctx);
+     return -ENOMEM;
+ }
+ 
++static void sgu_stop_dma_locked(struct tbstream_gpu_context *ctx)
++{
++    struct tbstream_dev *sdev = ctx->sdev;
++    unsigned long flags;
++    bool running;
++
++    lockdep_assert_held(&ctx->dma_lock);
++    spin_lock_irqsave(&ctx->lock, flags);
++    WRITE_ONCE(ctx->stopped, true);
++    WRITE_ONCE(ctx->started, false);
++    ++ctx->stats.dma_stops;
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    if (sgu_ring_running(sdev->tx_ring.ring))
++        tb_ring_stop(sdev->tx_ring.ring);
++    if (sgu_ring_running(sdev->rx_ring.ring))
++        tb_ring_stop(sdev->rx_ring.ring);
++    /* Zero counters/running=false do not replace joining a callback that
++     * has already removed its final descriptor but is still signalling. */
++    flush_work(&sdev->tx_ring.ring->work);
++    flush_work(&sdev->rx_ring.ring->work);
++    running = sgu_ring_running(sdev->tx_ring.ring) || sgu_ring_running(sdev->rx_ring.ring);
++    spin_lock_irqsave(&ctx->lock, flags);
++    ctx->lifetime.stop_confirmed = 0;
++    if (running || !sgu_controller_stopped(&ctx->lifetime))
++        WRITE_ONCE(ctx->failed, true);
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLERR);
++}
++
+ static void tbstream_gpu_stop(struct tbstream_dev *sdev)
+ {
+     struct tbstream_gpu_context *ctx = sdev->gpu_context;
+     struct tb_xdomain *xd;
+     unsigned long flags;
++    bool cookie;
+ 
+     if (!ctx)
+         return;
+-    if (sdev->tx_ring.ring && sgu_ring_running(sdev->tx_ring.ring))
+-        tb_ring_stop(sdev->tx_ring.ring);
+-    if (sdev->rx_ring.ring && sgu_ring_running(sdev->rx_ring.ring))
+-        tb_ring_stop(sdev->rx_ring.ring);
++    cookie = dma_fence_begin_signalling();
++    mutex_lock(&ctx->dma_lock);
++    sgu_stop_dma_locked(ctx);
++    mutex_unlock(&ctx->dma_lock);
++    dma_fence_end_signalling(cookie);
++    /* The worker never takes sdev->lock, so cancellation here cannot deadlock
++     * against user access or an exporter holding a reservation mutex. */
++    cancel_delayed_work_sync(&ctx->watchdog);
+     xd = tbstream_dev_xdomain(sdev);
++    /* Path management may block/allocate. It is NOT needed to signal fences
++     * after the local controller rings and callbacks have been stopped. */
+     if (ctx->armed) {
+         if (!xd || tb_xdomain_disable_paths(xd, sdev->out_hopid, sdev->tx_ring.ring->hop,
+                                             sdev->in_hopid, sdev->rx_ring.ring->hop))
+-            WRITE_ONCE(ctx->failed, true); /* keep path/ring identities retained */
++            WRITE_ONCE(ctx->failed, true);
+         else
+             ctx->armed = false;
+     }
+-    ctx->started = false;
+-    ctx->stopped = true;
+     spin_lock_irqsave(&ctx->lock, flags);
+     ctx->lifetime.paths_removed = !ctx->armed;
+-    /* tb_ring_stop() can return early while the NHI is going away. Callback
+-     * accounting alone must not authorise freeing an enabled DMA ring. */
+-    if (sgu_ring_running(sdev->tx_ring.ring) ||
+-        sgu_ring_running(sdev->rx_ring.ring)) {
+-        ctx->lifetime.stop_confirmed = 0;
+-        WRITE_ONCE(ctx->failed, true);
+-    } else if (!sgu_controller_stopped(&ctx->lifetime)) {
+-        WRITE_ONCE(ctx->failed, true);
+-    }
+-    spin_unlock_irqrestore(&ctx->lock, flags);
+-    cancel_delayed_work(&ctx->watchdog);
+-    wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLERR);
+-}
+-
+-/* Never block on sdev->lock: close cancels this work while holding that mutex. */
++    spin_unlock_irqrestore(&ctx->lock, flags);
++}
++
++/* Mandatory fence progress, independent of the user/control-plane mutex. */
+ static void sgu_watchdog(struct work_struct *work)
+ {
+     struct tbstream_gpu_context *ctx = container_of(to_delayed_work(work),
+                                                    struct tbstream_gpu_context, watchdog);
+-    struct tbstream_dev *sdev = ctx->sdev;
+-    unsigned long flags;
+-    u64 now = ktime_get_ns();
++    unsigned long flags;
++    u64 now;
+     u32 direction, slot, i;
+     bool pending = false, expired = false;
+-
+-    if (!mutex_trylock(&sdev->lock)) {
+-        if (!READ_ONCE(ctx->closing))
+-            mod_delayed_work(system_wq, &ctx->watchdog, msecs_to_jiffies(100));
+-        return;
+-    }
+-    if (ctx->closing || ctx->stopped)
++    bool cookie = dma_fence_begin_signalling();
++
++    mutex_lock(&ctx->dma_lock);
++    if (READ_ONCE(ctx->closing) || ctx->stopped)
+         goto unlock;
++    now = ktime_get_ns();
+     spin_lock_irqsave(&ctx->lock, flags);
+     for (direction = 0; direction < 2; ++direction) {
+         for (slot = 0; slot < ctx->queue_depth; ++slot) {
+@@ -641,6 +731,7 @@
+             if (now < op->deadline_ns)
+                 continue;
+             expired = true;
++            ++ctx->stats.timeouts;
+             op->error_flags |= SGU_FRAME_ERROR_TIMEOUT;
+             for (i = 0; i < op->total_frames; ++i) {
+                 struct sgu_hw_frame *f = sgu_frame_at(ctx, op, i);
+@@ -654,16 +745,15 @@
+         WRITE_ONCE(ctx->failed, true);
+     spin_unlock_irqrestore(&ctx->lock, flags);
+     if (READ_ONCE(ctx->failed)) {
+-        if (expired)
+-            dev_warn(ctx->dma_owner, "GPU stream DMA deadline expired; stopping session, not resetting NHI\n");
+-        /* STOP drains/cancels callbacks. Never signal a still-owned buffer
+-         * merely because a wall-clock deadline expired. */
+-        tbstream_gpu_stop(sdev);
++        /* No sdev mutex, user faults, allocations, resv waits or CM requests.
++         * Never fake DMA completion: an unsuccessful stop retains ownership. */
++        sgu_stop_dma_locked(ctx);
+     } else if (pending) {
+-        mod_delayed_work(system_wq, &ctx->watchdog, msecs_to_jiffies(100));
++        queue_delayed_work(ctx->watchdog_wq, &ctx->watchdog, msecs_to_jiffies(100));
+     }
+ unlock:
+-    mutex_unlock(&sdev->lock);
++    mutex_unlock(&ctx->dma_lock);
++    dma_fence_end_signalling(cookie);
+ }
+ 
+ static bool sgu_can_release(struct tbstream_gpu_context *ctx)
+@@ -694,6 +784,7 @@
+ {
+     u32 direction, slot;
+ 
++    cancel_delayed_work_sync(&ctx->watchdog);
+     for (direction = 0; direction < 2; ++direction)
+         for (slot = 0; slot < SGU_MAX_QUEUE_DEPTH; ++slot)
+             sgu_operation_clear(ctx, &ctx->operations[direction][slot]);
+@@ -708,6 +799,8 @@
+ static void tbstream_gpu_close(struct tbstream_dev *sdev)
+ {
+     struct tbstream_gpu_context *ctx = sdev->gpu_context;
++
++    bool quarantined;
+ 
+     if (!ctx)
+         return;
+@@ -722,6 +815,7 @@
+         }
+         return; /* retain device, stream, module, imports and callback sources */
+     }
++    quarantined = ctx->quarantined;
+     sgu_release_windows(ctx);
+     tb_ring_free(sdev->rx_ring.ring);
+     tb_ring_free(sdev->tx_ring.ring);
+@@ -733,7 +827,13 @@
+     put_device(ctx->xdomain_owner);
+     put_device(ctx->service_owner);
+     tbstream_put(ctx->stream_owner);
++    destroy_workqueue(ctx->watchdog_wq);
+     kfree(ctx);
++    /* File release/configfs recovery holds its own device and module refs. */
++    if (quarantined) {
++        tbstream_dev_put(sdev);
++        module_put(THIS_MODULE);
++    }
+ }
+ 
+ static int sgu_import_windows(struct tbstream_gpu_context *ctx, struct sgu_import *request)
+@@ -775,7 +875,7 @@
+     ctx->identity.import_generation = ++ctx->import_counter;
+     request->fence = ctx->identity;
+     ctx->imported = true;
+-    ctx->stopped = false;
++    WRITE_ONCE(ctx->stopped, false);
+     return 0;
+ free_rx:
+     sgu_window_free(&ctx->windows[SGU_DIRECTION_RX]);
+@@ -792,14 +892,17 @@
+ 
+     if (ctx->started || !xd)
+         return -EBUSY;
++    cancel_delayed_work_sync(&ctx->watchdog);
++    mutex_lock(&ctx->dma_lock);
+     tb_ring_throttling(ctx->sdev->tx_ring.ring, ctx->sdev->throttling);
+     tb_ring_throttling(ctx->sdev->rx_ring.ring, ctx->sdev->throttling);
+     tb_ring_start(ctx->sdev->tx_ring.ring);
+     tb_ring_start(ctx->sdev->rx_ring.ring);
+-    ctx->started = true;
++    WRITE_ONCE(ctx->started, true);
+     spin_lock_irqsave(&ctx->lock, flags);
+     ctx->lifetime.stop_confirmed = 0;
+     spin_unlock_irqrestore(&ctx->lock, flags);
++    mutex_unlock(&ctx->dma_lock);
+     if (!sgu_ring_running(ctx->sdev->tx_ring.ring) || !sgu_ring_running(ctx->sdev->rx_ring.ring)) {
+         WRITE_ONCE(ctx->failed, true);
+         tbstream_gpu_stop(ctx->sdev);
+@@ -835,6 +938,10 @@
+         return -EINVAL;
+     op = &ctx->operations[request->direction][slot];
+     spin_lock_irqsave(&ctx->lock, flags);
++    if (READ_ONCE(ctx->failed) || READ_ONCE(ctx->stopped)) {
++        spin_unlock_irqrestore(&ctx->lock, flags);
++        return -ESHUTDOWN;
++    }
+     if (ctx->queue_depth == 1 && op->phase == SGU_OP_STANDBY && op->retired &&
+         request->direction == SGU_DIRECTION_RX) {
+         if (op->remaining != op->total_frames || READ_ONCE(ctx->failed)) {
+@@ -955,6 +1062,69 @@
+     return ret;
+ }
+ 
++/* Caller owns sdev->lock; only an explicit administrative request gets here.
++ * STOP is separate so a busy controller reset does not silently tear down DMA. */
++static int sgu_reset_controller(struct tbstream_gpu_context *ctx)
++{
++    struct tb_xdomain *xd = tbstream_dev_xdomain(ctx->sdev);
++    unsigned long flags;
++    int ret;
++
++    if (!capable(CAP_SYS_ADMIN))
++        return -EPERM;
++    if (!xd || tbstream_dev_valid(ctx->sdev) ||
++        ctx->sdev->stream != ctx->stream_owner)
++        return -ENODEV;
++    if (!READ_ONCE(ctx->stopped) || !sgu_can_release(ctx))
++        return -EBUSY;
++    ret = tb_domain_reset_dma(xd->tb, ctx->sdev->tx_ring.ring, ctx->sdev->rx_ring.ring);
++    spin_lock_irqsave(&ctx->lock, flags);
++    if (ret)
++        ++ctx->stats.reset_failures;
++    else
++        ++ctx->stats.resets;
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    return ret;
++}
++
++/* A configfs recovery operation holds an item/device reference in addition to
++ * the quarantine's pin. Only proven quiescence authorizes dropping that pin.
++ * Disconnected/unknown controllers fail closed rather than guessing at DMA. */
++static int tbstream_gpu_reap(struct tbstream_dev *sdev, bool reset)
++{
++    struct tbstream_gpu_context *ctx = sdev->gpu_context;
++    struct tb_xdomain *xd = tbstream_dev_xdomain(sdev);
++    int ret;
++
++    lockdep_assert_held(&sdev->lock);
++    if (!capable(CAP_SYS_ADMIN))
++        return -EPERM;
++    if (sdev->users)
++        return -EBUSY;
++    if (!xd || tbstream_dev_valid(sdev))
++        return -ENODEV;
++    if (!ctx)
++        return reset ? tb_domain_reset_dma(xd->tb, NULL, NULL) : -ENOENT;
++    if (!ctx->quarantined || sdev->stream != ctx->stream_owner)
++        return -EBUSY;
++    tbstream_gpu_stop(sdev);
++    if (!sgu_can_release(ctx))
++        return -EIO;
++    if (reset) {
++        ret = sgu_reset_controller(ctx);
++        if (ret)
++            return ret;
++    }
++    tbstream_gpu_close(sdev);
++    return sdev->gpu_context ? -EIO : 0;
++}
++
++static bool tbstream_gpu_quarantined(struct tbstream_dev *sdev)
++{
++    lockdep_assert_held(&sdev->lock);
++    return sdev->gpu_context && sdev->gpu_context->quarantined;
++}
++
+ static int sgu_action_execute(struct tbstream_gpu_context *ctx, unsigned int command,
+                               struct sgu_action *a, struct dma_fence **dependency)
+ {
+@@ -962,18 +1132,30 @@
+     unsigned long flags;
+     bool allowed;
+     int ret = sgu_live(ctx, &a->fence, command == SGU_IOC_STOP || command == SGU_IOC_RELEASE ||
+-                      command == SGU_IOC_CANCEL || command == SGU_IOC_RECOVER);
++                      command == SGU_IOC_CANCEL || command == SGU_IOC_RECOVER || command == SGU_IOC_RESET);
+ 
+     if (ret)
+         return ret;
+     if (a->reserved || a->result || a->queued_frames || a->direction > SGU_DIRECTION_RX)
+         return -EINVAL;
+     if (command == SGU_IOC_ARM || command == SGU_IOC_STOP ||
+-        command == SGU_IOC_RELEASE || command == SGU_IOC_RECOVER) {
++        command == SGU_IOC_RELEASE || command == SGU_IOC_RECOVER || command == SGU_IOC_RESET) {
+         if (a->handle || a->sequence || a->direction)
+             return -EINVAL;
+         if (command == SGU_IOC_ARM)
+             return sgu_arm(ctx);
++        if (command == SGU_IOC_RESET) {
++            ret = sgu_reset_controller(ctx);
++            if (ret)
++                return ret;
++            sgu_release_windows(ctx);
++            WRITE_ONCE(ctx->failed, false);
++            ctx->lifetime.cancel_requested = 0;
++            ctx->requires_new_epoch = true;
++            a->fence = ctx->identity;
++            a->result = SGU_RESULT_CONTROLLER_RESET;
++            return 0;
++        }
+         if (command == SGU_IOC_RECOVER) {
+             if (tbstream_dev_valid(ctx->sdev))
+                 return -ENODEV;
+@@ -1007,10 +1189,12 @@
+     case SGU_IOC_SUBMIT:
+         if (a->sequence <= ctx->submitted_sequence[a->direction])
+             return -ESTALE;
++        mutex_lock(&ctx->dma_lock);
+         spin_lock_irqsave(&ctx->lock, flags);
+-        allowed = ctx->armed && !READ_ONCE(ctx->failed) && op->phase == SGU_OP_PREPARED;
++        allowed = ctx->armed && !ctx->stopped && !READ_ONCE(ctx->failed) && op->phase == SGU_OP_PREPARED;
+         if (!allowed) {
+             spin_unlock_irqrestore(&ctx->lock, flags);
++            mutex_unlock(&ctx->dma_lock);
+             return -EINVAL;
+         }
+         /* Check and transition under the same lock: a standby callback must
+@@ -1020,13 +1204,16 @@
+              * only the next peer-agreed operation identity has changed. */
+             op->reuse_rx = false;
+             op->phase = SGU_OP_PENDING;
+-            op->deadline_ns = ktime_get_ns() + (u64)READ_ONCE(gpu_dma_timeout_ms) * NSEC_PER_MSEC;
++            op->submitted_ns = ktime_get_ns();
++            op->deadline_ns = op->submitted_ns + (u64)READ_ONCE(gpu_dma_timeout_ms) * NSEC_PER_MSEC;
+             ctx->submitted_sequence[a->direction] = a->sequence;
+             a->queued_frames = op->total_frames;
+             spin_unlock_irqrestore(&ctx->lock, flags);
++            mutex_unlock(&ctx->dma_lock);
+             return 0;
+         }
+         spin_unlock_irqrestore(&ctx->lock, flags);
++        mutex_unlock(&ctx->dma_lock);
+         ret = sgu_enqueue(ctx, op, false, dependency);
+         if (!ret) {
+             ctx->submitted_sequence[a->direction] = a->sequence;
+@@ -1040,7 +1227,7 @@
+         ctx->lifetime.cancel_requested = 1;
+         spin_unlock_irqrestore(&ctx->lock, flags);
+         a->result = SGU_RESULT_CANCEL_REQUESTED;
+-        mod_delayed_work(system_wq, &ctx->watchdog, 0);
++        mod_delayed_work(ctx->watchdog_wq, &ctx->watchdog, 0);
+         return 0; /* no pending count changes: cancellation is not a stop */
+     case SGU_IOC_RX_REPOST:
+         if (ctx->queue_depth > 1)
+@@ -1100,6 +1287,13 @@
+         if (!ctx)
+             return -ENXIO;
+         ret = sgu_action_execute(ctx, command, action, &dependency);
++        if (ret == -EAGAIN) {
++            unsigned long flags;
++
++            spin_lock_irqsave(&ctx->lock, flags);
++            ++ctx->stats.dependency_retries;
++            spin_unlock_irqrestore(&ctx->lock, flags);
++        }
+         if (ret != -EAGAIN || (command != SGU_IOC_SUBMIT && command != SGU_IOC_RX_REPOST) ||
+             (file->f_flags & O_NONBLOCK)) {
+             dma_fence_put(dependency);
+@@ -1146,7 +1340,7 @@
+     q.depth = depth;
+     q.maximum_depth = SGU_MAX_QUEUE_DEPTH;
+     q.features = SGU_CAP_MULTI_OP | SGU_CAP_NONBLOCK_SUBMIT | SGU_CAP_SYNC_FILE |
+-                 SGU_CAP_SESSION_RECOVERY | SGU_CAP_DMA_TIMEOUT;
++                 SGU_CAP_SESSION_RECOVERY | SGU_CAP_DMA_TIMEOUT | SGU_CAP_STATS | SGU_CAP_IDLE_RESET;
+     if (copy_to_user(user, &q, sizeof(q)))
+         return -EFAULT;
+     spin_lock_irqsave(&ctx->lock, flags);
+@@ -1175,7 +1369,8 @@
+     if (!op)
+         return -ESTALE;
+     spin_lock_irqsave(&ctx->lock, flags);
+-    if (op->phase != SGU_OP_PENDING && op->phase != SGU_OP_COMPLETE && op->phase != SGU_OP_TAKEN) {
++    if (op->phase != SGU_OP_PENDING && op->phase != SGU_OP_FINISHING &&
++        op->phase != SGU_OP_COMPLETE && op->phase != SGU_OP_TAKEN) {
+         spin_unlock_irqrestore(&ctx->lock, flags);
+         return -EINVAL;
+     }
+@@ -1204,6 +1399,29 @@
+     return 0;
+ }
+ 
++static int sgu_stats_ioctl(struct tbstream_gpu_context *ctx, void __user *user)
++{
++    struct sgu_stats out;
++    unsigned long flags;
++
++    if (copy_from_user(&out, user, sizeof(out)))
++        return -EFAULT;
++    if (memcmp(&out.fence, &ctx->identity, sizeof(out.fence)))
++        return -ESTALE;
++    if (memchr_inv((u8 *)&out + sizeof(out.fence), 0,
++                  sizeof(out) - sizeof(out.fence)))
++        return -EINVAL;
++    spin_lock_irqsave(&ctx->lock, flags);
++    out = ctx->stats;
++    out.fence = ctx->identity;
++    out.monotonic_ns = ktime_get_ns();
++    out.pending_callbacks = ctx->lifetime.pending_callbacks;
++    out.queue_depth = ctx->queue_depth;
++    out.quarantined = ctx->quarantined;
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    return copy_to_user(user, &out, sizeof(out)) ? -EFAULT : 0;
++}
++
+ static long tbstream_gpu_ioctl(struct file *file, unsigned int command, unsigned long argument)
+ {
+     struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+@@ -1233,7 +1451,7 @@
+         memset(&query, 0, sizeof(query));
+         query.fence = ctx->identity;
+         query.state = tbstream_dev_valid(sdev) ? SGU_STATE_DISCONNECTED : READ_ONCE(ctx->failed) ? SGU_STATE_FAILED :
+-                      ctx->stopped ? SGU_STATE_STOPPED : ctx->armed ? SGU_STATE_ARMED : ctx->imported ? SGU_STATE_IMPORTED : SGU_STATE_OPEN;
++                      READ_ONCE(ctx->stopped) ? SGU_STATE_STOPPED : ctx->armed ? SGU_STATE_ARMED : ctx->imported ? SGU_STATE_IMPORTED : SGU_STATE_OPEN;
+         query.frame_bytes = SGU_FRAME_BYTES;
+         query.ring_frames = sdev->ring_size;
+         query.maximum_sg_entries = SGU_MAX_SG_ENTRIES;
+@@ -1274,6 +1492,8 @@
+             ret = -EINVAL;
+         else
+             ret = sgu_prepare_operation(ctx, &request.operation, request.slot);
++    } else if (command == SGU_IOC_STATS) {
++        ret = sgu_stats_ioctl(ctx, user);
+     } else if (command == SGU_IOC_QUEUE) {
+         ret = sgu_queue_ioctl(ctx, user);
+     } else if (command == SGU_IOC_EXPORT_SYNC_FILE) {
+@@ -1282,7 +1502,7 @@
+         ret = sgu_event_ioctl(ctx, user);
+     } else if (command == SGU_IOC_ARM || command == SGU_IOC_SUBMIT || command == SGU_IOC_CANCEL ||
+                command == SGU_IOC_RX_REPOST || command == SGU_IOC_RETIRE || command == SGU_IOC_STOP ||
+-               command == SGU_IOC_RELEASE || command == SGU_IOC_RECOVER) {
++               command == SGU_IOC_RELEASE || command == SGU_IOC_RECOVER || command == SGU_IOC_RESET) {
+         struct sgu_action action;
+ 
+         if (copy_from_user(&action, user, sizeof(action))) {
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -508,6 +508,9 @@
+  * @rx_rings: All Rx rings available on this host controller
+  * @going_away: The host controller device is about to disappear so when
+  *		this flag is set, avoid touching the hardware anymore.
++ * @dma_resetting: Blocks new data-ring allocation/start during explicit reset
++ * @dma_shutdown: Blocks new data rings after domain teardown begins
++ * @dma_wq: Reclaim-capable workqueue for DMA completion and cancellation
+  * @iommu_dma_protection: An IOMMU will isolate external-facing ports.
+  * @interrupt_work: Work scheduled to handle ring interrupt when no
+  *		    MSI-X is used.
+@@ -528,8 +531,12 @@
+ 	struct tb_ring **tx_rings;
+ 	struct tb_ring **rx_rings;
+ 	bool going_away;
++	/* Protected by lock: explicit reset and domain teardown admission gates. */
++	bool dma_resetting;
++	bool dma_shutdown;
+ 	bool iommu_dma_protection;
+ 	struct work_struct interrupt_work;
++	struct workqueue_struct *dma_wq;
+ 	u32 hop_count;
+ 	unsigned long quirks;
+ 	struct completion domain_released;
+diff --git a/include/uapi/linux/strix_gpu_stream.h b/include/uapi/linux/strix_gpu_stream.h
+--- a/include/uapi/linux/strix_gpu_stream.h
++++ b/include/uapi/linux/strix_gpu_stream.h
+@@ -47,6 +47,8 @@
+ #define SGU_CAP_SYNC_FILE 4U
+ #define SGU_CAP_SESSION_RECOVERY 8U
+ #define SGU_CAP_DMA_TIMEOUT 16U
++#define SGU_CAP_STATS 32U
++#define SGU_CAP_IDLE_RESET 64U
+ 
+ /* Observed endpoint identity; import generation zero means no active import. */
+ struct sgu_fence {
+@@ -225,4 +227,39 @@
+ #define SGU_IOC_RECOVER _IOWR(0xb7, 0x4d, struct sgu_action)
+ #define SGU_IOC_PREPARE_SLOT _IOW(0xb7, 0x4e, struct sgu_prepare_slot)
+ 
++/* STATS input: exact current QUERY identity; all following bytes zero.
++ * Counters are cumulative for the open context, including recovery/reimports.
++ * A completion counts a DMA batch (including legacy standby), not a peer ACK.
++ * Durations include local software queueing; byte counters exclude the terminal.
++ */
++struct sgu_stats {
++    struct sgu_fence fence;
++    __aligned_u64 monotonic_ns;
++    __aligned_u64 submissions[2];
++    __aligned_u64 completions[2];
++    __aligned_u64 errors[2];
++    __aligned_u64 payload_bytes[2];
++    __aligned_u64 last_dma_ns[2];
++    __aligned_u64 max_dma_ns[2];
++    __aligned_u64 dependency_retries;
++    __aligned_u64 timeouts;
++    __aligned_u64 dma_stops;
++    __aligned_u64 resets;
++    __aligned_u64 reset_failures;
++    __u32 pending_callbacks;
++    __u32 peak_callbacks;
++    __u32 queue_depth;
++    __u32 quarantined;
++    __aligned_u64 reserved[2];
++};
++#define SGU_IOC_STATS _IOWR(0xb7, 0x4f, struct sgu_stats)
++/* Explicit CAP_SYS_ADMIN operation. Requires STOP and zero local ownership;
++ * rejects any other allocated non-control ring on this NHI, even if idle.
++ * Does not stop other users, force PCI reset, or retrain the physical link.
++ * On success, drops imports and requires a newer peer-agreed connection epoch.
++ * Input/output use the existing sgu_action layout with zero operation fields.
++ */
++#define SGU_RESULT_CONTROLLER_RESET 5U
++#define SGU_IOC_RESET _IOWR(0xb7, 0x50, struct sgu_action)
++
+ #endif
+diff --git a/drivers/thunderbolt/nhi.h b/drivers/thunderbolt/nhi.h
+--- a/drivers/thunderbolt/nhi.h
++++ b/drivers/thunderbolt/nhi.h
+@@ -39,3 +39,4 @@
+ void nhi_shutdown(struct tb_nhi *nhi);
+ int __tb_ring_enqueue_list(struct tb_ring *ring, struct list_head *frames);
++int tb_domain_reset_dma(struct tb *tb, struct tb_ring *tx, struct tb_ring *rx);
+ extern const struct dev_pm_ops nhi_pm_ops;
+diff --git a/drivers/thunderbolt/domain.c b/drivers/thunderbolt/domain.c
+--- a/drivers/thunderbolt/domain.c
++++ b/drivers/thunderbolt/domain.c
+@@ -18,3 +18,4 @@
+ #include "tb.h"
++#include "dma_recovery.c"
+ 
+ static DEFINE_IDA(tb_domain_ida);
+@@ -501,4 +502,7 @@
+ void tb_domain_remove(struct tb *tb)
+ {
+ 	mutex_lock(&tb->lock);
++	spin_lock_irq(&tb->nhi->lock);
++	tb->nhi->dma_shutdown = true;
++	spin_unlock_irq(&tb->nhi->lock);
+ 	if (tb->cm_ops->stop)
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -15,2 +15,3 @@
+ #include <linux/dma-mapping.h>
++#include <linux/dma-fence.h>
+ #include <linux/interrupt.h>
+@@ -293,3 +294,6 @@
+ static void ring_work(struct work_struct *work)
+ {
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	bool cookie = dma_fence_begin_signalling();
++#endif
+ 	struct tb_ring *ring = container_of(work, typeof(*ring), work);
+@@ -342,4 +346,7 @@
+ 	wake_up(&ring->wait);
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	dma_fence_end_signalling(cookie);
++#endif
+ }
+ 
+ int __tb_ring_enqueue(struct tb_ring *ring, struct ring_frame *frame)
+@@ -444,5 +451,5 @@
+ 		ring->start_poll(ring->poll_data);
+ 	} else {
+-		schedule_work(&ring->work);
++		queue_work(ring->nhi->dma_wq, &ring->work);
+ 	}
+ }
+@@ -539,3 +546,7 @@
+ 	spin_lock_irq(&nhi->lock);
+ 
++	if (ring->hop != 0 && (nhi->dma_resetting || nhi->dma_shutdown)) {
++		ret = -EBUSY;
++		goto err_unlock;
++	}
+ 	if (ring->hop < 0) {
+@@ -720,3 +731,5 @@
+ 	if (ring->nhi->going_away)
+ 		goto err;
++	if (ring->hop && (ring->nhi->dma_resetting || ring->nhi->dma_shutdown))
++		goto err;
+ 	if (ring->running) {
+@@ -851,4 +864,4 @@
+-	schedule_work(&ring->work);
++	queue_work(ring->nhi->dma_wq, &ring->work);
+ 	flush_work(&ring->work);
+ }
+ EXPORT_SYMBOL_GPL(tb_ring_stop);
+@@ -1017,3 +1030,3 @@
+-	schedule_work(&nhi->interrupt_work);
++	queue_work(nhi->dma_wq, &nhi->interrupt_work);
+ 	return IRQ_HANDLED;
+ }
+@@ -1253,3 +1266,11 @@
++static void nhi_release_dma_wq(void *data)
++{
++	struct tb_nhi *nhi = data;
++
++	destroy_workqueue(nhi->dma_wq);
++	nhi->dma_wq = NULL;
++}
++
+ int nhi_probe(struct tb_nhi *nhi)
+ {
+ 	struct device *dev = nhi->dev;
+@@ -1280,4 +1301,13 @@
+ 	/* In case someone left them on. */
+ 	nhi_disable_interrupts(nhi);
+ 
++	spin_lock_init(&nhi->lock);
++	nhi->dma_wq = alloc_workqueue("tb_dma", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
++	if (!nhi->dma_wq)
++		return -ENOMEM;
++	/* Register before IRQ acquisition: managed IRQ cleanup runs before this
++	 * action on probe failures, and normal shutdown releases IRQs explicitly. */
++	res = devm_add_action_or_reset(dev, nhi_release_dma_wq, nhi);
++	if (res)
++		return res;
+ 	res = nhi->ops->init_interrupts(nhi);
+@@ -1295,3 +1325 @@
+-	spin_lock_init(&nhi->lock);
+-
+ 	res = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
+diff --git a/drivers/thunderbolt/gpu_stream.h b/drivers/thunderbolt/gpu_stream.h
+--- a/drivers/thunderbolt/gpu_stream.h
++++ b/drivers/thunderbolt/gpu_stream.h
+@@ -10,2 +10,4 @@
+ static bool tbstream_gpu_paths_pending(struct tbstream_dev *sdev);
++static int tbstream_gpu_reap(struct tbstream_dev *sdev, bool reset);
++static bool tbstream_gpu_quarantined(struct tbstream_dev *sdev);
+ static long tbstream_gpu_ioctl(struct file *file, unsigned int command, unsigned long argument);
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -1493,3 +1493,35 @@
+ CONFIGFS_ATTR(tbstream_dev_, throttling);
+ 
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++static ssize_t tbstream_dev_gpu_quarantine_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	guard(mutex)(&sdev->lock);
++	return sysfs_emit(buf, "%u\n", tbstream_gpu_quarantined(sdev));
++}
++CONFIGFS_ATTR_RO(tbstream_dev_, gpu_quarantine);
++
++static ssize_t tbstream_dev_gpu_recover_store(struct config_item *item,
++					     const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++	bool reset;
++	int ret;
++
++	if (sysfs_streq(buf, "reset"))
++		reset = true;
++	else if (sysfs_streq(buf, "reap"))
++		reset = false;
++	else
++		return -EINVAL;
++	guard(mutex)(&sdev->lock);
++	if (!sdev->gpu_direct)
++		return -EOPNOTSUPP;
++	ret = tbstream_gpu_reap(sdev, reset);
++	return ret ? ret : count;
++}
++CONFIGFS_ATTR_WO(tbstream_dev_, gpu_recover);
++#endif
++
+ static struct configfs_attribute *tbstream_dev_attrs[] = {
+@@ -1498,3 +1530,5 @@
+ 	&tbstream_dev_attr_gpu_direct,
++	&tbstream_dev_attr_gpu_quarantine,
++	&tbstream_dev_attr_gpu_recover,
+ #endif
+ 	&tbstream_dev_attr_index,
+@@ -1659,3 +1693,9 @@
+-	/* Notify any task that the underlying group was removed  */
+-	sdev->removed = true;
++	/* Removing configfs must not leave a live GPU DMA lease behind. */
++	scoped_guard(mutex, &sdev->lock) {
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++		if (sdev->gpu_context)
++			tbstream_gpu_disconnect(sdev);
++#endif
++		WRITE_ONCE(sdev->removed, true);
++	}
+ 	wake_up_interruptible_poll(&sdev->wait, EPOLLHUP | EPOLLERR);

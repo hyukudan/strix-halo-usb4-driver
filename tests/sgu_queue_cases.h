@@ -336,6 +336,8 @@ static void test_max_queue_reuse(void) {
     fixture_close(&f);assert(atomic_load(&module_refs)==0);
 }
 
+#include "sgu_recovery_cases.h"
+
 int main(int argc,char **argv) {
     assert(argc==2);
     struct { const char *name; void (*run)(void); } tests[]={
@@ -343,7 +345,13 @@ int main(int argc,char **argv) {
         {"events_legacy",test_events_and_legacy},{"timeout_recovery",test_timeout_recovery},
         {"wait_concurrency",test_wait_concurrency},{"wait_retry_order",test_wait_retry_and_order},
         {"export_lifetime",test_export_lifetime},{"admission_rollback",test_admission_and_rollback},
-        {"watchdog_schedule",test_watchdog_schedule},{"max_queue_reuse",test_max_queue_reuse}};
+        {"watchdog_schedule",test_watchdog_schedule},{"max_queue_reuse",test_max_queue_reuse},
+        {"watchdog_mutex_independence",test_watchdog_mutex_independence},
+        {"fence_precedes_event",test_fence_precedes_event},
+        {"stop_before_publication",test_stop_before_publication},
+        {"quarantine_reaping",test_quarantine_reaping},
+        {"explicit_controller_reset",test_explicit_controller_reset},
+        {"statistics_snapshot",test_statistics_snapshot}};
     for(unsigned i=0;i<sizeof(tests)/sizeof(tests[0]);++i)if(!strcmp(tests[i].name,argv[1])) {
         tests[i].run();printf("PASS %s\n",argv[1]);return 0;
     }

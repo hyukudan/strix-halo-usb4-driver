@@ -11,7 +11,49 @@ import tempfile
 
 REPO = Path(__file__).resolve().parents[1]
 
+
+def copy_additional_base(repo: Path, tree: Path) -> None:
+    """Add hash-pinned upstream files absent from the immutable capture.
+
+    Never replace a captured file. Only explicit, relative manifest paths are
+    copied; symlinks, duplicates, extra/missing files and hash changes fail.
+    """
+    base = repo / 'base'
+    manifest_path = repo / 'provenance/recovery-base.json'
+    if not manifest_path.exists():
+        if base.exists():
+            raise ValueError('Additional base exists without its manifest')
+        return
+    manifest = json.loads(manifest_path.read_text())
+    expected_ref = '72d3fcf802c45d00b300f25b848a93c3a2bd7c7e'
+    if manifest['upstream_ref'] != expected_ref:
+        raise ValueError('Unexpected additional-base upstream revision')
+    files = manifest['files']
+    names = [item['path'] for item in files]
+    if len(set(names)) != len(names):
+        raise ValueError('Duplicate additional-base file')
+    actual = {str(p.relative_to(base)) for p in base.rglob('*') if p.is_file() or p.is_symlink()}
+    if set(names) != actual:
+        raise ValueError('Additional-base inventory mismatch')
+    for item in files:
+        relative = Path(item['path'])
+        if relative.is_absolute() or '..' in relative.parts or not relative.parts:
+            raise ValueError('Invalid additional-base path')
+        source = base / relative
+        if source.is_symlink() or not source.is_file() or base.resolve() not in source.resolve().parents:
+            raise ValueError('Invalid additional-base source')
+        data = source.read_bytes()
+        digest = hashlib.sha1(f'blob {len(data)}\0'.encode() + data).hexdigest()
+        if digest != item['git_blob_sha']:
+            raise ValueError(f'Additional-base hash mismatch: {relative}')
+        target = tree / relative
+        if target.exists():
+            raise ValueError(f'Additional base would overwrite capture: {relative}')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+
 def materialize(output: Path, repo: Path = REPO) -> None:
+    repo = repo.resolve()
     output = output.resolve()
     if output.exists():
         raise ValueError(f"Refusing to overwrite {output}")
@@ -27,6 +69,7 @@ def materialize(output: Path, repo: Path = REPO) -> None:
     with tempfile.TemporaryDirectory(prefix='.usb4-', dir=output.parent) as tmp:
         tree = Path(tmp) / 'source'
         shutil.copytree(repo / 'overlay', tree)
+        copy_additional_base(repo, tree)
         # Never inherit a surrounding repository: git apply otherwise silently
         # skips these paths when output is a subdirectory of the checkout.
         env = os.environ.copy()
