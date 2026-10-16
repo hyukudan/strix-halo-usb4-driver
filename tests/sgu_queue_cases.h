@@ -37,6 +37,7 @@ static void fixture_open(struct fixture *f,unsigned depth,unsigned frames,bool i
     f->stream.svc=&f->svc;f->svc.xd=&f->xd;f->xd.tb=&f->tb;
     f->tb.cm_ops=&f->cm;f->tb.nhi=&f->nhi;f->xd.local_uuid=&f->local;f->xd.remote_uuid=&f->peer;
     f->xd.route=1;f->sb.s_dev=55;
+    f->nhi.dev.bound=true; f->nhi.dev.driver_data=&f->tb;
     assert(tbstream_gpu_open(&f->sdev)==0);
     for(unsigned d=0;d<2;++d) {
         mutex_init(&f->resv[d].lock);
@@ -336,6 +337,11 @@ static void test_max_queue_reuse(void) {
     fixture_close(&f);assert(atomic_load(&module_refs)==0);
 }
 
+#include "sgu_recovery_cases.h"
+#include "sgu_detached_cases.h"
+
+#include "sgu_group_cases.h"
+
 int main(int argc,char **argv) {
     assert(argc==2);
     struct { const char *name; void (*run)(void); } tests[]={
@@ -343,7 +349,23 @@ int main(int argc,char **argv) {
         {"events_legacy",test_events_and_legacy},{"timeout_recovery",test_timeout_recovery},
         {"wait_concurrency",test_wait_concurrency},{"wait_retry_order",test_wait_retry_and_order},
         {"export_lifetime",test_export_lifetime},{"admission_rollback",test_admission_and_rollback},
-        {"watchdog_schedule",test_watchdog_schedule},{"max_queue_reuse",test_max_queue_reuse}};
+        {"watchdog_schedule",test_watchdog_schedule},{"max_queue_reuse",test_max_queue_reuse},
+        {"group_success",test_group_success},{"group_rejections",test_group_rejections},
+        {"group_copy_failure",test_group_copy_failure},
+        {"domain_retirement_open_fds",test_domain_retirement_open_fds},
+        {"domain_retirement_keeps_unproved_dma",test_domain_retirement_keeps_unproved_dma},
+        {"domain_retirement_foreign_domain",test_domain_retirement_foreign_domain},
+        {"domain_retirement_concurrent_poll",test_domain_retirement_concurrent_poll},
+        {"watchdog_mutex_independence",test_watchdog_mutex_independence},
+        {"fence_precedes_event",test_fence_precedes_event},
+        {"stop_before_publication",test_stop_before_publication},
+        {"quarantine_reaping",test_quarantine_reaping},
+        {"explicit_controller_reset",test_explicit_controller_reset},
+        {"statistics_snapshot",test_statistics_snapshot},
+        {"detached_reap",test_detached_reap},
+        {"detached_path_proof",test_detached_path_proof},
+        {"detached_device_guard",test_detached_device_guard},
+        {"detached_reset_rejected",test_detached_reset_rejected}};
     for(unsigned i=0;i<sizeof(tests)/sizeof(tests[0]);++i)if(!strcmp(tests[i].name,argv[1])) {
         tests[i].run();printf("PASS %s\n",argv[1]);return 0;
     }

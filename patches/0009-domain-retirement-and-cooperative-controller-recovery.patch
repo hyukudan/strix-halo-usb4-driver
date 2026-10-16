@@ -1,0 +1,1014 @@
+diff --git a/drivers/net/thunderbolt/dma_recovery.h b/drivers/net/thunderbolt/dma_recovery.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/net/thunderbolt/dma_recovery.h
+@@ -0,0 +1,106 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Included by main.c after struct tbnet. RTNL serializes interface lifecycle,
++ * ring ownership, this registry and the entire close/reset/reopen transaction.
++ * This is a short administrative outage, not a guarantee of packet delivery. */
++#include <linux/notifier.h>
++#include <linux/rtnetlink.h>
++
++#define TBNET_DMA_MAX_CLIENTS 64U
++static LIST_HEAD(tbnet_dma_clients);
++
++static void tbnet_dma_register_device(struct tbnet *net)
++{
++    rtnl_lock();
++    list_add_tail(&net->recovery_node, &tbnet_dma_clients);
++    rtnl_unlock();
++}
++
++static void tbnet_dma_unregister_device(struct tbnet *net)
++{
++    rtnl_lock();
++    list_del_init(&net->recovery_node);
++    rtnl_unlock();
++}
++
++static int tbnet_dma_recovery_notify(struct notifier_block *notifier,
++                                    unsigned long event, void *data)
++{
++    struct tb_dma_reset_request *request = data;
++    struct net_device **up;
++    struct tbnet *net;
++    unsigned int count = 0, closed = 0, i;
++    int ret = 0;
++    bool stop_unproved = false;
++
++    if (event != TB_DMA_GROUP_RECOVERY || request->handled)
++        return NOTIFY_DONE;
++    request->handled = true;
++    if (!rtnl_trylock()) {
++        request->status = -EAGAIN;
++        return NOTIFY_OK;
++    }
++    /* Preflight every candidate before changing a single administrative flag.
++     * Registry and netdev identity cannot change while we retain RTNL. */
++    list_for_each_entry(net, &tbnet_dma_clients, recovery_node) {
++        if (net->xd->tb != request->tb)
++            continue;
++        if (READ_ONCE(net->xd->is_unplugged) ||
++            !netif_device_present(net->dev)) {
++            ret = -ENODEV;
++            goto unlock;
++        }
++        if (netif_running(net->dev) && ++count > TBNET_DMA_MAX_CLIENTS) {
++            ret = -E2BIG;
++            goto unlock;
++        }
++    }
++    up = kcalloc(count ?: 1, sizeof(*up), GFP_KERNEL);
++    if (!up) {
++        ret = -ENOMEM;
++        goto unlock;
++    }
++    list_for_each_entry(net, &tbnet_dma_clients, recovery_node) {
++        if (net->xd->tb != request->tb || !netif_running(net->dev))
++            continue;
++        up[closed++] = net->dev;
++        /* Normal ndo_stop handles NAPI, login/disconnect work, DMA rings and
++         * paths. It is never emulated by merely zeroing a ring pointer. */
++        dev_close(net->dev);
++        if (net->tx_ring.ring || net->rx_ring.ring) {
++            stop_unproved = true;
++            ret = -EBUSY;
++            goto restore;
++        }
++    }
++    ret = request->execute(request);
++restore:
++    /* An attempted but unproved reset leaves interfaces down. A failed ioctl
++     * is not permission to restart DMA onto unknown ring register state. */
++    if (!stop_unproved && (!*request->performed || !ret)) {
++        for (i = 0; i < closed; ++i) {
++            int error = dev_open(up[i], NULL);
++
++            if (!ret && error)
++                ret = error;
++        }
++    }
++    kfree(up);
++unlock:
++    rtnl_unlock();
++    request->status = ret;
++    return NOTIFY_OK;
++}
++
++static struct notifier_block tbnet_dma_lifecycle_notifier = {
++    .notifier_call = tbnet_dma_recovery_notify,
++};
++
++static int tbnet_dma_lifecycle_init(void)
++{
++    return tb_register_dma_recovery_notifier(&tbnet_dma_lifecycle_notifier);
++}
++
++static void tbnet_dma_lifecycle_exit(void)
++{
++    tb_unregister_dma_recovery_notifier(&tbnet_dma_lifecycle_notifier);
++}
+diff --git a/drivers/thunderbolt/dma_recovery.c b/drivers/thunderbolt/dma_recovery.c
+--- a/drivers/thunderbolt/dma_recovery.c
++++ b/drivers/thunderbolt/dma_recovery.c
+@@ -4,6 +4,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/delay.h>
+ #include <linux/pci.h>
++#include <linux/notifier.h>
+ #include "nhi.h"
+ #include "nhi_regs.h"
+ 
+@@ -23,47 +24,77 @@
+ 
+ /* Paired with the same nhi->lock gate in ring allocation and ring start.
+  * Allocated-but-idle sibling rings are intentionally not considered free. */
+-static int nhi_dma_reset_begin(struct tb_nhi *nhi,
+-			       struct tb_ring *tx, struct tb_ring *rx)
+-{
+-	unsigned long flags;
+-	unsigned int i;
+-	int ret = 0;
+-
+-	spin_lock_irqsave(&nhi->lock, flags);
+-	if (nhi->going_away || nhi->dma_shutdown) {
+-		ret = -ENODEV;
+-		goto unlock;
+-	}
+-	if (nhi->dma_resetting) {
+-		ret = -EBUSY;
+-		goto unlock;
+-	}
+-	if ((tx && (!tx->is_tx || tx->nhi != nhi || tx->hop <= 0 ||
+-		    tx->hop >= nhi->hop_count || nhi->tx_rings[tx->hop] != tx)) ||
+-	    (rx && (rx->is_tx || rx->nhi != nhi || rx->hop <= 0 ||
+-		    rx->hop >= nhi->hop_count || nhi->rx_rings[rx->hop] != rx))) {
+-		ret = -EINVAL;
+-		goto unlock;
+-	}
+-	for (i = 1; i < nhi->hop_count; ++i) {
+-		struct tb_ring *ring = nhi->tx_rings[i];
+-
+-		if (ring && (ring != tx || !nhi_dma_idle_ring(ring))) {
+-			ret = -EBUSY;
+-			goto unlock;
+-		}
+-		ring = nhi->rx_rings[i];
+-		if (ring && (ring != rx || !nhi_dma_idle_ring(ring))) {
+-			ret = -EBUSY;
+-			goto unlock;
+-		}
+-	}
+-	nhi->dma_resetting = true;
++/* Every ring in the group is pinned and serialized by its owner. No caller
++ * may provide a pointer obtained by looking in nhi->*_rings without ownership.
++ * Unknown consumers are a veto, never silently converted to participants. */
++static bool nhi_dma_group_contains(struct tb_ring *const *rings,
++                                   unsigned int nrings, struct tb_ring *ring)
++{
++    unsigned int i;
++
++    for (i = 0; i < nrings; ++i)
++        if (rings[i] == ring)
++            return true;
++    return false;
++}
++
++static int nhi_dma_reset_group_begin(struct tb_nhi *nhi,
++                                     struct tb_ring *const *rings,
++                                     unsigned int nrings)
++{
++    unsigned long flags;
++    unsigned int i, j;
++    int ret = 0;
++
++    if (nrings > TB_DMA_RESET_MAX_RINGS || (nrings && !rings))
++        return -EINVAL;
++    spin_lock_irqsave(&nhi->lock, flags);
++    if (nhi->going_away || nhi->dma_shutdown) {
++        ret = -ENODEV;
++        goto unlock;
++    }
++    if (nhi->dma_resetting) {
++        ret = -EBUSY;
++        goto unlock;
++    }
++    for (i = 0; i < nrings; ++i) {
++        struct tb_ring *ring = rings[i];
++
++        if (!ring || ring->nhi != nhi || ring->hop <= 0 ||
++            ring->hop >= nhi->hop_count ||
++            (ring->is_tx ? nhi->tx_rings[ring->hop] :
++                           nhi->rx_rings[ring->hop]) != ring) {
++            ret = -EINVAL;
++            goto unlock;
++        }
++        for (j = 0; j < i; ++j) {
++            if (rings[j] == ring) {
++                ret = -EINVAL;
++                goto unlock;
++            }
++        }
++    }
++    for (i = 1; i < nhi->hop_count; ++i) {
++        struct tb_ring *ring = nhi->tx_rings[i];
++
++        if (ring && (!nhi_dma_group_contains(rings, nrings, ring) ||
++                     !nhi_dma_idle_ring(ring))) {
++            ret = -EBUSY;
++            goto unlock;
++        }
++        ring = nhi->rx_rings[i];
++        if (ring && (!nhi_dma_group_contains(rings, nrings, ring) ||
++                     !nhi_dma_idle_ring(ring))) {
++            ret = -EBUSY;
++            goto unlock;
++        }
++    }
++    nhi->dma_resetting = true;
+ unlock:
+-	spin_unlock_irqrestore(&nhi->lock, flags);
+-	return ret;
+-}
++    spin_unlock_irqrestore(&nhi->lock, flags);
++    return ret;
++}
++
+ 
+ static void nhi_dma_reset_end(struct tb_nhi *nhi)
+ {
+@@ -156,10 +187,11 @@
+ EXPORT_SYMBOL_GPL(tb_domain_dma_paths_busy);
+ 
+ /**
+- * tb_domain_reset_dma() - Reset an exclusively idle, supported AMD NHI
++ * __tb_domain_reset_dma() - Reset a verified owner-held idle ring set
+  * @tb: Domain whose control channel is restarted over the reset
+- * @tx: Optional caller-owned stopped transmit ring
+- * @rx: Optional caller-owned stopped receive ring
++ * @rings: Caller-owned stopped rings
++ * @nrings: Number of owner-held rings
++ * @performed: Set before destructive operations, including failure
+  *
+  * The caller must serialize its own ring lifetime/start/stop and remove its
+  * DMA paths first. Every other allocated non-control ring causes -EBUSY.
+@@ -168,7 +200,9 @@
+  * forcibly stopped on behalf of another consumer. A failed post-reset read
+  * leaves admission closed until reprobe rather than asserting recovery.
+  */
+-int tb_domain_reset_dma(struct tb *tb, struct tb_ring *tx, struct tb_ring *rx)
++static int __tb_domain_reset_dma(struct tb *tb,
++                                  struct tb_ring *const *rings,
++                                  unsigned int nrings, bool *performed)
+ {
+ 	struct tb_nhi *nhi = tb->nhi;
+ 	struct pci_dev *pdev;
+@@ -206,12 +240,14 @@
+ 			ret = -EBUSY;
+ 		goto unlock;
+ 	}
+-	ret = nhi_dma_reset_begin(nhi, tx, rx);
++	ret = nhi_dma_reset_group_begin(nhi, rings, nrings);
+ 	if (ret)
+ 		goto unlock;
+ 
+ 	/* NHI-v1 reset affects ring registers and E2E credits, not PHY training.
+ 	 * Control HopID 0 is the only ring permitted to restart inside the gate. */
++	if (performed)
++		*performed = true;
+ 	tb_ctl_stop(tb->ctl);
+ 	iowrite32(TB_DMA_INTERFACE_RESET_RST, nhi->iobase + TB_DMA_INTERFACE_RESET);
+ 	/* Posted-write flush followed by tHIReset, as in the pinned backend. */
+@@ -235,4 +271,110 @@
+ 	pm_runtime_put_autosuspend(nhi->dev);
+ 	return ret;
+ }
++int tb_domain_reset_dma(struct tb *tb, struct tb_ring *tx, struct tb_ring *rx)
++{
++    struct tb_ring *rings[2];
++    unsigned int count = 0;
++
++    if ((tx && !tx->is_tx) || (rx && rx->is_tx))
++        return -EINVAL;
++    if (tx)
++        rings[count++] = tx;
++    if (rx)
++        rings[count++] = rx;
++    return __tb_domain_reset_dma(tb, rings, count, NULL);
++}
+ EXPORT_SYMBOL_GPL(tb_domain_reset_dma);
++
++/* Registered only during a consumer module's init/exit, never while holding
++ * its per-file mutex. This avoids notifier-unregister versus callback ABBA. */
++static BLOCKING_NOTIFIER_HEAD(tb_dma_lifecycle_notifiers);
++/* Separate from teardown: its callback takes sdev locks, while reset is called
++ * with those locks already held. Sharing a writer-preferring notifier rwsem
++ * would permit an unregister/callback/reset ABBA. Recovery has only network
++ * consumers, whose RTNL admission is nonblocking. */
++static BLOCKING_NOTIFIER_HEAD(tb_dma_recovery_notifiers);
++
++int tb_register_dma_recovery_notifier(struct notifier_block *notifier)
++{
++    return blocking_notifier_chain_register(&tb_dma_recovery_notifiers, notifier);
++}
++EXPORT_SYMBOL_GPL(tb_register_dma_recovery_notifier);
++
++int tb_unregister_dma_recovery_notifier(struct notifier_block *notifier)
++{
++    return blocking_notifier_chain_unregister(&tb_dma_recovery_notifiers, notifier);
++}
++EXPORT_SYMBOL_GPL(tb_unregister_dma_recovery_notifier);
++
++int tb_register_dma_lifecycle_notifier(struct notifier_block *notifier)
++{
++    return blocking_notifier_chain_register(&tb_dma_lifecycle_notifiers, notifier);
++}
++EXPORT_SYMBOL_GPL(tb_register_dma_lifecycle_notifier);
++
++int tb_unregister_dma_lifecycle_notifier(struct notifier_block *notifier)
++{
++    return blocking_notifier_chain_unregister(&tb_dma_lifecycle_notifiers, notifier);
++}
++EXPORT_SYMBOL_GPL(tb_unregister_dma_lifecycle_notifier);
++
++/* Called by domain.c after CM stop and queued removal work have completed,
++ * outside tb->lock, before deinit/unregister can discard the inventory. The
++ * parent's remove path still owns its MMIO/devres while domain refs exist. */
++static void tb_dma_retire_domain_clients(struct tb *tb)
++{
++    blocking_notifier_call_chain(&tb_dma_lifecycle_notifiers,
++                                TB_DMA_DOMAIN_QUIESCING, tb);
++}
++
++
++static int tb_dma_execute_group_reset(struct tb_dma_reset_request *request)
++{
++    return __tb_domain_reset_dma(request->tb, request->rings,
++                                 request->nrings, request->performed);
++}
++
++/**
++ * tb_domain_reset_dma_group() - Cooperatively reset an owner-held idle group
++ * @tb: Retained domain
++ * @rings: Unique non-control rings, serialized and pinned by all owners
++ * @nrings: Bounded owner-held ring set
++ * @flags: TB_DMA_RESET_WITH_NETWORK explicitly permits USB4NET down/up
++ * @performed: Set before destructive reset/control-stop, including failures
++ *
++ * With NETWORK, a registered network consumer wraps the continuation while
++ * holding RTNL. It closes only its interfaces on this domain, then restores
++ * the previously-up interfaces after success or a nondestructive rejection.
++ * Other allocated rings/tunnels remain a veto. No force-unbind or packet replay.
++ * The caller must serialize the NHI device binding against driver removal for
++ * this entire call (including the optional network close/open continuation).
++ */
++int tb_domain_reset_dma_group(struct tb *tb, struct tb_ring *const *rings,
++                              unsigned int nrings, unsigned int flags,
++                              bool *performed)
++{
++    struct tb_dma_reset_request request = {
++        .tb = tb, .rings = rings, .nrings = nrings, .performed = performed,
++        .execute = tb_dma_execute_group_reset,
++    };
++
++    if (!performed)
++        return -EINVAL;
++    *performed = false;
++    if (nrings > TB_DMA_RESET_MAX_RINGS || (nrings && !rings) ||
++        (flags & ~TB_DMA_RESET_WITH_NETWORK))
++        return -EINVAL;
++    /* Reject unsupported/removing controllers before any network outage. */
++    if (READ_ONCE(tb->nhi->going_away) || READ_ONCE(tb->nhi->dma_shutdown))
++        return -ENODEV;
++    if (!nhi_dma_reset_supported(tb->nhi))
++        return -EOPNOTSUPP;
++    if (flags & TB_DMA_RESET_WITH_NETWORK)
++        blocking_notifier_call_chain(&tb_dma_recovery_notifiers,
++                                    TB_DMA_GROUP_RECOVERY, &request);
++    if (!request.handled)
++        request.status = request.execute(&request);
++    return request.status;
++}
++EXPORT_SYMBOL_GPL(tb_domain_reset_dma_group);
+diff --git a/drivers/thunderbolt/gpu_group_reset.h b/drivers/thunderbolt/gpu_group_reset.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/thunderbolt/gpu_group_reset.h
+@@ -0,0 +1,180 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Included after the GPU lifecycle helpers. No userspace access or FD release
++ * occurs with an sdev/DMA mutex held. fget keeps every participant's open-file
++ * identity alive; duplicate sdevs (including dup FDs) are rejected first. */
++static long sgu_reset_group_ioctl(struct file *caller, void __user *user)
++{
++    struct sgu_group_owner {
++        struct file *file;
++        struct tbstream_dev *sdev;
++        struct tbstream_gpu_context *ctx;
++        bool locked, dma_locked;
++    } owners[SGU_MAX_RESET_MEMBERS] = {};
++    struct tb_ring *rings[2 * SGU_MAX_RESET_MEMBERS];
++    struct sgu_reset_group *request;
++    struct tb *domain = NULL;
++    struct device *controller = NULL;
++    bool controller_locked = false;
++    unsigned int i, j, count = 0;
++    bool contains_caller = false, performed = false;
++    long ret;
++
++    if (!capable(CAP_SYS_ADMIN))
++        return -EPERM;
++    request = kzalloc(sizeof(*request), GFP_KERNEL);
++    if (!request)
++        return -ENOMEM;
++    if (copy_from_user(request, user, sizeof(*request))) {
++        ret = -EFAULT;
++        goto free_request;
++    }
++    if (!request->count || request->count > SGU_MAX_RESET_MEMBERS ||
++        request->result || request->reserved ||
++        (request->flags & ~SGU_RESET_GROUP_NETWORK)) {
++        ret = -EINVAL;
++        goto free_request;
++    }
++    count = request->count;
++    if (memchr_inv(&request->members[count], 0,
++                  (SGU_MAX_RESET_MEMBERS - count) * sizeof(request->members[0]))) {
++        ret = -EINVAL;
++        goto free_request;
++    }
++    for (i = 0; i < count; ++i) {
++        const struct sgu_reset_member *member = &request->members[i];
++        struct file *file;
++
++        if (member->reserved || member->fd < 0) {
++            ret = -EINVAL;
++            goto unlock;
++        }
++        file = fget(member->fd);
++        if (!file) {
++            ret = -EBADF;
++            goto unlock;
++        }
++        owners[i].file = file;
++        if (file->f_op != &tbstream_dev_fops) {
++            ret = -EINVAL;
++            goto unlock;
++        }
++        owners[i].sdev = to_tbstream_dev(file->private_data);
++        if (file == caller)
++            contains_caller = true;
++        for (j = 0; j < i; ++j) {
++            if (owners[i].sdev == owners[j].sdev) {
++                ret = -EINVAL;
++                goto unlock;
++            }
++        }
++    }
++    if (!contains_caller) {
++        ret = -EINVAL;
++        goto unlock;
++    }
++    /* Nonblocking multi-lock admission avoids opposing caller lock orders.
++     * Contention is failure without any STOP, state mutation or reset. */
++    for (i = 0; i < count; ++i) {
++        struct tbstream_dev *sdev = owners[i].sdev;
++        struct tbstream_gpu_context *ctx;
++        struct tb_xdomain *xd;
++
++        if (!mutex_trylock(&sdev->lock)) {
++            ret = -EAGAIN;
++            goto unlock;
++        }
++        owners[i].locked = true;
++        ctx = sdev->gpu_context;
++        if (!sdev->gpu_direct || sdev->users <= 0 || !ctx ||
++            tbstream_dev_valid(sdev) || sdev->stream != ctx->stream_owner) {
++            ret = -ENODEV;
++            goto unlock;
++        }
++        if (memcmp(&request->members[i].fence, &ctx->identity,
++                   sizeof(ctx->identity))) {
++            ret = -ESTALE;
++            goto unlock;
++        }
++        owners[i].ctx = ctx;
++        if (!mutex_trylock(&ctx->dma_lock)) {
++            ret = -EAGAIN;
++            goto unlock;
++        }
++        owners[i].dma_locked = true;
++        if (!ctx->stopped || !sgu_can_release(ctx) || ctx->quarantined) {
++            ret = -EBUSY;
++            goto unlock;
++        }
++        xd = sgu_original_xdomain(ctx);
++        if (domain && domain != xd->tb) {
++            ret = -EXDEV;
++            goto unlock;
++        }
++        domain = xd->tb;
++        rings[2 * i] = sdev->tx_ring.ring;
++        rings[2 * i + 1] = sdev->rx_ring.ring;
++    }
++    /* A retained struct device does not pin its devres/driver binding. A
++     * nonblocking device lock avoids ABBA with remove waiting for sdev->lock. */
++    controller = get_device(owners[0].ctx->dma_owner);
++    if (!device_trylock(controller)) {
++        ret = -EAGAIN;
++        goto unlock;
++    }
++    controller_locked = true;
++    if (!device_is_bound(controller) || dev_get_drvdata(controller) != domain ||
++        READ_ONCE(domain->nhi->going_away) || READ_ONCE(domain->nhi->dma_shutdown)) {
++        ret = -ENODEV;
++        goto unlock;
++    }
++    /* The core rechecks the ENTIRE ring and tunnel inventories under its
++     * admission/CM locks. User-provided completeness is never trusted. */
++    ret = tb_domain_reset_dma_group(domain, rings, 2 * count,
++        request->flags & SGU_RESET_GROUP_NETWORK ? TB_DMA_RESET_WITH_NETWORK : 0,
++        &performed);
++    for (i = 0; i < count; ++i) {
++        struct tbstream_gpu_context *ctx = owners[i].ctx;
++        unsigned long flags;
++
++        spin_lock_irqsave(&ctx->lock, flags);
++        if (ret) {
++            ++ctx->stats.reset_failures;
++        } else {
++            ++ctx->stats.resets;
++        }
++        if (performed) {
++            /* Reset is not a transparent resumption or an import release.
++             * RECOVER and a larger agreed epoch are mandatory for every FD. */
++            WRITE_ONCE(ctx->failed, true);
++            ctx->requires_new_epoch = true;
++        }
++        spin_unlock_irqrestore(&ctx->lock, flags);
++        if (performed)
++            wake_up_interruptible_poll(&ctx->sdev->wait, EPOLLERR);
++    }
++    if (!ret)
++        request->result = SGU_RESULT_GROUP_RESET;
++unlock:
++    if (controller_locked)
++        device_unlock(controller);
++    if (controller)
++        put_device(controller);
++    for (i = count; i > 0; --i) {
++        struct sgu_group_owner *owner = &owners[i - 1];
++
++        if (owner->dma_locked)
++            mutex_unlock(&owner->ctx->dma_lock);
++        if (owner->locked)
++            mutex_unlock(&owner->sdev->lock);
++    }
++    /* A fault after successful reset does not undo the reset. Every member
++     * remains failed and requires RECOVER, even if the result copy is lost. */
++    if (!ret && copy_to_user(user, request, sizeof(*request)))
++        ret = -EFAULT;
++    for (i = 0; i < count; ++i)
++        if (owners[i].file)
++            fput(owners[i].file);
++free_request:
++    kfree(request);
++    return ret;
++}
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -14,6 +14,9 @@
+ #include <linux/sync_file.h>
+ #include <linux/workqueue.h>
+ #include <linux/capability.h>
++#include <linux/file.h>
++#include <linux/notifier.h>
++#include <linux/rcupdate.h>
+ #include "tb.h"
+ #include "nhi.h"
+ #include "gpu_stream_logic.h"
+@@ -81,6 +84,9 @@
+ };
+ struct tbstream_gpu_context {
+     struct tbstream_dev *sdev;
++    struct list_head client_node;
++    u64 client_id;
++    struct rcu_head rcu;
+     spinlock_t lock; /* callbacks never acquire either process-context mutex */
+     /* No allocation, user access, reservation wait or path operation under this
+      * mutex. The watchdog deliberately never acquires sdev->lock. */
+@@ -101,6 +107,36 @@
+     bool closing, requires_new_epoch;
+     bool path_check_required, detached_hopids;
+ };
++
++/* Registry entries exist only while their contexts hold the original domain.
++ * The registry lock never nests an sdev lock. A sweep snapshots one sdev ref
++ * plus a monotonic registration ID, then revalidates under sdev->lock. */
++static DEFINE_MUTEX(sgu_clients_lock);
++static LIST_HEAD(sgu_clients);
++static u64 sgu_client_serial;
++
++static int sgu_register_client(struct tbstream_gpu_context *ctx)
++{
++    int ret = 0;
++
++    INIT_LIST_HEAD(&ctx->client_node);
++    mutex_lock(&sgu_clients_lock);
++    if (sgu_client_serial == U64_MAX) {
++        ret = -EOVERFLOW;
++    } else {
++        ctx->client_id = ++sgu_client_serial;
++        list_add_tail(&ctx->client_node, &sgu_clients);
++    }
++    mutex_unlock(&sgu_clients_lock);
++    return ret;
++}
++
++static void sgu_unregister_client(struct tbstream_gpu_context *ctx)
++{
++    mutex_lock(&sgu_clients_lock);
++    list_del_init(&ctx->client_node);
++    mutex_unlock(&sgu_clients_lock);
++}
+ 
+ static const char *sgu_fence_driver(struct dma_fence *fence) { return "strix-usb4stream"; }
+ static const char *sgu_fence_timeline(struct dma_fence *fence) { return "controller-dma"; }
+@@ -620,6 +656,7 @@
+     struct tb_xdomain *xd = tbstream_dev_xdomain(sdev);
+     uuid_t instance;
+     struct tb_ring *ring;
++    int ret;
+ 
+     if (sdev->busy_poll || !xd || !xd->local_uuid || !xd->remote_uuid ||
+         !xd->tb->cm_ops || xd->tb->cm_ops->driver_ready)
+@@ -669,6 +706,14 @@
+     }
+     sdev->rx_ring.ring = ring;
+     ctx->dma_owner = get_device(tb_ring_dma_device(ring));
++    ret = sgu_register_client(ctx);
++    if (ret) {
++        tb_ring_free(sdev->rx_ring.ring);
++        tb_ring_free(sdev->tx_ring.ring);
++        sdev->rx_ring.ring = sdev->tx_ring.ring = NULL;
++        put_device(ctx->dma_owner);
++        goto fail;
++    }
+     sdev->gpu_context = ctx;
+     return 0; /* allocation only: no path, ring start or DMA enqueue */
+ fail:
+@@ -732,7 +777,15 @@
+         ctx->path_check_required = true;
+     /* Path management may block/allocate. It is NOT needed to signal fences
+      * after the local controller rings and callbacks have been stopped. */
+-    if (ctx->armed) {
++    /* Domain teardown may already have freed router objects used by the
++     * path-disconnect callback. Once shutdown is gated, use the CM inventory
++     * only; never issue a fresh path mutation through that stale topology. */
++    if (READ_ONCE(xd->tb->nhi->dma_shutdown)) {
++        ctx->path_check_required = true;
++        if (tb_domain_dma_paths_busy(xd->tb, sdev->tx_ring.ring->hop,
++                                     sdev->rx_ring.ring->hop) == 0)
++            ctx->armed = false;
++    } else if (ctx->armed) {
+         if (tb_xdomain_disable_paths(xd, ctx->identity.out_hopid, sdev->tx_ring.ring->hop,
+                                     ctx->identity.in_hopid, sdev->rx_ring.ring->hop))
+             WRITE_ONCE(ctx->failed, true);
+@@ -895,20 +948,21 @@
+         return; /* retain device, stream, module, imports and callback sources */
+     }
+     quarantined = ctx->quarantined;
++    sgu_unregister_client(ctx);
+     sgu_release_detached_hopids(ctx);
+     sgu_release_windows(ctx);
+     tb_ring_free(sdev->rx_ring.ring);
+     tb_ring_free(sdev->tx_ring.ring);
+     sdev->rx_ring.ring = NULL;
+     sdev->tx_ring.ring = NULL;
+-    sdev->gpu_context = NULL;
++    WRITE_ONCE(sdev->gpu_context, NULL);
+     put_device(ctx->dma_owner);
+     put_device(ctx->domain_owner);
+     put_device(ctx->xdomain_owner);
+     put_device(ctx->service_owner);
+     tbstream_put(ctx->stream_owner);
+     destroy_workqueue(ctx->watchdog_wq);
+-    kfree(ctx);
++    kfree_rcu(ctx, rcu);
+     /* File release/configfs recovery holds its own device and module refs. */
+     if (quarantined) {
+         tbstream_dev_put(sdev);
+@@ -1469,7 +1523,7 @@
+     q.depth = depth;
+     q.maximum_depth = SGU_MAX_QUEUE_DEPTH;
+     q.features = SGU_CAP_MULTI_OP | SGU_CAP_NONBLOCK_SUBMIT | SGU_CAP_SYNC_FILE |
+-                 SGU_CAP_SESSION_RECOVERY | SGU_CAP_DMA_TIMEOUT | SGU_CAP_STATS | SGU_CAP_IDLE_RESET;
++                 SGU_CAP_SESSION_RECOVERY | SGU_CAP_DMA_TIMEOUT | SGU_CAP_STATS | SGU_CAP_IDLE_RESET | SGU_CAP_GROUP_RESET;
+     if (copy_to_user(user, &q, sizeof(q)))
+         return -EFAULT;
+     spin_lock_irqsave(&ctx->lock, flags);
+@@ -1551,6 +1605,8 @@
+     return copy_to_user(user, &out, sizeof(out)) ? -EFAULT : 0;
+ }
+ 
++#include "gpu_group_reset.h"
++
+ static long tbstream_gpu_ioctl(struct file *file, unsigned int command, unsigned long argument)
+ {
+     struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+@@ -1558,6 +1614,8 @@
+     void __user *user = (void __user *)argument;
+     int ret;
+ 
++    if (command == SGU_IOC_RESET_GROUP)
++        return sgu_reset_group_ioctl(file, user);
+     if (mutex_lock_interruptible(&sdev->lock))
+         return -ERESTARTSYS;
+     ctx = sdev->gpu_context;
+@@ -1655,14 +1713,18 @@
+ static __poll_t tbstream_gpu_poll(struct file *file, poll_table *wait)
+ {
+     struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+-    struct tbstream_gpu_context *ctx = READ_ONCE(sdev->gpu_context);
++    struct tbstream_gpu_context *ctx;
+     unsigned long flags;
+     __poll_t mask = 0;
+     u32 direction, slot;
+ 
+     poll_wait(file, &sdev->wait, wait);
+-    if (!ctx)
++    rcu_read_lock();
++    ctx = READ_ONCE(sdev->gpu_context);
++    if (!ctx) {
++        rcu_read_unlock();
+         return EPOLLERR | EPOLLHUP;
++    }
+     spin_lock_irqsave(&ctx->lock, flags);
+     for (direction = 0; direction < 2; ++direction)
+         for (slot = 0; slot < ctx->queue_depth; ++slot)
+@@ -1671,5 +1733,73 @@
+     if (READ_ONCE(ctx->failed) || READ_ONCE(sdev->stream) != ctx->stream_owner || READ_ONCE(sdev->removed))
+         mask |= EPOLLERR | EPOLLHUP;
+     spin_unlock_irqrestore(&ctx->lock, flags);
++    rcu_read_unlock();
+     return mask;
+ }
++
++/* End of local domain teardown, before CM deinit and NHI devres release.
++ * Normal open FDs must not pin a safely stopped controller indefinitely. An
++ * old FD becomes an error-only handle; sdev->users still prevents re-opening
++ * a replacement context until that FD is released. Exported fences own their
++ * own references and remain usable. No GPU completion is inferred here. */
++static int sgu_domain_quiescing(struct notifier_block *notifier,
++                               unsigned long event, void *data)
++{
++    struct tb *tb = data;
++    u64 cursor = 0;
++    unsigned int retained = 0;
++
++    if (event != TB_DMA_DOMAIN_QUIESCING)
++        return NOTIFY_DONE;
++    if (!READ_ONCE(tb->nhi->dma_shutdown))
++        return NOTIFY_BAD;
++    for (;;) {
++        struct tbstream_gpu_context *entry, *ctx;
++        struct tbstream_dev *sdev = NULL;
++        u64 id = 0;
++
++        mutex_lock(&sgu_clients_lock);
++        list_for_each_entry(entry, &sgu_clients, client_node) {
++            if (entry->domain_owner == &tb->dev && entry->client_id > cursor) {
++                sdev = entry->sdev;
++                id = entry->client_id;
++                tbstream_dev_get(sdev);
++                break;
++            }
++        }
++        mutex_unlock(&sgu_clients_lock);
++        if (!sdev)
++            break;
++        cursor = id;
++        mutex_lock(&sdev->lock);
++        ctx = sdev->gpu_context;
++        if (ctx && ctx->client_id == id && ctx->domain_owner == &tb->dev) {
++            WRITE_ONCE(ctx->failed, true);
++            ctx->path_check_required = true;
++            tbstream_gpu_close(sdev);
++            if (sdev->gpu_context)
++                ++retained;
++            wake_up_interruptible_poll(&sdev->wait, EPOLLHUP | EPOLLERR);
++        }
++        mutex_unlock(&sdev->lock);
++        tbstream_dev_put(sdev);
++    }
++    if (retained)
++        dev_warn(&tb->dev, "%u GPU contexts retained: DMA/path quiescence unproved\n", retained);
++    /* Do not prevent other consumers from running their cleanup callbacks. */
++    return NOTIFY_OK;
++}
++
++static struct notifier_block sgu_lifecycle_notifier = {
++    .notifier_call = sgu_domain_quiescing,
++};
++
++static int tbstream_gpu_lifecycle_init(void)
++{
++    return tb_register_dma_lifecycle_notifier(&sgu_lifecycle_notifier);
++}
++
++static void tbstream_gpu_lifecycle_exit(void)
++{
++    tb_unregister_dma_lifecycle_notifier(&sgu_lifecycle_notifier);
++}
+diff --git a/drivers/thunderbolt/gpu_stream.h b/drivers/thunderbolt/gpu_stream.h
+--- a/drivers/thunderbolt/gpu_stream.h
++++ b/drivers/thunderbolt/gpu_stream.h
+@@ -14,4 +14,6 @@
+ static bool tbstream_gpu_quarantined(struct tbstream_dev *sdev);
+ static long tbstream_gpu_ioctl(struct file *file, unsigned int command, unsigned long argument);
+ static __poll_t tbstream_gpu_poll(struct file *file, poll_table *wait);
++static int tbstream_gpu_lifecycle_init(void);
++static void tbstream_gpu_lifecycle_exit(void);
+ #endif
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -762,6 +762,34 @@
+ void tb_configfs_unregister_group(struct config_group *group);
+ #endif
+ 
++/* Cooperative DMA recovery/lifetime hooks. Not an external user ABI. */
++#define TB_DMA_RESET_MAX_RINGS 32U
++#define TB_DMA_DOMAIN_QUIESCING 1UL
++#define TB_DMA_GROUP_RECOVERY 2UL
++#define TB_DMA_RESET_WITH_NETWORK 1U
++struct notifier_block;
++int tb_register_dma_lifecycle_notifier(struct notifier_block *notifier);
++int tb_unregister_dma_lifecycle_notifier(struct notifier_block *notifier);
++/* Separate chain: do not register per-stream teardown consumers here. */
++int tb_register_dma_recovery_notifier(struct notifier_block *notifier);
++int tb_unregister_dma_recovery_notifier(struct notifier_block *notifier);
++/* Kernel-only continuation handed to a registered cooperating consumer. The
++ * notifier read lock spans quiesce, execute and restore; module exit cannot
++ * unregister/free its code halfway through this transaction. */
++struct tb_dma_reset_request {
++    struct tb *tb;
++    struct tb_ring *const *rings;
++    unsigned int nrings;
++    bool *performed;
++    bool handled;
++    int status;
++    int (*execute)(struct tb_dma_reset_request *request);
++};
++int tb_domain_reset_dma_group(struct tb *tb, struct tb_ring *const *rings,
++                             unsigned int nrings, unsigned int flags,
++                             bool *performed);
++
++
+ #else /* CONFIG_USB4 */
+ static inline bool usb4_usb3_port_match(struct device *usb4_port_dev,
+ 					const struct fwnode_handle *usb3_port_fwnode)
+@@ -770,4 +798,5 @@
+ }
+ #endif /* CONFIG_USB4 */
+ 
++
+ #endif /* THUNDERBOLT_H_ */
+diff --git a/include/uapi/linux/strix_gpu_stream.h b/include/uapi/linux/strix_gpu_stream.h
+--- a/include/uapi/linux/strix_gpu_stream.h
++++ b/include/uapi/linux/strix_gpu_stream.h
+@@ -262,4 +262,33 @@
+ #define SGU_RESULT_CONTROLLER_RESET 5U
+ #define SGU_IOC_RESET _IOWR(0xb7, 0x50, struct sgu_action)
+ 
++/* All members explicitly lend one live GPU-stream FD with its exact current
++ * identity. Every session must already be stopped with its DMA paths removed.
++ * Duplicate FDs/devices, mixed controllers or any unknown data ring are refused.
++ * Lock contention is EAGAIN without reset; no member is stopped implicitly.
++ * On success every member is invalidated and must RECOVER/IMPORT using a fresh,
++ * strictly larger peer-agreed epoch. Old imports never resume automatically.
++ * This is a LOCAL controller operation: coordinate every peer independently.
++ * It is forbidden to use the affected USB4NET link as the only control channel.
++ * result/reserved and all unused member bytes must be zero on input. */
++#define SGU_MAX_RESET_MEMBERS 16U
++#define SGU_CAP_GROUP_RESET 128U
++#define SGU_RESET_GROUP_NETWORK 1U
++#define SGU_RESULT_GROUP_RESET 6U
++struct sgu_reset_member {
++    __s32 fd;
++    __u32 reserved;
++    struct sgu_fence fence;
++};
++struct sgu_reset_group {
++    __u32 count;
++    __u32 result;
++    /* NETWORK explicitly authorizes local USB4NET down/up under RTNL. This
++     * can drop packets: use an independently authenticated control channel. */
++    __u32 flags;
++    __u32 reserved;
++    struct sgu_reset_member members[SGU_MAX_RESET_MEMBERS];
++};
++#define SGU_IOC_RESET_GROUP _IOWR(0xb7, 0x51, struct sgu_reset_group)
++
+ #endif
+diff --git a/drivers/net/thunderbolt/main.c b/drivers/net/thunderbolt/main.c
+--- a/drivers/net/thunderbolt/main.c
++++ b/drivers/net/thunderbolt/main.c
+@@ -200,4 +200,5 @@
+ 	struct tbnet_ring rx_ring;
+ 	atomic_t frame_id;
+ 	struct tbnet_ring tx_ring;
++	struct list_head recovery_node;
+ };
+@@ -220,3 +221,5 @@
+ static struct tb_property_dir *tbnet_dir;
+ 
++#include "dma_recovery.h"
++
+ static bool tbnet_e2e = true;
+@@ -1380,5 +1383,6 @@
+ 	net->svc = svc;
+ 	net->dev = dev;
+ 	net->xd = xd;
++	INIT_LIST_HEAD(&net->recovery_node);
+ 
+ 	tbnet_generate_mac(dev);
+@@ -1425,8 +1429,9 @@
+ 	ret = register_netdev(dev);
+ 	if (ret) {
+ 		tb_unregister_protocol_handler(&net->handler);
+ 		free_netdev(dev);
+ 		return ret;
+ 	}
++	tbnet_dma_register_device(net);
+ 
+ 	return 0;
+@@ -1440,5 +1445,6 @@
+ static void tbnet_remove(struct tb_service *svc)
+ {
+ 	struct tbnet *net = tb_service_get_drvdata(svc);
+ 
++	tbnet_dma_unregister_device(net);
+ 	unregister_netdev(net->dev);
+@@ -1520,7 +1526,12 @@
++	ret = tbnet_dma_lifecycle_init();
++	if (ret)
++		goto err_unregister;
+ 	ret = tb_register_service_driver(&tbnet_driver);
+ 	if (ret)
+-		goto err_unregister;
++		goto err_unregister_lifecycle;
+ 
+ 	return 0;
+ 
++err_unregister_lifecycle:
++	tbnet_dma_lifecycle_exit();
+ err_unregister:
+@@ -1545,3 +1556,4 @@
+ static void __exit tbnet_exit(void)
+ {
++	tbnet_dma_lifecycle_exit();
+ 	tb_unregister_service_driver(&tbnet_driver);
+diff --git a/drivers/thunderbolt/domain.c b/drivers/thunderbolt/domain.c
+--- a/drivers/thunderbolt/domain.c
++++ b/drivers/thunderbolt/domain.c
+@@ -520,4 +520,9 @@
+ 	flush_workqueue(tb->wq);
++
++	/* CM stop and removal work have drained. Consumers release only contexts
++	 * with proven ring/callback/path quiescence before the NHI waits for its
++	 * domain references. Run outside tb->lock to avoid recursive CM locking. */
++	tb_dma_retire_domain_clients(tb);
+ 
+ 	if (tb->cm_ops->deinit)
+ 		tb->cm_ops->deinit(tb);
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -1970,7 +1970,16 @@
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	ret = tbstream_gpu_lifecycle_init();
++	if (ret)
++		goto err_unregister_group;
++#endif
+ 	ret = tb_register_service_driver(&tbstream_driver);
+ 	if (ret)
+-		goto err_unregister_group;
++		goto err_unregister_lifecycle;
+ 	return 0;
+ 
++err_unregister_lifecycle:
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	tbstream_gpu_lifecycle_exit();
+ err_unregister_group:
++#endif
+ 	tb_configfs_unregister_group(&tbstream_group);
+@@ -1995,3 +2004,6 @@
+ static void __exit tbstream_exit(void)
+ {
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	tbstream_gpu_lifecycle_exit();
++#endif
+ 	tb_unregister_service_driver(&tbstream_driver);

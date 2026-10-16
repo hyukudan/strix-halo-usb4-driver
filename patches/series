@@ -3,3 +3,7 @@
 0003-batch-gpu-ring-submission.patch
 0004-fence-and-stop-lifetime.patch
 0005-gpu-queues-fences-and-session-recovery.patch
+0006-dma-progress-idle-reset-and-quarantine-reaping.patch
+0007-external-dependency-errors.patch
+0008-detached-quarantine-and-notification-lifecycle.patch
+0009-domain-retirement-and-cooperative-controller-recovery.patch

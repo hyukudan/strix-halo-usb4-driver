@@ -295,7 +295,7 @@ int main(void) {
         free = function('drivers/thunderbolt/gpu_stream.c', 'sgu_fence_free')
         self.assertIn('dma_fence_free(fence)', free)
         self.assertNotIn('kfree(', free)
-        stop = function('drivers/thunderbolt/gpu_stream.c', 'tbstream_gpu_stop')
+        stop = function('drivers/thunderbolt/gpu_stream.c', 'sgu_stop_dma_locked')
         self.assertIn('ctx->lifetime.stop_confirmed = 0', stop)
         self.assertIn('sgu_ring_running(sdev->rx_ring.ring)', stop)
         callback = function('drivers/thunderbolt/gpu_stream.c', 'sgu_callback')
@@ -305,6 +305,13 @@ int main(void) {
         self.assertLess(enqueue.index('sgu_controller_queue_batch'), enqueue.index('__tb_ring_enqueue_list'))
         self.assertIn('list_del_init', enqueue)
         self.assertIn('op->remaining = 0', enqueue)
+        self.assertIn('flush_work', stop)
+        wrapper = function('drivers/thunderbolt/gpu_stream.c', 'tbstream_gpu_stop')
+        self.assertIn('sgu_stop_dma_locked(ctx)', wrapper)
+        watchdog = function('drivers/thunderbolt/gpu_stream.c', 'sgu_watchdog')
+        self.assertNotIn('sdev->lock', watchdog)
+        finish = function('drivers/thunderbolt/gpu_stream.c', 'sgu_finish_signal')
+        self.assertLess(finish.index('sgu_signal('), finish.index('op->event_pending = true'))
 
     def test_sysfs_per_lane_not_per_cable(self):
         diagnose = load('diagnose', REPO / 'tools/usb4_diagnose.py')

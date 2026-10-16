@@ -1,14 +1,19 @@
 diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
 --- a/drivers/thunderbolt/gpu_stream.c
 +++ b/drivers/thunderbolt/gpu_stream.c
-@@ -66,4 +66,5 @@
+@@ -64,7 +64,8 @@
+ static const char *sgu_fence_timeline(struct dma_fence *fence) { return "controller-dma"; }
  static void sgu_fence_free(struct dma_fence *fence)
  {
 -    kfree(container_of(fence, struct sgu_dma_fence, base));
 +    /* base is the first member; reservation readers require an RCU grace period. */
 +    dma_fence_free(fence);
  }
-@@ -495,3 +496,10 @@
+ static const struct dma_fence_ops sgu_fence_ops = {
+     .get_driver_name = sgu_fence_driver, .get_timeline_name = sgu_fence_timeline,
+@@ -513,8 +514,15 @@
+     ctx->stopped = true;
+     spin_lock_irqsave(&ctx->lock, flags);
      ctx->lifetime.paths_removed = !ctx->armed;
 -    if (!sgu_controller_stopped(&ctx->lifetime))
 +    /* tb_ring_stop() can return early while the NHI is going away. Callback
@@ -20,20 +25,31 @@ diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
 +    } else if (!sgu_controller_stopped(&ctx->lifetime)) {
 +        WRITE_ONCE(ctx->failed, true);
 +    }
+     spin_unlock_irqrestore(&ctx->lock, flags);
+     wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLERR);
+ }
 diff --git a/drivers/thunderbolt/gpu_stream_logic.h b/drivers/thunderbolt/gpu_stream_logic.h
 --- a/drivers/thunderbolt/gpu_stream_logic.h
 +++ b/drivers/thunderbolt/gpu_stream_logic.h
-@@ -6,4 +6,4 @@
+@@ -6,7 +6,7 @@
+ #include <uapi/linux/strix_gpu_stream.h>
  #include <linux/string.h>
  #else
 -#include "strix/linux_direct_gpu_stream_uapi.h"
 +#include <linux/strix_gpu_stream.h>
  #include <string.h>
+ #endif
+ 
 diff --git a/include/uapi/linux/strix_gpu_stream.h b/include/uapi/linux/strix_gpu_stream.h
 --- a/include/uapi/linux/strix_gpu_stream.h
 +++ b/include/uapi/linux/strix_gpu_stream.h
-@@ -116,2 +116,3 @@
+@@ -108,7 +108,8 @@
+  * the exact prepared operation. result/queued_frames/reserved are zero input.
+  * CANCEL acknowledges a request; only STOP proves controller quiescence.
   * RX_REPOST physically enqueues the slots; RETIRE keeps standby DMA retained.
 - * The next RX PREPARE drains/rearms standby slots before changing geometry. */
 + * The next RX PREPARE must preserve pool_offset and payload frame count.
 + * Changed slot geometry requires STOP/RELEASE and a coordinated fresh import. */
+ struct sgu_action {
+     struct sgu_fence fence;
+     __aligned_u64 handle;

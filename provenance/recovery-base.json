@@ -1,0 +1,10 @@
+{
+  "upstream_repository": "torvalds/linux",
+  "upstream_ref": "72d3fcf802c45d00b300f25b848a93c3a2bd7c7e",
+  "files": [
+    {
+      "path": "include/linux/thunderbolt.h",
+      "git_blob_sha": "d48623fda79ba43fe1c90d3e37e2cccf43e620ea"
+    }
+  ]
+}

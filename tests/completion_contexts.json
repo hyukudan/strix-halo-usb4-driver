@@ -1,0 +1,66 @@
+{
+  "kind": "partial source-context fixtures; NOT complete pinned upstream source",
+  "upstream_ref": "72d3fcf802c45d00b300f25b848a93c3a2bd7c7e",
+  "fragments": [
+    {
+      "path": "drivers/thunderbolt/domain.c",
+      "line": 520,
+      "before": "\tflush_workqueue(tb->wq);\n\n\tif (tb->cm_ops->deinit)\n\t\ttb->cm_ops->deinit(tb);\n",
+      "after": "\tflush_workqueue(tb->wq);\n\n\t/* CM stop and removal work have drained. Consumers release only contexts\n\t * with proven ring/callback/path quiescence before the NHI waits for its\n\t * domain references. Run outside tb->lock to avoid recursive CM locking. */\n\ttb_dma_retire_domain_clients(tb);\n\n\tif (tb->cm_ops->deinit)\n\t\ttb->cm_ops->deinit(tb);\n"
+    },
+    {
+      "path": "drivers/thunderbolt/stream.c",
+      "line": 1970,
+      "before": "\tret = tb_register_service_driver(&tbstream_driver);\n\tif (ret)\n\t\tgoto err_unregister_group;\n\treturn 0;\n\nerr_unregister_group:\n\ttb_configfs_unregister_group(&tbstream_group);\n",
+      "after": "#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)\n\tret = tbstream_gpu_lifecycle_init();\n\tif (ret)\n\t\tgoto err_unregister_group;\n#endif\n\tret = tb_register_service_driver(&tbstream_driver);\n\tif (ret)\n\t\tgoto err_unregister_lifecycle;\n\treturn 0;\n\nerr_unregister_lifecycle:\n#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)\n\ttbstream_gpu_lifecycle_exit();\nerr_unregister_group:\n#endif\n\ttb_configfs_unregister_group(&tbstream_group);\n"
+    },
+    {
+      "path": "drivers/thunderbolt/stream.c",
+      "line": 1995,
+      "before": "static void __exit tbstream_exit(void)\n{\n\ttb_unregister_service_driver(&tbstream_driver);\n",
+      "after": "static void __exit tbstream_exit(void)\n{\n#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)\n\ttbstream_gpu_lifecycle_exit();\n#endif\n\ttb_unregister_service_driver(&tbstream_driver);\n"
+    },
+    {
+      "path": "drivers/net/thunderbolt/main.c",
+      "line": 200,
+      "before": "\tstruct tbnet_ring rx_ring;\n\tatomic_t frame_id;\n\tstruct tbnet_ring tx_ring;\n};\n",
+      "after": "\tstruct tbnet_ring rx_ring;\n\tatomic_t frame_id;\n\tstruct tbnet_ring tx_ring;\n\tstruct list_head recovery_node;\n};\n"
+    },
+    {
+      "path": "drivers/net/thunderbolt/main.c",
+      "line": 220,
+      "before": "static struct tb_property_dir *tbnet_dir;\n\nstatic bool tbnet_e2e = true;\n",
+      "after": "static struct tb_property_dir *tbnet_dir;\n\n#include \"dma_recovery.h\"\n\nstatic bool tbnet_e2e = true;\n"
+    },
+    {
+      "path": "drivers/net/thunderbolt/main.c",
+      "line": 1380,
+      "before": "\tnet->svc = svc;\n\tnet->dev = dev;\n\tnet->xd = xd;\n\n\ttbnet_generate_mac(dev);\n",
+      "after": "\tnet->svc = svc;\n\tnet->dev = dev;\n\tnet->xd = xd;\n\tINIT_LIST_HEAD(&net->recovery_node);\n\n\ttbnet_generate_mac(dev);\n"
+    },
+    {
+      "path": "drivers/net/thunderbolt/main.c",
+      "line": 1425,
+      "before": "\tret = register_netdev(dev);\n\tif (ret) {\n\t\ttb_unregister_protocol_handler(&net->handler);\n\t\tfree_netdev(dev);\n\t\treturn ret;\n\t}\n\n\treturn 0;\n",
+      "after": "\tret = register_netdev(dev);\n\tif (ret) {\n\t\ttb_unregister_protocol_handler(&net->handler);\n\t\tfree_netdev(dev);\n\t\treturn ret;\n\t}\n\ttbnet_dma_register_device(net);\n\n\treturn 0;\n"
+    },
+    {
+      "path": "drivers/net/thunderbolt/main.c",
+      "line": 1440,
+      "before": "static void tbnet_remove(struct tb_service *svc)\n{\n\tstruct tbnet *net = tb_service_get_drvdata(svc);\n\n\tunregister_netdev(net->dev);\n",
+      "after": "static void tbnet_remove(struct tb_service *svc)\n{\n\tstruct tbnet *net = tb_service_get_drvdata(svc);\n\n\ttbnet_dma_unregister_device(net);\n\tunregister_netdev(net->dev);\n"
+    },
+    {
+      "path": "drivers/net/thunderbolt/main.c",
+      "line": 1520,
+      "before": "\tret = tb_register_service_driver(&tbnet_driver);\n\tif (ret)\n\t\tgoto err_unregister;\n\n\treturn 0;\n\nerr_unregister:\n",
+      "after": "\tret = tbnet_dma_lifecycle_init();\n\tif (ret)\n\t\tgoto err_unregister;\n\tret = tb_register_service_driver(&tbnet_driver);\n\tif (ret)\n\t\tgoto err_unregister_lifecycle;\n\n\treturn 0;\n\nerr_unregister_lifecycle:\n\ttbnet_dma_lifecycle_exit();\nerr_unregister:\n"
+    },
+    {
+      "path": "drivers/net/thunderbolt/main.c",
+      "line": 1545,
+      "before": "static void __exit tbnet_exit(void)\n{\n\ttb_unregister_service_driver(&tbnet_driver);\n",
+      "after": "static void __exit tbnet_exit(void)\n{\n\ttbnet_dma_lifecycle_exit();\n\ttb_unregister_service_driver(&tbnet_driver);\n"
+    }
+  ]
+}

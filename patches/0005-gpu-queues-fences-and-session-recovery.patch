@@ -10,7 +10,7 @@ index 75ffad4..b8c167d 100644
  	default n
  	help
  	  Adds a project experimental, explicitly selected DMA-BUF mode to
- diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
 index 5cc6b67..69352b3 100644
 --- a/drivers/thunderbolt/gpu_stream.c
 +++ b/drivers/thunderbolt/gpu_stream.c

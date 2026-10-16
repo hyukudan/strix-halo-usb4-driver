@@ -15,7 +15,8 @@ import unittest
 
 REPO = Path(__file__).resolve().parents[1]
 CASES = ("geometry", "queue", "failure_isolation", "events_legacy", "timeout_recovery",
-         "wait_concurrency", "wait_retry_order", "export_lifetime", "admission_rollback", "watchdog_schedule", "max_queue_reuse")
+         "wait_concurrency", "wait_retry_order", "export_lifetime", "admission_rollback", "watchdog_schedule", "max_queue_reuse", "watchdog_mutex_independence", "fence_precedes_event", "stop_before_publication",
+         "quarantine_reaping", "explicit_controller_reset", "statistics_snapshot", "detached_reap", "detached_path_proof", "detached_device_guard", "detached_reset_rejected", "group_success", "group_rejections", "group_copy_failure", "domain_retirement_open_fds", "domain_retirement_keeps_unproved_dma", "domain_retirement_foreign_domain", "domain_retirement_concurrent_poll")
 
 class GpuQueueTests(unittest.TestCase):
     @classmethod
@@ -30,9 +31,9 @@ class GpuQueueTests(unittest.TestCase):
             subprocess.run(["python3", str(REPO / "tools/prepare_overlay.py"), str(source)], check=True)
         implementation = (source / "drivers/thunderbolt/gpu_stream.c").read_text()
         # Replace ONLY the includes; all function bodies are the actual source.
-        implementation = re.sub(r"^#include[^\n]*\n", "", implementation, flags=re.MULTILINE)
+        implementation = re.sub(r'^#include(?! "gpu_group_reset.h")[^\n]*\n', "", implementation, flags=re.MULTILINE)
         unit = tmp / "test.c"
-        unit.write_text('#include "sgu_test_kernel.h"\n#include "gpu_stream_logic.h"\n' +
+        unit.write_text('#include "sgu_test_kernel.h"\n#include "sgu_dependency_status.h"\n#include "gpu_stream_logic.h"\n' +
                         implementation + '\n#include "sgu_queue_cases.h"\n')
         cls.binary = tmp / "test"
         compiler = os.environ.get("CC", "cc")
@@ -40,7 +41,7 @@ class GpuQueueTests(unittest.TestCase):
             raise RuntimeError(f"Required C compiler unavailable: {compiler}")
         command = [compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
                    "-Wno-unused-function", "-Wno-unused-parameter", "-Wno-unused-const-variable",
-                   "-fno-omit-frame-pointer", "-fsanitize=address,undefined", "-pthread",
+                   "-fno-omit-frame-pointer", "-fno-pie", "-no-pie", "-fsanitize=address,undefined", "-pthread",
                    "-I", str(REPO / "tests"), "-I", str(source / "drivers/thunderbolt"),
                    "-I", str(source / "include/uapi"), str(unit), "-o", str(cls.binary)]
         result = subprocess.run(command, capture_output=True, text=True)

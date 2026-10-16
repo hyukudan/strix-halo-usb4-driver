@@ -1,0 +1,19 @@
+{
+  "materialized_files": {
+    "drivers/thunderbolt/dma_recovery.c": "b4019cf1e22016649678dfa0712c6f5b991450373fadb8963c22594d00246f01",
+    "drivers/thunderbolt/xdomain_notify.h": "96ddb040e6c9d964bc875554cb42325943436f2215748d0b4fb0019db767586b",
+    "drivers/thunderbolt/gpu_group_reset.h": "bae2601de79eb7e8e3d0533877522ae5ac64e4f2fba0e8c5f39a8af6c909af59",
+    "drivers/thunderbolt/gpu_stream.h": "c2ed9cc8f246ad4f106f54e2480b787c5ab2b3fba3ee7af5f8f99fa4e90fd0ed",
+    "drivers/thunderbolt/dma_path_query.h": "ad1abdda0e82657662941775c38e6cf43c076277d1395b27177436c95ae3b89a",
+    "drivers/thunderbolt/gpu_stream_logic.h": "375dace1bd5d0374a04d22af6e51769d6dd90b691ab7f7c8cf2896c3af9ae134",
+    "drivers/thunderbolt/gpu_stream.c": "61f5f6f5e65e41da48698dff8190bf4344d9816ffe35f08f2d95d4bc3ea4dd82",
+    "drivers/net/thunderbolt/dma_recovery.h": "1fb352bbee0ba4802b03ba0a24317f6849cacb8fb8810866e030c62cdca1bcb0",
+    "include/linux/thunderbolt.h": "80594aa28ba34e5125da22ede65936feb1071a84dab58c972df1fd0734f588a9",
+    "include/uapi/linux/strix_gpu_stream.h": "9e90140bb44a0c4b58b03f6d334f67e31c56f1f3f76633c9f52528e2253dda28"
+  },
+  "engine_files_sha256": {
+    "include/strix/linux_direct_gpu_stream_uapi.h": "9e90140bb44a0c4b58b03f6d334f67e31c56f1f3f76633c9f52528e2253dda28",
+    "src/linux_gpu_queue.cpp": "4f20935f0dd2869bf387771929db866bae453aad1ed776c9fdc16be73327741f",
+    "src/gpu_queue_session.cpp": "d7b329370bf217d1f47b19e411d6ff7a7acbb3f8c995885ad80620d17508614b"
+  }
+}

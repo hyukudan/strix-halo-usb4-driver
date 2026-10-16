@@ -1,0 +1,592 @@
+diff --git a/drivers/thunderbolt/dma_path_query.h b/drivers/thunderbolt/dma_path_query.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/thunderbolt/dma_path_query.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Included by tb.c after its private CM and tunnel declarations. */
++#ifndef TB_DMA_PATH_QUERY_H
++#define TB_DMA_PATH_QUERY_H
++static int tb_dma_paths_busy(struct tb *tb, int transmit_ring, int receive_ring)
++{
++	struct tb_cm *tcm = tb_priv(tb);
++	struct tb_tunnel *tunnel;
++
++	lockdep_assert_held(&tb->lock);
++	list_for_each_entry(tunnel, &tcm->tunnel_list, list) {
++		if (!tb_tunnel_is_dma(tunnel))
++			continue;
++		if ((transmit_ring < 0 && receive_ring < 0) ||
++		    (transmit_ring > 0 &&
++		     tb_tunnel_match_dma(tunnel, -1, transmit_ring, -1, -1)) ||
++		    (receive_ring > 0 &&
++		     tb_tunnel_match_dma(tunnel, -1, -1, -1, receive_ring)))
++			return 1;
++	}
++	return 0;
++}
++#endif
+diff --git a/drivers/thunderbolt/dma_recovery.c b/drivers/thunderbolt/dma_recovery.c
+--- a/drivers/thunderbolt/dma_recovery.c
++++ b/drivers/thunderbolt/dma_recovery.c
+@@ -127,6 +127,35 @@
+ }
+ 
+ /**
++ * tb_domain_dma_paths_busy() - Check whether DMA tunnels still own ring IDs
++ * @tb: Retained domain whose connection manager owns the tunnel inventory
++ * @transmit_ring: Positive TX HopID, or -1 to ignore
++ * @receive_ring: Positive RX HopID, or -1 to ignore
++ *
++ * Both -1 queries all DMA tunnels. Returns 0 only on an affirmative inventory
++ * check, 1 for a matching tunnel, negative when no proof is available. The
++ * query deliberately does not wait for tb->lock (including recursive removal).
++ * This is path-table proof, not a hardware DMA-stop or GPU-consumer proof.
++ */
++int tb_domain_dma_paths_busy(struct tb *tb, int transmit_ring, int receive_ring)
++{
++	int ret;
++
++	if ((transmit_ring != -1 && transmit_ring <= 0) ||
++	    (receive_ring != -1 && receive_ring <= 0))
++		return -EINVAL;
++	if (!mutex_trylock(&tb->lock))
++		return -EAGAIN;
++	if (!tb->cm_ops || !tb->cm_ops->dma_paths_busy)
++		ret = -EOPNOTSUPP;
++	else
++		ret = tb->cm_ops->dma_paths_busy(tb, transmit_ring, receive_ring);
++	mutex_unlock(&tb->lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(tb_domain_dma_paths_busy);
++
++/**
+  * tb_domain_reset_dma() - Reset an exclusively idle, supported AMD NHI
+  * @tb: Domain whose control channel is restarted over the reset
+  * @tx: Optional caller-owned stopped transmit ring
+@@ -167,6 +196,16 @@
+ 		ret = -EOPNOTSUPP;
+ 		goto unlock;
+ 	}
++	if (!tb->cm_ops || !tb->cm_ops->dma_paths_busy) {
++		ret = -EOPNOTSUPP;
++		goto unlock;
++	}
++	ret = tb->cm_ops->dma_paths_busy(tb, -1, -1);
++	if (ret) {
++		if (ret > 0)
++			ret = -EBUSY;
++		goto unlock;
++	}
+ 	ret = nhi_dma_reset_begin(nhi, tx, rx);
+ 	if (ret)
+ 		goto unlock;
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -99,6 +99,7 @@
+     u64 fence_sequence[2][SGU_MAX_QUEUE_DEPTH], submitted_sequence[2];
+     bool imported, started, armed, stopped, failed, rearming_rx, quarantined;
+     bool closing, requires_new_epoch;
++    bool path_check_required, detached_hopids;
+ };
+ 
+ static const char *sgu_fence_driver(struct dma_fence *fence) { return "strix-usb4stream"; }
+@@ -138,6 +139,13 @@
+             return op;
+     }
+     return NULL;
++}
++
++/* This reference belongs to the import, not to a possibly reattached configfs
++ * endpoint. It remains valid until the context releases xdomain_owner. */
++static struct tb_xdomain *sgu_original_xdomain(struct tbstream_gpu_context *ctx)
++{
++    return container_of(ctx->xdomain_owner, struct tb_xdomain, dev);
+ }
+ 
+ static bool sgu_ring_running(struct tb_ring *ring)
+@@ -719,19 +727,34 @@
+     /* The worker never takes sdev->lock, so cancellation here cannot deadlock
+      * against user access or an exporter holding a reservation mutex. */
+     cancel_delayed_work_sync(&ctx->watchdog);
+-    xd = tbstream_dev_xdomain(sdev);
++    xd = sgu_original_xdomain(ctx);
++    if (READ_ONCE(xd->is_unplugged) || sdev->stream != ctx->stream_owner)
++        ctx->path_check_required = true;
+     /* Path management may block/allocate. It is NOT needed to signal fences
+      * after the local controller rings and callbacks have been stopped. */
+     if (ctx->armed) {
+-        if (!xd || tb_xdomain_disable_paths(xd, sdev->out_hopid, sdev->tx_ring.ring->hop,
+-                                            sdev->in_hopid, sdev->rx_ring.ring->hop))
++        if (tb_xdomain_disable_paths(xd, ctx->identity.out_hopid, sdev->tx_ring.ring->hop,
++                                    ctx->identity.in_hopid, sdev->rx_ring.ring->hop))
+             WRITE_ONCE(ctx->failed, true);
+         else
+             ctx->armed = false;
+     }
+-    spin_lock_irqsave(&ctx->lock, flags);
+-    ctx->lifetime.paths_removed = !ctx->armed;
+-    spin_unlock_irqrestore(&ctx->lock, flags);
++    /* An unplugged XDomain may acknowledge disable_paths before its CM has
++     * removed the actual tunnel. Do not free/reuse the ring on that ACK alone.
++     * The CM query uses trylock: service removal may already own tb->lock. */
++    if (ctx->path_check_required) {
++        bool gone = !ctx->armed &&
++            tb_domain_dma_paths_busy(xd->tb, sdev->tx_ring.ring->hop,
++                                     sdev->rx_ring.ring->hop) == 0;
++
++        spin_lock_irqsave(&ctx->lock, flags);
++        ctx->lifetime.paths_removed = gone;
++        spin_unlock_irqrestore(&ctx->lock, flags);
++    } else {
++        spin_lock_irqsave(&ctx->lock, flags);
++        ctx->lifetime.paths_removed = !ctx->armed;
++        spin_unlock_irqrestore(&ctx->lock, flags);
++    }
+ }
+ 
+ /* Mandatory fence progress, independent of the user/control-plane mutex. */
+@@ -801,12 +824,39 @@
+     if (!sdev->gpu_context)
+         return;
+     WRITE_ONCE(sdev->gpu_context->failed, true);
++    sdev->gpu_context->path_check_required = true;
+     tbstream_gpu_stop(sdev);
+ }
+ 
+-static bool tbstream_gpu_paths_pending(struct tbstream_dev *sdev)
+-{
+-    return sdev->gpu_context && sdev->gpu_context->armed;
++/* Called by stream detachment under sdev->lock. Transfer responsibility for
++ * old XDomain HopIDs to the retained context while actual paths remain. New
++ * connections can have the same numbers but belong to a different allocator. */
++static bool tbstream_gpu_paths_pending(struct tbstream_dev *sdev,
++                                       const struct tbstream *detaching)
++{
++    struct tbstream_gpu_context *ctx = sdev->gpu_context;
++    bool pending;
++
++    lockdep_assert_held(&sdev->lock);
++    pending = ctx && ctx->stream_owner == detaching &&
++        (ctx->detached_hopids || ctx->armed || !ctx->lifetime.paths_removed);
++    if (pending)
++        ctx->detached_hopids = true;
++    return pending;
++}
++
++static void sgu_release_detached_hopids(struct tbstream_gpu_context *ctx)
++{
++    struct tb_xdomain *xd = sgu_original_xdomain(ctx);
++
++    if (!ctx->detached_hopids)
++        return;
++    /* The caller has proved both local ring/callback stop and CM path removal. */
++    if (ctx->identity.out_hopid)
++        tb_xdomain_release_out_hopid(xd, ctx->identity.out_hopid);
++    if (ctx->identity.in_hopid)
++        tb_xdomain_release_in_hopid(xd, ctx->identity.in_hopid);
++    ctx->detached_hopids = false;
+ }
+ 
+ static void sgu_release_windows(struct tbstream_gpu_context *ctx)
+@@ -845,6 +895,7 @@
+         return; /* retain device, stream, module, imports and callback sources */
+     }
+     quarantined = ctx->quarantined;
++    sgu_release_detached_hopids(ctx);
+     sgu_release_windows(ctx);
+     tb_ring_free(sdev->rx_ring.ring);
+     tb_ring_free(sdev->tx_ring.ring);
+@@ -1116,13 +1167,17 @@
+     return ret;
+ }
+ 
+-/* A configfs recovery operation holds an item/device reference in addition to
+- * the quarantine's pin. Only proven quiescence authorizes dropping that pin.
+- * Disconnected/unknown controllers fail closed rather than guessing at DMA. */
++/* Administrative cleanup may outlive cable/service detach, but never host
++ * driver unbind. A device reference alone does not retain devres or MMIO.
++ * trylock avoids ABBA with a remove callback that already holds device_lock
++ * and is waiting for sdev->lock. The device gets a temporary independent ref
++ * because successful close destroys ctx and releases its dma_owner ref. */
+ static int tbstream_gpu_reap(struct tbstream_dev *sdev, bool reset)
+ {
+     struct tbstream_gpu_context *ctx = sdev->gpu_context;
+     struct tb_xdomain *xd = tbstream_dev_xdomain(sdev);
++    struct device *dma;
++    struct tb *tb;
+     int ret;
+ 
+     lockdep_assert_held(&sdev->lock);
+@@ -1130,22 +1185,46 @@
+         return -EPERM;
+     if (sdev->users)
+         return -EBUSY;
+-    if (!xd || tbstream_dev_valid(sdev))
++    if (sdev->removed)
+         return -ENODEV;
+-    if (!ctx)
++    if (!ctx) {
++        if (!xd || tbstream_dev_valid(sdev))
++            return -ENODEV;
+         return reset ? tb_domain_reset_dma(xd->tb, NULL, NULL) : -ENOENT;
+-    if (!ctx->quarantined || sdev->stream != ctx->stream_owner)
++    }
++    if (!ctx->quarantined)
+         return -EBUSY;
++    /* Reaping old storage is allowed after detach. Resetting or resurrecting
++     * a different/new peer is not: reset retains the existing live-only rule. */
++    if (reset && (!xd || sdev->stream != ctx->stream_owner || tbstream_dev_valid(sdev)))
++        return -ENODEV;
++    tb = sgu_original_xdomain(ctx)->tb;
++    dma = get_device(ctx->dma_owner);
++    if (!device_trylock(dma)) {
++        put_device(dma);
++        return -EAGAIN;
++    }
++    if (!device_is_bound(dma) || dev_get_drvdata(dma) != tb ||
++        READ_ONCE(tb->nhi->going_away) || READ_ONCE(tb->nhi->dma_shutdown)) {
++        ret = -ENODEV;
++        goto unlock;
++    }
+     tbstream_gpu_stop(sdev);
+-    if (!sgu_can_release(ctx))
+-        return -EIO;
++    if (!sgu_can_release(ctx)) {
++        ret = -EIO;
++        goto unlock;
++    }
+     if (reset) {
+         ret = sgu_reset_controller(ctx);
+         if (ret)
+-            return ret;
++            goto unlock;
+     }
+     tbstream_gpu_close(sdev);
+-    return sdev->gpu_context ? -EIO : 0;
++    ret = sdev->gpu_context ? -EIO : 0;
++unlock:
++    device_unlock(dma);
++    put_device(dma);
++    return ret;
+ }
+ 
+ static bool tbstream_gpu_quarantined(struct tbstream_dev *sdev)
+diff --git a/drivers/thunderbolt/xdomain_notify.h b/drivers/thunderbolt/xdomain_notify.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/thunderbolt/xdomain_notify.h
+@@ -0,0 +1,111 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Included in xdomain.c after the property-request implementation.
++ * The post-enumeration nudge is sent once per handshake, not once per remote
++ * property read. Genuine local changes have independent, bounded retry budgets.
++ * All fields below are protected by xd->lock; no XDomain request holds it.
++ */
++#ifndef TB_XDOMAIN_NOTIFY_H
++#define TB_XDOMAIN_NOTIFY_H
++
++static void tb_xdomain_notify_reset(struct tb_xdomain *xd)
++{
++	mutex_lock(&xd->lock);
++	xd->properties_post_enumeration = false;
++	xd->properties_notify_stopped = false;
++	xd->properties_notify_pending = false;
++	++xd->properties_notify_serial;
++	xd->properties_changed_retries = 0;
++	mutex_unlock(&xd->lock);
++}
++
++/* Close admission before cancel_delayed_work_sync; a concurrent local service
++ * update must not requeue notification work after suspend/removal canceled it. */
++static void tb_xdomain_notify_stop(struct tb_xdomain *xd)
++{
++	mutex_lock(&xd->lock);
++	xd->properties_notify_stopped = true;
++	xd->properties_notify_pending = false;
++	++xd->properties_notify_serial;
++	xd->properties_changed_retries = 0;
++	mutex_unlock(&xd->lock);
++}
++
++static void __tb_xdomain_queue_properties_changed(struct tb_xdomain *xd)
++{
++	lockdep_assert_held(&xd->lock);
++	if (xd->properties_notify_stopped || xd->removing || READ_ONCE(xd->is_unplugged))
++		return;
++	++xd->properties_notify_serial;
++	xd->properties_notify_pending = true;
++	xd->properties_changed_retries = XDOMAIN_RETRIES;
++	/* Do not postpone an already scheduled notification with mod_delayed_work.
++	 * Updates arriving during the request queue the next invocation instead. */
++	queue_delayed_work(xd->tb->wq, &xd->properties_changed_work,
++			   msecs_to_jiffies(XDOMAIN_SHORT_TIMEOUT));
++}
++
++static void tb_xdomain_queue_properties_changed(struct tb_xdomain *xd)
++{
++	mutex_lock(&xd->lock);
++	__tb_xdomain_queue_properties_changed(xd);
++	mutex_unlock(&xd->lock);
++}
++
++static void tb_xdomain_notify_enumerated(struct tb_xdomain *xd)
++{
++	mutex_lock(&xd->lock);
++	if (!xd->properties_post_enumeration && !xd->properties_notify_stopped &&
++	    !xd->removing &&
++	    !READ_ONCE(xd->is_unplugged)) {
++		xd->properties_post_enumeration = true;
++		__tb_xdomain_queue_properties_changed(xd);
++	}
++	mutex_unlock(&xd->lock);
++}
++
++static void tb_xdomain_properties_changed(struct work_struct *work)
++{
++	struct tb_xdomain *xd = container_of(work, typeof(*xd),
++					     properties_changed_work.work);
++	u32 serial;
++	int retries, ret;
++
++	mutex_lock(&xd->lock);
++	if (!xd->properties_notify_pending || xd->properties_notify_stopped ||
++	    xd->removing ||
++	    READ_ONCE(xd->is_unplugged)) {
++		xd->properties_notify_pending = false;
++		mutex_unlock(&xd->lock);
++		return;
++	}
++	serial = xd->properties_notify_serial;
++	retries = xd->properties_changed_retries;
++	mutex_unlock(&xd->lock);
++
++	ret = tb_xdp_properties_changed_request(xd->tb->ctl, xd->route,
++					      retries, xd->local_uuid);
++
++	mutex_lock(&xd->lock);
++	/* A service update or a new handshake invalidates this request's result.
++	 * In particular an old success must not swallow a newer local change, nor
++	 * may an old error consume the new generation's retry budget. */
++	if (serial != xd->properties_notify_serial)
++		goto unlock;
++	if (xd->properties_notify_stopped || xd->removing || READ_ONCE(xd->is_unplugged)) {
++		xd->properties_notify_pending = false;
++		goto unlock;
++	}
++	if (!ret) {
++		xd->properties_notify_pending = false;
++	} else if (retries > 0) {
++		xd->properties_changed_retries = retries - 1;
++		queue_delayed_work(xd->tb->wq, &xd->properties_changed_work,
++				   msecs_to_jiffies(XDOMAIN_DEFAULT_TIMEOUT));
++	} else {
++		xd->properties_notify_pending = false;
++		dev_warn(&xd->dev, "properties notification exhausted: %d\n", ret);
++	}
++unlock:
++	mutex_unlock(&xd->lock);
++}
++#endif
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -232,6 +232,10 @@
+  *			     our properties have changed
+  * @properties_changed_retries: Number of times left to send properties
+  *				changed notification
++ * @properties_notify_serial: Local change serial, protected by lock
++ * @properties_notify_pending: Notification still requires acknowledgment
++ * @properties_notify_stopped: Suspend/removal has closed notification admission
++ * @properties_post_enumeration: This handshake already queued its final nudge
+  * @bonding_possible: True if lane bonding is possible on local side
+  * @target_link_width: Target link width from the remote host
+  * @ntunnels: Keeps track of how many tunnels go through this XDomain
+@@ -279,6 +283,11 @@
+ 	int state_retries;
+ 	struct delayed_work properties_changed_work;
+ 	int properties_changed_retries;
++	/* Property notification bookkeeping; protected by lock. */
++	u32 properties_notify_serial;
++	bool properties_notify_pending;
++	bool properties_notify_stopped;
++	bool properties_post_enumeration;
+ 	bool bonding_possible;
+ 	u8 target_link_width;
+ 	atomic_t ntunnels;
+@@ -665,6 +674,10 @@
+ 	return ring->size;
+ }
+ 
++/* 0: no DMA tunnel uses either ring, 1: busy, negative: no proof available.
++ * Caller keeps ring/domain lifetimes stable. Never a hardware-stop proof. */
++int tb_domain_dma_paths_busy(struct tb *tb, int transmit_ring, int receive_ring);
++
+ struct tb_ring *tb_ring_alloc_tx(struct tb_nhi *nhi, int hop, int size,
+ 				 unsigned int flags);
+ struct tb_ring *tb_ring_alloc_rx(struct tb_nhi *nhi, int hop, int size,
+diff --git a/drivers/thunderbolt/gpu_stream.h b/drivers/thunderbolt/gpu_stream.h
+--- a/drivers/thunderbolt/gpu_stream.h
++++ b/drivers/thunderbolt/gpu_stream.h
+@@ -1,13 +1,15 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ #ifndef STRIX_GPU_STREAM_H
+ #define STRIX_GPU_STREAM_H
++struct tbstream;
+ struct tbstream_dev;
+ struct tbstream_gpu_context;
+ static int tbstream_gpu_open(struct tbstream_dev *sdev);
+ static void tbstream_gpu_stop(struct tbstream_dev *sdev);
+ static void tbstream_gpu_close(struct tbstream_dev *sdev);
+ static void tbstream_gpu_disconnect(struct tbstream_dev *sdev);
+-static bool tbstream_gpu_paths_pending(struct tbstream_dev *sdev);
++static bool tbstream_gpu_paths_pending(struct tbstream_dev *sdev,
++                                       const struct tbstream *detaching);
+ static int tbstream_gpu_reap(struct tbstream_dev *sdev, bool reset);
+ static bool tbstream_gpu_quarantined(struct tbstream_dev *sdev);
+ static long tbstream_gpu_ioctl(struct file *file, unsigned int command, unsigned long argument);
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -1625,7 +1625,7 @@
+ 		sdev->stream = NULL;
+ 		xd = tb_service_parent(stream->svc);
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+-		if (!tbstream_gpu_paths_pending(sdev)) {
++		if (!tbstream_gpu_paths_pending(sdev, stream)) {
+ #endif
+ 			if (sdev->out_hopid > 0)
+ 				tb_xdomain_release_out_hopid(xd, sdev->out_hopid);
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -2395,5 +2395,7 @@
+ 	tb_enable_clx(sw);
+ }
++
++#include "dma_path_query.h"
+ 
+ static int tb_disconnect_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
+ 				       int transmit_path, int transmit_ring,
+@@ -3320,6 +3322,7 @@
+ 	.approve_switch = tb_tunnel_pci,
+ 	.approve_xdomain_paths = tb_approve_xdomain_paths,
+ 	.disconnect_xdomain_paths = tb_disconnect_xdomain_paths,
++	.dma_paths_busy = tb_dma_paths_busy,
+ };
+ 
+ /*
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -528,6 +528,9 @@
+ 	int (*disconnect_xdomain_paths)(struct tb *tb, struct tb_xdomain *xd,
+ 					int transmit_path, int transmit_ring,
+ 					int receive_path, int receive_ring);
++	/* Called with tb->lock held. 0 absent, 1 busy, negative unknown.
++	 * Matching either positive ring is sufficient; both -1 means any DMA. */
++	int (*dma_paths_busy)(struct tb *tb, int transmit_ring, int receive_ring);
+ 	int (*usb4_switch_op)(struct tb_switch *sw, u16 opcode, u32 *metadata,
+ 			      u8 *status, const void *tx_data, size_t tx_data_len,
+ 			      void *rx_data, size_t rx_data_len);
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -75,5 +75,8 @@
+ static struct tb_property_dir *xdomain_property_dir;
+ static u32 xdomain_property_block_gen;
+ 
++static void tb_xdomain_queue_properties_changed(struct tb_xdomain *xd);
++static void tb_xdomain_notify_stop(struct tb_xdomain *xd);
++
+ /* Additional protocol handlers */
+ static LIST_HEAD(protocol_handlers);
+@@ -745,8 +748,8 @@
+ /* Can be called from state_work */
+ static void __stop_handshake(struct tb_xdomain *xd)
+ {
++	tb_xdomain_notify_stop(xd);
+ 	cancel_delayed_work_sync(&xd->properties_changed_work);
+-	xd->properties_changed_retries = 0;
+ 	xd->state_retries = 0;
+ }
+ 
+@@ -994,14 +997,8 @@
+ 	struct tb_xdomain *xd;
+ 
+ 	xd = tb_to_xdomain(dev);
+-	if (xd) {
+-		mutex_lock(&xd->lock);
+-		if (!xd->removing)
+-			queue_delayed_work(xd->tb->wq,
+-					   &xd->properties_changed_work,
+-					   msecs_to_jiffies(50));
+-		mutex_unlock(&xd->lock);
+-	}
++	if (xd)
++		tb_xdomain_queue_properties_changed(xd);
+ 
+ 	return 0;
+ }
+@@ -1710,12 +1707,7 @@
+ 			   msecs_to_jiffies(XDOMAIN_DEFAULT_TIMEOUT));
+ }
+ 
+-static void tb_xdomain_queue_properties_changed(struct tb_xdomain *xd)
+-{
+-	xd->properties_changed_retries = XDOMAIN_RETRIES;
+-	queue_delayed_work(xd->tb->wq, &xd->properties_changed_work,
+-			   msecs_to_jiffies(XDOMAIN_SHORT_TIMEOUT));
+-}
++#include "xdomain_notify.h"
+ 
+ static void tb_xdomain_failed(struct tb_xdomain *xd)
+ {
+@@ -1770,5 +1762,7 @@
+ 	switch (state) {
+ 	case XDOMAIN_STATE_INIT:
++		/* Start may be called under xd->lock; reset here, outside it. */
++		tb_xdomain_notify_reset(xd);
+ 		if (xd->needs_uuid) {
+ 			tb_xdomain_queue_uuid(xd);
+ 		} else {
+@@ -1870,6 +1864,7 @@
+ 			tb_xdomain_failed(xd);
+ 		} else {
+ 			xd->state = XDOMAIN_STATE_ENUMERATED;
++			tb_xdomain_notify_enumerated(xd);
+ 		}
+ 		break;
+ 
+@@ -1935,29 +1930,4 @@
+ 			   msecs_to_jiffies(XDOMAIN_DEFAULT_TIMEOUT));
+-}
+-
+-static void tb_xdomain_properties_changed(struct work_struct *work)
+-{
+-	struct tb_xdomain *xd = container_of(work, typeof(*xd),
+-					     properties_changed_work.work);
+-	int ret;
+-
+-	dev_dbg(&xd->dev, "sending properties changed notification\n");
+-
+-	ret = tb_xdp_properties_changed_request(xd->tb->ctl, xd->route,
+-				xd->properties_changed_retries, xd->local_uuid);
+-	if (ret) {
+-		if (xd->properties_changed_retries-- > 0) {
+-			dev_dbg(&xd->dev,
+-				"failed to send properties changed notification, retrying\n");
+-			queue_delayed_work(xd->tb->wq,
+-					   &xd->properties_changed_work,
+-					   msecs_to_jiffies(XDOMAIN_DEFAULT_TIMEOUT));
+-		}
+-		dev_err(&xd->dev, "failed to send properties changed notification\n");
+-		return;
+-	}
+-
+-	xd->properties_changed_retries = XDOMAIN_RETRIES;
+ }
+ 
+ static ssize_t device_show(struct device *dev, struct device_attribute *attr,

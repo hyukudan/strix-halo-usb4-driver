@@ -1,0 +1,109 @@
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -75,6 +75,8 @@
+     enum sgu_op_phase phase;
+     u32 payload_frames, total_frames, remaining, event_cursor, error_flags;
+     u64 completion_ns, deadline_ns, submitted_ns;
++    struct dma_fence *wait_fence; /* retained across EAGAIN and exporter pruning */
++    int dependency_error; /* sticky until this operation is cleared */
+     bool event_pending, retired, canceled, reuse_rx;
+ };
+ struct tbstream_gpu_context {
+@@ -390,7 +392,7 @@
+ 
+ static void sgu_operation_clear(struct tbstream_gpu_context *ctx, struct sgu_hw_operation *op)
+ {
+-    struct dma_fence *fence;
++    struct dma_fence *fence, *wait_fence;
+     unsigned long flags;
+     u32 i;
+ 
+@@ -402,9 +404,11 @@
+         f->queued = false;
+     }
+     fence = op->fence;
++    wait_fence = op->wait_fence;
+     memset(op, 0, sizeof(*op));
+     spin_unlock_irqrestore(&ctx->lock, flags);
+     dma_fence_put(fence);
++    dma_fence_put(wait_fence);
+ }
+ 
+ static int sgu_publish_fence(struct tbstream_gpu_context *ctx, struct sgu_hw_operation *op,
+@@ -421,11 +425,36 @@
+     unsigned long flags;
+     int ret;
+ 
++    if (op->dependency_error)
++        return op->dependency_error;
++    if (op->wait_fence) {
++        ret = dma_fence_get_status(op->wait_fence);
++        if (!ret) {
++            *dependency = dma_fence_get(op->wait_fence);
++            return -EAGAIN;
++        }
++        if (ret < 0) {
++            op->dependency_error = ret;
++            return ret;
++        }
++        dma_fence_put(op->wait_fence);
++        op->wait_fence = NULL;
++    }
+     if (!dma_resv_trylock(resv))
+         return -EAGAIN;
+     dma_resv_for_each_fence(&cursor, resv, wait_usage, fence) {
+-        if (!sgu_owns_fence_context(ctx->fence_context, fence->context) &&
+-            !dma_fence_is_signaled(fence)) {
++        /* Signalled is not the same as successful. A failed GPU producer or
++         * reader must not authorize DMA. Own non-overlapping slots are not
++         * foreign dependencies and retain their independent timelines. */
++        if (sgu_owns_fence_context(ctx->fence_context, fence->context))
++            continue;
++        ret = dma_fence_get_status(fence);
++        if (ret < 0) {
++            op->dependency_error = ret;
++            goto unlock;
++        }
++        if (!ret) {
++            op->wait_fence = dma_fence_get(fence);
+             *dependency = dma_fence_get(fence);
+             ret = -EAGAIN;
+             goto unlock;
+@@ -1281,6 +1310,7 @@
+         struct tbstream_gpu_context *ctx = sdev->gpu_context;
+         struct dma_fence *dependency = NULL;
+         long waited;
++        int dependency_status = 0;
+         unsigned long slice;
+         int ret;
+ 
+@@ -1313,8 +1343,28 @@
+             schedule_timeout_interruptible(1);
+             waited = signal_pending(current) ? -ERESTARTSYS : 1;
+         }
++        /* Keep the reference until the completion status has been read:
++         * the exporter can prune the fence from resv while we are waiting. */
++        if (dependency)
++            dependency_status = dma_fence_get_status(dependency);
+         dma_fence_put(dependency);
+         mutex_lock(&sdev->lock);
++        if (dependency_status < 0) {
++            struct sgu_hw_operation *op;
++
++            ctx = sdev->gpu_context;
++            if (!ctx)
++                return -ENXIO;
++            ret = sgu_live(ctx, &action->fence, false);
++            if (ret)
++                return ret;
++            op = sgu_find_operation(ctx, action->direction,
++                                    action->handle, action->sequence);
++            if (!op)
++                return -ESTALE;
++            op->dependency_error = dependency_status;
++            return dependency_status;
++        }
+         if (waited < 0)
+             return waited;
+         /* Revalidate endpoint, generation, phase and sequence on every retry.

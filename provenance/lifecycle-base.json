@@ -1,0 +1,17 @@
+{
+  "upstream_ref": "72d3fcf802c45d00b300f25b848a93c3a2bd7c7e",
+  "files": [
+    {
+      "path": "drivers/thunderbolt/tb.c",
+      "git_blob_sha": "47753a5c0f2ebde1dd4701b3b54e35561bdf0364"
+    },
+    {
+      "path": "drivers/thunderbolt/tb.h",
+      "git_blob_sha": "4373336d9425e379fcc0fc551deee9e2e2ca5c13"
+    },
+    {
+      "path": "drivers/net/thunderbolt/main.c",
+      "git_blob_sha": "d9fb587a62c5e13b6cb8b4397e0cd31c076cec7b"
+    }
+  ]
+}
