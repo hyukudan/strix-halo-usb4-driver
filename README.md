@@ -23,11 +23,18 @@ USB4_SOURCE_TREE="$PWD/audited-overlay" python3 -m unittest discover -s tests -v
 python3 tools/usb4_diagnose.py --logs > usb4-report.json
 ```
 
-Read [the audit and validation limits](docs/AUDIT-2026-10-16.md) and
-[BUILD.md](BUILD.md) before building. The audit does not claim a measured bandwidth
-improvement or that the failing physical link now negotiates 40 Gb/s. A sysfs
-speed of 20 Gb/s **per lane** with two lanes already represents a 40 Gb/s raw
-link in that direction. Application throughput is a separate measurement.
+Read [the initial audit and validation limits](docs/AUDIT-2026-10-16.md),
+[queue/fence/session-recovery additions](docs/QUEUES-AND-RECOVERY.md), and
+[BUILD.md](BUILD.md) before building. Patch 0005 adds opt-in queues of up to eight
+operations per direction, waits outside the device mutex, per-slot sync_file
+fences, finite DMA deadlines and fail-closed session recovery. It preserves the
+legacy ioctl layouts and does not reset the whole AMD NHI or retrain the cable.
+
+The audit does not claim a measured bandwidth improvement or that the failing
+physical link now negotiates 40 Gb/s. A sysfs speed of 20 Gb/s **per lane** with
+two lanes already represents a 40 Gb/s raw link in that direction. Application
+throughput is a separate measurement. Local simulator tests are not a substitute
+for the pinned-kernel build and two-host GPU/DMA integrity testing.
 
 ## Immutable capture
 

@@ -1,0 +1,958 @@
+diff --git a/drivers/thunderbolt/Kconfig b/drivers/thunderbolt/Kconfig
+index 75ffad4..b8c167d 100644
+--- a/drivers/thunderbolt/Kconfig
++++ b/drivers/thunderbolt/Kconfig
+@@ -79,6 +79,7 @@ config USB4_GPU_STREAM
+ 	bool "Experimental GPU DMA-BUF stream mode"
+ 	depends on USB4_STREAM
+ 	select DMA_SHARED_BUFFER
++	select SYNC_FILE
+ 	default n
+ 	help
+ 	  Adds a project experimental, explicitly selected DMA-BUF mode to
+ diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+index 5cc6b67..69352b3 100644
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -10,12 +10,41 @@
+ #include <linux/random.h>
+ #include <linux/scatterlist.h>
+ #include <linux/vmalloc.h>
++#include <linux/sched/signal.h>
++#include <linux/sync_file.h>
++#include <linux/workqueue.h>
+ #include "tb.h"
+ #include "nhi.h"
+ #include "gpu_stream_logic.h"
+ 
+ MODULE_IMPORT_NS("DMA_BUF");
+ 
++/* Finite DMA leases, including legacy RX standby ownership. Sampled on enqueue. */
++static unsigned int gpu_dma_timeout_ms = 30000;
++static unsigned int gpu_standby_timeout_ms = 300000;
++
++static int sgu_timeout_set(const char *value, const struct kernel_param *kp)
++{
++    unsigned int timeout;
++    int ret = kstrtouint(value, 0, &timeout);
++
++    if (ret)
++        return ret;
++    if (timeout < 100 || timeout > 3600000)
++        return -ERANGE;
++    WRITE_ONCE(*(unsigned int *)kp->arg, timeout);
++    return 0;
++}
++
++static const struct kernel_param_ops sgu_timeout_ops = {
++    .set = sgu_timeout_set,
++    .get = param_get_uint,
++};
++module_param_cb(gpu_dma_timeout_ms, &sgu_timeout_ops, &gpu_dma_timeout_ms, 0644);
++MODULE_PARM_DESC(gpu_dma_timeout_ms, "GPU DMA operation deadline in ms (100..3600000, default 30000)");
++module_param_cb(gpu_standby_timeout_ms, &sgu_timeout_ops, &gpu_standby_timeout_ms, 0644);
++MODULE_PARM_DESC(gpu_standby_timeout_ms, "GPU legacy RX standby deadline in ms (100..3600000, default 300000)");
++
+ enum sgu_op_phase { SGU_OP_EMPTY, SGU_OP_PREPARED, SGU_OP_PENDING,
+                     SGU_OP_COMPLETE, SGU_OP_TAKEN, SGU_OP_STANDBY };
+ struct sgu_hw_operation;
+@@ -44,7 +73,7 @@ struct sgu_hw_operation {
+     struct dma_fence *fence;
+     enum sgu_op_phase phase;
+     u32 payload_frames, total_frames, remaining, event_cursor, error_flags;
+-    u64 completion_ns;
++    u64 completion_ns, deadline_ns;
+     bool event_pending, retired, canceled, reuse_rx;
+ };
+ struct tbstream_gpu_context {
+@@ -52,12 +81,16 @@ struct tbstream_gpu_context {
+     spinlock_t lock; /* callbacks never acquire sdev->lock */
+     struct sgu_fence identity;
+     struct sgu_window windows[2];
+-    struct sgu_hw_operation operations[2];
++    struct sgu_hw_operation operations[2][SGU_MAX_QUEUE_DEPTH];
++    struct delayed_work watchdog;
++    u32 queue_depth;
+     struct sgu_controller_lifetime lifetime;
+     struct tbstream *stream_owner;
+     struct device *service_owner, *dma_owner, *xdomain_owner, *domain_owner;
+-    u64 import_counter, last_epoch, last_handle, last_sequence[2], fence_context, fence_sequence[2];
++    u64 import_counter, last_epoch, last_handle, last_sequence[2], fence_context;
++    u64 fence_sequence[2][SGU_MAX_QUEUE_DEPTH], submitted_sequence[2];
+     bool imported, started, armed, stopped, failed, rearming_rx, quarantined;
++    bool closing, requires_new_epoch;
+ };
+ 
+ static const char *sgu_fence_driver(struct dma_fence *fence) { return "strix-usb4stream"; }
+@@ -66,12 +99,39 @@ static void sgu_fence_free(struct dma_fence *fence)
+ {
+     /* base is the first member; reservation readers require an RCU grace period. */
+     dma_fence_free(fence);
++    /* Reservation objects and exported sync_files can outlive the stream FD. */
++    module_put(THIS_MODULE);
+ }
+ static const struct dma_fence_ops sgu_fence_ops = {
+     .get_driver_name = sgu_fence_driver, .get_timeline_name = sgu_fence_timeline,
+     .release = sgu_fence_free,
+ };
+ 
++static void tbstream_gpu_stop(struct tbstream_dev *sdev);
++static void sgu_watchdog(struct work_struct *work);
++
++static u32 sgu_operation_slot(struct tbstream_gpu_context *ctx, struct sgu_hw_operation *op)
++{
++    return op - ctx->operations[op->request.direction];
++}
++
++static struct sgu_hw_operation *sgu_find_operation(struct tbstream_gpu_context *ctx,
++                                                  u32 direction, u64 handle, u64 sequence)
++{
++    u32 slot;
++
++    if (direction > SGU_DIRECTION_RX || !handle || !sequence)
++        return NULL;
++    for (slot = 0; slot < ctx->queue_depth; ++slot) {
++        struct sgu_hw_operation *op = &ctx->operations[direction][slot];
++
++        if (op->request.handle == handle &&
++            op->request.sequence == sequence)
++            return op;
++    }
++    return NULL;
++}
++
+ static bool sgu_ring_running(struct tb_ring *ring)
+ {
+     unsigned long flags;
+@@ -87,7 +147,7 @@ static struct sgu_hw_frame *sgu_frame_at(struct tbstream_gpu_context *ctx,
+                                       struct sgu_hw_operation *op, u32 index)
+ {
+     u32 slot = index < op->payload_frames ? op->request.pool_offset / SGU_FRAME_BYTES + index :
+-               ctx->sdev->ring_size - 1U;
++               ctx->sdev->ring_size - ctx->queue_depth + sgu_operation_slot(ctx, op);
+     return &ctx->windows[op->request.direction].frames[slot];
+ }
+ 
+@@ -116,7 +176,8 @@ static void sgu_complete_locked(struct tbstream_gpu_context *ctx, struct sgu_hw_
+     op->event_cursor = 0;
+     op->event_pending = true;
+     *signal = dma_fence_get(op->fence);
+-    *error = op->error_flags ? -EIO : op->canceled ? -ECANCELED : 0;
++    *error = op->error_flags & SGU_FRAME_ERROR_TIMEOUT ? -ETIMEDOUT :
++             op->error_flags ? -EIO : op->canceled ? -ECANCELED : 0;
+ }
+ 
+ static void sgu_callback(struct tb_ring *ring, struct ring_frame *frame, bool canceled)
+@@ -138,7 +199,7 @@ static void sgu_callback(struct tb_ring *ring, struct ring_frame *frame, bool ca
+     --op->remaining;
+     if (canceled) {
+         f->result.actual_bytes = 0;
+-        f->result.error_flags = SGU_FRAME_ERROR_CANCELED;
++        f->result.error_flags |= SGU_FRAME_ERROR_CANCELED;
+         if (!(ctx->rearming_rx && op->phase == SGU_OP_STANDBY))
+             op->canceled = true;
+     } else {
+@@ -171,6 +232,8 @@ unlock:
+     sgu_signal(signal, error);
+     if (wake)
+         wake_up_interruptible_poll(&ctx->sdev->wait, EPOLLIN | EPOLLRDNORM | EPOLLERR);
++    if (READ_ONCE(ctx->failed) && !READ_ONCE(ctx->closing))
++        mod_delayed_work(system_wq, &ctx->watchdog, 0);
+ }
+ 
+ static void sgu_window_free(struct sgu_window *w)
+@@ -245,6 +308,11 @@ static int sgu_window_map(struct tbstream_gpu_context *ctx, struct sgu_window *w
+         if (!bytes || bytes > U64_MAX - logical || bytes > U64_MAX - (u64)sg_dma_address(sg) ||
+             sg_dma_is_swiotlb(sg))
+             goto fail;
++        /* Whole-allocation cache maintenance cannot overlap other DMA slots. */
++        if (ctx->queue_depth > 1 && dma_need_sync(w->device, sg_dma_address(sg))) {
++            ret = -EOPNOTSUPP;
++            goto fail;
++        }
+         segments[i].logical_offset = logical;
+         segments[i].dma_address = sg_dma_address(sg);
+         segments[i].bytes = bytes;
+@@ -296,44 +364,53 @@ static void sgu_operation_clear(struct tbstream_gpu_context *ctx, struct sgu_hw_
+     dma_fence_put(fence);
+ }
+ 
+-static int sgu_publish_fence(struct tbstream_gpu_context *ctx, struct sgu_hw_operation *op)
++static int sgu_publish_fence(struct tbstream_gpu_context *ctx, struct sgu_hw_operation *op,
++                             struct dma_fence **dependency)
+ {
+-    struct sgu_window *w = &ctx->windows[op->request.direction];
++    struct dma_resv *resv = ctx->windows[op->request.direction].buffer->resv;
+     struct sgu_dma_fence *f;
++    struct dma_resv_iter cursor;
++    struct dma_fence *fence, *previous;
+     enum dma_resv_usage wait_usage = op->request.direction == SGU_DIRECTION_TX ? DMA_RESV_USAGE_WRITE : DMA_RESV_USAGE_READ;
+     enum dma_resv_usage own_usage = op->request.direction == SGU_DIRECTION_TX ? DMA_RESV_USAGE_READ : DMA_RESV_USAGE_WRITE;
+-    long waited;
+-    struct dma_fence *previous;
++    u32 slot = sgu_operation_slot(ctx, op);
++    u64 *sequence = &ctx->fence_sequence[op->request.direction][slot];
+     unsigned long flags;
+     int ret;
+ 
+-    waited = dma_resv_wait_timeout(w->buffer->resv, wait_usage, true, msecs_to_jiffies(1000));
+-    if (waited < 0)
+-        return waited;
+-    if (!waited)
+-        return -ETIMEDOUT;
++    /* Never wait on GPU work or the reservation mutex under sdev->lock. */
++    if (!dma_resv_trylock(resv))
++        return -EAGAIN;
++    dma_resv_for_each_fence(&cursor, resv, wait_usage, fence) {
++        if (!sgu_owns_fence_context(ctx->fence_context, fence->context) &&
++            !dma_fence_is_signaled(fence)) {
++            *dependency = dma_fence_get(fence);
++            ret = -EAGAIN;
++            goto unlock;
++        }
++    }
++    if (*sequence == U64_MAX) {
++        ret = -EOVERFLOW;
++        goto unlock;
++    }
+     f = kzalloc(sizeof(*f), GFP_KERNEL);
+-    if (!f)
+-        return -ENOMEM;
+-    if (ctx->fence_sequence[op->request.direction] == U64_MAX) {
+-        kfree(f);
+-        return -EOVERFLOW;
++    if (!f) {
++        ret = -ENOMEM;
++        goto unlock;
+     }
+     spin_lock_init(&f->lock);
++    __module_get(THIS_MODULE);
+     dma_fence_init(&f->base, &sgu_fence_ops, &f->lock,
+-        ctx->fence_context + op->request.direction, ++ctx->fence_sequence[op->request.direction]);
+-    ret = dma_resv_lock_interruptible(w->buffer->resv, NULL);
+-    if (ret)
+-        goto put;
+-    if (!dma_resv_test_signaled(w->buffer->resv, wait_usage)) {
+-        ret = -EAGAIN;
++        ctx->fence_context + op->request.direction * SGU_MAX_QUEUE_DEPTH + slot, ++*sequence);
++    ret = dma_resv_reserve_fences(resv, 1);
++    if (ret) {
++        dma_fence_put(&f->base);
+         goto unlock;
+     }
+-    ret = dma_resv_reserve_fences(w->buffer->resv, 1);
+-    if (ret)
+-        goto unlock;
+-    dma_resv_add_fence(w->buffer->resv, &f->base, own_usage);
+-    dma_resv_unlock(w->buffer->resv);
++    /* Own slots were checked for overlap at PREPARE and keep independent
++     * timelines. External readers/writers must still wait for every slot. */
++    dma_resv_add_fence(resv, &f->base, own_usage);
++    dma_resv_unlock(resv);
+     spin_lock_irqsave(&ctx->lock, flags);
+     previous = op->fence;
+     op->fence = &f->base;
+@@ -341,13 +418,12 @@ static int sgu_publish_fence(struct tbstream_gpu_context *ctx, struct sgu_hw_ope
+     dma_fence_put(previous);
+     return 0;
+ unlock:
+-    dma_resv_unlock(w->buffer->resv);
+-put:
+-    dma_fence_put(&f->base);
++    dma_resv_unlock(resv);
+     return ret;
+ }
+ 
+-static int sgu_enqueue(struct tbstream_gpu_context *ctx, struct sgu_hw_operation *op, bool standby)
++static int sgu_enqueue(struct tbstream_gpu_context *ctx, struct sgu_hw_operation *op,
++                       bool standby, struct dma_fence **dependency)
+ {
+     struct sgu_window *w = &ctx->windows[op->request.direction];
+     struct tb_ring *ring = op->request.direction == SGU_DIRECTION_TX ? ctx->sdev->tx_ring.ring : ctx->sdev->rx_ring.ring;
+@@ -357,11 +433,13 @@ static int sgu_enqueue(struct tbstream_gpu_context *ctx, struct sgu_hw_operation
+     int ret, error = 0;
+     u32 i;
+ 
+-    ret = sgu_publish_fence(ctx, op);
++    ret = sgu_publish_fence(ctx, op, dependency);
+     if (ret)
+         return ret;
+     dma_sync_sgtable_for_device(w->device, w->mapping, w->direction);
+     spin_lock_irqsave(&ctx->lock, flags);
++    op->deadline_ns = ktime_get_ns() + (u64)(standby ? READ_ONCE(gpu_standby_timeout_ms) :
++                                          READ_ONCE(gpu_dma_timeout_ms)) * NSEC_PER_MSEC;
+     op->phase = standby ? SGU_OP_STANDBY : SGU_OP_PENDING;
+     op->remaining = op->total_frames;
+     op->error_flags = 0;
+@@ -393,8 +471,11 @@ static int sgu_enqueue(struct tbstream_gpu_context *ctx, struct sgu_hw_operation
+     spin_unlock_irqrestore(&ctx->lock, flags);
+ 
+     ret = __tb_ring_enqueue_list(ring, &frames);
+-    if (!ret)
++    if (!ret) {
++        /* New traffic must not push out an older operation's watchdog. */
++        queue_delayed_work(system_wq, &ctx->watchdog, msecs_to_jiffies(100));
+         return 0;
++    }
+ 
+     /* Failure is all-or-nothing: none of these slots reached the ring. */
+     spin_lock_irqsave(&ctx->lock, flags);
+@@ -413,13 +494,14 @@ cancel_locked:
+         struct sgu_hw_frame *f = sgu_frame_at(ctx, op, i);
+ 
+         f->result.actual_bytes = 0;
+-        f->result.error_flags = SGU_FRAME_ERROR_CANCELED;
++        f->result.error_flags |= SGU_FRAME_ERROR_CANCELED;
+     }
+     op->remaining = 0;
+     sgu_complete_locked(ctx, op, &signal, &error);
+     spin_unlock_irqrestore(&ctx->lock, flags);
+     sgu_signal(signal, error);
+     wake_up_interruptible_poll(&ctx->sdev->wait, EPOLLIN | EPOLLRDNORM | EPOLLERR);
++    mod_delayed_work(system_wq, &ctx->watchdog, 0);
+     return ret;
+ }
+ 
+@@ -451,7 +533,9 @@ static int tbstream_gpu_open(struct tbstream_dev *sdev)
+     spin_lock_init(&ctx->lock);
+     ctx->lifetime.stop_confirmed = 1;
+     ctx->lifetime.paths_removed = 1;
+-    ctx->fence_context = dma_fence_context_alloc(2); /* independent TX/RX ordered timelines */
++    ctx->queue_depth = 1; /* legacy ABI remains the default */
++    INIT_DELAYED_WORK(&ctx->watchdog, sgu_watchdog);
++    ctx->fence_context = dma_fence_context_alloc(2 * SGU_MAX_QUEUE_DEPTH);
+     ctx->stream_owner = tbstream_get(sdev->stream);
+     ctx->service_owner = get_device(&sdev->stream->svc->dev);
+     ctx->xdomain_owner = get_device(&xd->dev);
+@@ -524,9 +608,64 @@ static void tbstream_gpu_stop(struct tbstream_dev *sdev)
+         WRITE_ONCE(ctx->failed, true);
+     }
+     spin_unlock_irqrestore(&ctx->lock, flags);
++    cancel_delayed_work(&ctx->watchdog);
+     wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLERR);
+ }
+ 
++/* Never block on sdev->lock: close cancels this work while holding that mutex. */
++static void sgu_watchdog(struct work_struct *work)
++{
++    struct tbstream_gpu_context *ctx = container_of(to_delayed_work(work),
++                                                   struct tbstream_gpu_context, watchdog);
++    struct tbstream_dev *sdev = ctx->sdev;
++    unsigned long flags;
++    u64 now = ktime_get_ns();
++    u32 direction, slot, i;
++    bool pending = false, expired = false;
++
++    if (!mutex_trylock(&sdev->lock)) {
++        if (!READ_ONCE(ctx->closing))
++            mod_delayed_work(system_wq, &ctx->watchdog, msecs_to_jiffies(100));
++        return;
++    }
++    if (ctx->closing || ctx->stopped)
++        goto unlock;
++    spin_lock_irqsave(&ctx->lock, flags);
++    for (direction = 0; direction < 2; ++direction) {
++        for (slot = 0; slot < ctx->queue_depth; ++slot) {
++            struct sgu_hw_operation *op = &ctx->operations[direction][slot];
++
++            if (!op->remaining)
++                continue;
++            pending = true;
++            if (now < op->deadline_ns)
++                continue;
++            expired = true;
++            op->error_flags |= SGU_FRAME_ERROR_TIMEOUT;
++            for (i = 0; i < op->total_frames; ++i) {
++                struct sgu_hw_frame *f = sgu_frame_at(ctx, op, i);
++
++                if (f->queued)
++                    f->result.error_flags |= SGU_FRAME_ERROR_TIMEOUT;
++            }
++        }
++    }
++    if (expired)
++        WRITE_ONCE(ctx->failed, true);
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    if (READ_ONCE(ctx->failed)) {
++        if (expired)
++            dev_warn(ctx->dma_owner, "GPU stream DMA deadline expired; stopping session, not resetting NHI\n");
++        /* STOP drains/cancels callbacks. Never signal a still-owned buffer
++         * merely because a wall-clock deadline expired. */
++        tbstream_gpu_stop(sdev);
++    } else if (pending) {
++        mod_delayed_work(system_wq, &ctx->watchdog, msecs_to_jiffies(100));
++    }
++unlock:
++    mutex_unlock(&sdev->lock);
++}
++
+ static bool sgu_can_release(struct tbstream_gpu_context *ctx)
+ {
+     unsigned long flags;
+@@ -553,8 +692,11 @@ static bool tbstream_gpu_paths_pending(struct tbstream_dev *sdev)
+ 
+ static void sgu_release_windows(struct tbstream_gpu_context *ctx)
+ {
+-    sgu_operation_clear(ctx, &ctx->operations[SGU_DIRECTION_TX]);
+-    sgu_operation_clear(ctx, &ctx->operations[SGU_DIRECTION_RX]);
++    u32 direction, slot;
++
++    for (direction = 0; direction < 2; ++direction)
++        for (slot = 0; slot < SGU_MAX_QUEUE_DEPTH; ++slot)
++            sgu_operation_clear(ctx, &ctx->operations[direction][slot]);
+     sgu_window_free(&ctx->windows[SGU_DIRECTION_RX]);
+     sgu_window_free(&ctx->windows[SGU_DIRECTION_TX]);
+     ctx->imported = false;
+@@ -569,6 +711,8 @@ static void tbstream_gpu_close(struct tbstream_dev *sdev)
+ 
+     if (!ctx)
+         return;
++    WRITE_ONCE(ctx->closing, true);
++    cancel_delayed_work_sync(&ctx->watchdog);
+     tbstream_gpu_stop(sdev);
+     if (WARN_ON_ONCE(!sgu_can_release(ctx))) {
+         if (!ctx->quarantined) {
+@@ -600,6 +744,7 @@ static int sgu_import_windows(struct tbstream_gpu_context *ctx, struct sgu_impor
+         !sgu_endpoint_equal(&request->fence, &ctx->identity) || request->fence.import_generation ||
+         !request->fence.pool_binding_identity || !request->fence.connection_epoch ||
+         request->fence.connection_epoch < ctx->last_epoch ||
++        (ctx->requires_new_epoch && request->fence.connection_epoch <= ctx->last_epoch) ||
+         (request->fence.connection_epoch != ctx->last_epoch &&
+          request->fence.connection_epoch <= ctx->sdev->gpu_last_epoch) ||
+         request->reserved[0] || request->reserved[1] ||
+@@ -618,8 +763,11 @@ static int sgu_import_windows(struct tbstream_gpu_context *ctx, struct sgu_impor
+         ret = -EINVAL;
+         goto free_rx;
+     }
+-    if (request->fence.connection_epoch != ctx->last_epoch)
++    if (request->fence.connection_epoch != ctx->last_epoch) {
+         ctx->last_sequence[0] = ctx->last_sequence[1] = 0;
++        ctx->submitted_sequence[0] = ctx->submitted_sequence[1] = 0;
++    }
++    ctx->requires_new_epoch = false;
+     ctx->last_epoch = request->fence.connection_epoch;
+     ctx->sdev->gpu_last_epoch = request->fence.connection_epoch;
+     ctx->identity.connection_epoch = request->fence.connection_epoch;
+@@ -671,21 +819,24 @@ static int sgu_arm(struct tbstream_gpu_context *ctx)
+     return 0;
+ }
+ 
+-static int sgu_prepare_operation(struct tbstream_gpu_context *ctx, const struct sgu_prepare *request)
++static int sgu_prepare_operation(struct tbstream_gpu_context *ctx,
++                                 const struct sgu_prepare *request, u32 slot)
+ {
+     struct sgu_hw_operation *op;
+     unsigned long flags;
+-    u32 payload_frames, i;
++    u32 payload_frames, i, other;
+     int ret = sgu_live(ctx, &request->fence, false);
+ 
+     if (ret)
+         return ret;
+-    if (!sgu_prepare_valid(request, ctx->sdev->ring_size, &payload_frames) ||
++    if (slot >= ctx->queue_depth ||
++        !sgu_prepare_queue_valid(request, ctx->sdev->ring_size, ctx->queue_depth, &payload_frames) ||
+         request->handle <= ctx->last_handle || request->sequence <= ctx->last_sequence[request->direction])
+         return -EINVAL;
+-    op = &ctx->operations[request->direction];
++    op = &ctx->operations[request->direction][slot];
+     spin_lock_irqsave(&ctx->lock, flags);
+-    if (op->phase == SGU_OP_STANDBY && op->retired && request->direction == SGU_DIRECTION_RX) {
++    if (ctx->queue_depth == 1 && op->phase == SGU_OP_STANDBY && op->retired &&
++        request->direction == SGU_DIRECTION_RX) {
+         if (op->remaining != op->total_frames || READ_ONCE(ctx->failed)) {
+             spin_unlock_irqrestore(&ctx->lock, flags);
+             return -ESHUTDOWN;
+@@ -700,11 +851,20 @@ static int sgu_prepare_operation(struct tbstream_gpu_context *ctx, const struct
+             return -EOPNOTSUPP;
+         }
+         op->reuse_rx = true;
+-    }
+-    if (op->phase != SGU_OP_EMPTY && !op->reuse_rx) {
++    } else if (op->phase != SGU_OP_EMPTY) {
+         spin_unlock_irqrestore(&ctx->lock, flags);
+         return -EBUSY;
+     }
++    for (other = 0; other < ctx->queue_depth; ++other) {
++        struct sgu_hw_operation *occupied = &ctx->operations[request->direction][other];
++
++        if (other != slot && occupied->phase != SGU_OP_EMPTY &&
++            sgu_frame_ranges_overlap(request->pool_offset, payload_frames,
++                                     occupied->request.pool_offset, occupied->payload_frames)) {
++            spin_unlock_irqrestore(&ctx->lock, flags);
++            return -EBUSY;
++        }
++    }
+     op->request = *request;
+     op->payload_frames = payload_frames;
+     op->total_frames = payload_frames + 1U;
+@@ -735,7 +895,7 @@ static long sgu_event_ioctl(struct tbstream_gpu_context *ctx, void __user *user)
+     struct sgu_event *out;
+     struct sgu_hw_operation *op = NULL;
+     unsigned long flags;
+-    u32 direction, i;
++    u32 direction, slot, i;
+     int ret;
+ 
+     out = kzalloc(sizeof(*out), GFP_KERNEL);
+@@ -754,10 +914,12 @@ static long sgu_event_ioctl(struct tbstream_gpu_context *ctx, void __user *user)
+     }
+     spin_lock_irqsave(&ctx->lock, flags);
+     for (direction = 0; direction < 2; ++direction) {
+-        struct sgu_hw_operation *candidate = &ctx->operations[direction];
++        for (slot = 0; slot < ctx->queue_depth; ++slot) {
++            struct sgu_hw_operation *candidate = &ctx->operations[direction][slot];
+ 
+-        if (candidate->event_pending && (!op || candidate->completion_ns < op->completion_ns))
+-            op = candidate;
++            if (candidate->event_pending && (!op || candidate->completion_ns < op->completion_ns))
++                op = candidate;
++        }
+     }
+     if (!op) {
+         spin_unlock_irqrestore(&ctx->lock, flags);
+@@ -793,22 +955,39 @@ free:
+     return ret;
+ }
+ 
+-static int sgu_action_execute(struct tbstream_gpu_context *ctx, unsigned int command, struct sgu_action *a)
++static int sgu_action_execute(struct tbstream_gpu_context *ctx, unsigned int command,
++                              struct sgu_action *a, struct dma_fence **dependency)
+ {
+     struct sgu_hw_operation *op;
+     unsigned long flags;
+     bool allowed;
+-    int ret = sgu_live(ctx, &a->fence, command == SGU_IOC_STOP || command == SGU_IOC_RELEASE || command == SGU_IOC_CANCEL);
++    int ret = sgu_live(ctx, &a->fence, command == SGU_IOC_STOP || command == SGU_IOC_RELEASE ||
++                      command == SGU_IOC_CANCEL || command == SGU_IOC_RECOVER);
+ 
+     if (ret)
+         return ret;
+     if (a->reserved || a->result || a->queued_frames || a->direction > SGU_DIRECTION_RX)
+         return -EINVAL;
+-    if (command == SGU_IOC_ARM || command == SGU_IOC_STOP || command == SGU_IOC_RELEASE) {
++    if (command == SGU_IOC_ARM || command == SGU_IOC_STOP ||
++        command == SGU_IOC_RELEASE || command == SGU_IOC_RECOVER) {
+         if (a->handle || a->sequence || a->direction)
+             return -EINVAL;
+         if (command == SGU_IOC_ARM)
+             return sgu_arm(ctx);
++        if (command == SGU_IOC_RECOVER) {
++            if (tbstream_dev_valid(ctx->sdev))
++                return -ENODEV;
++            tbstream_gpu_stop(ctx->sdev);
++            if (!sgu_can_release(ctx))
++                return -EIO;
++            sgu_release_windows(ctx);
++            WRITE_ONCE(ctx->failed, false);
++            ctx->lifetime.cancel_requested = 0;
++            ctx->requires_new_epoch = true;
++            a->fence = ctx->identity;
++            a->result = SGU_RESULT_SESSION_RECOVERED;
++            return 0;
++        }
+         if (command == SGU_IOC_STOP) {
+             tbstream_gpu_stop(ctx->sdev);
+             if (!sgu_can_release(ctx))
+@@ -821,33 +1000,38 @@ static int sgu_action_execute(struct tbstream_gpu_context *ctx, unsigned int com
+         sgu_release_windows(ctx);
+         return 0;
+     }
+-    op = &ctx->operations[a->direction];
+-    spin_lock_irqsave(&ctx->lock, flags);
+-    allowed = a->handle && a->sequence && op->request.handle == a->handle && op->request.sequence == a->sequence;
+-    spin_unlock_irqrestore(&ctx->lock, flags);
+-    if (!allowed)
++    op = sgu_find_operation(ctx, a->direction, a->handle, a->sequence);
++    if (!op)
+         return -ESTALE;
+     switch (command) {
+     case SGU_IOC_SUBMIT:
++        if (a->sequence <= ctx->submitted_sequence[a->direction])
++            return -ESTALE;
+         spin_lock_irqsave(&ctx->lock, flags);
+         allowed = ctx->armed && !READ_ONCE(ctx->failed) && op->phase == SGU_OP_PREPARED;
+-        spin_unlock_irqrestore(&ctx->lock, flags);
+-        if (!allowed)
++        if (!allowed) {
++            spin_unlock_irqrestore(&ctx->lock, flags);
+             return -EINVAL;
+-        spin_lock_irqsave(&ctx->lock, flags);
++        }
++        /* Check and transition under the same lock: a standby callback must
++         * not change the phase between admission and RX reuse. */
+         if (op->reuse_rx) {
+             /* The pending repost fence and controller ownership are retained;
+              * only the next peer-agreed operation identity has changed. */
+             op->reuse_rx = false;
+             op->phase = SGU_OP_PENDING;
++            op->deadline_ns = ktime_get_ns() + (u64)READ_ONCE(gpu_dma_timeout_ms) * NSEC_PER_MSEC;
++            ctx->submitted_sequence[a->direction] = a->sequence;
+             a->queued_frames = op->total_frames;
+             spin_unlock_irqrestore(&ctx->lock, flags);
+             return 0;
+         }
+         spin_unlock_irqrestore(&ctx->lock, flags);
+-        ret = sgu_enqueue(ctx, op, false);
+-        if (!ret)
++        ret = sgu_enqueue(ctx, op, false, dependency);
++        if (!ret) {
++            ctx->submitted_sequence[a->direction] = a->sequence;
+             a->queued_frames = op->total_frames;
++        }
+         return ret;
+     case SGU_IOC_CANCEL:
+         spin_lock_irqsave(&ctx->lock, flags);
+@@ -856,15 +1040,18 @@ static int sgu_action_execute(struct tbstream_gpu_context *ctx, unsigned int com
+         ctx->lifetime.cancel_requested = 1;
+         spin_unlock_irqrestore(&ctx->lock, flags);
+         a->result = SGU_RESULT_CANCEL_REQUESTED;
++        mod_delayed_work(system_wq, &ctx->watchdog, 0);
+         return 0; /* no pending count changes: cancellation is not a stop */
+     case SGU_IOC_RX_REPOST:
++        if (ctx->queue_depth > 1)
++            return -EOPNOTSUPP;
+         spin_lock_irqsave(&ctx->lock, flags);
+         allowed = a->direction == SGU_DIRECTION_RX && op->phase == SGU_OP_TAKEN && !op->remaining &&
+                   !op->error_flags && !op->canceled && !READ_ONCE(ctx->failed);
+         spin_unlock_irqrestore(&ctx->lock, flags);
+         if (!allowed)
+             return -EINVAL;
+-        ret = sgu_enqueue(ctx, op, true);
++        ret = sgu_enqueue(ctx, op, true, dependency);
+         if (!ret) {
+             a->result = SGU_RESULT_RX_REPOSTED;
+             a->queued_frames = op->total_frames;
+@@ -876,7 +1063,7 @@ static int sgu_action_execute(struct tbstream_gpu_context *ctx, unsigned int com
+             spin_unlock_irqrestore(&ctx->lock, flags);
+             return -ESTALE;
+         }
+-        if (a->direction == SGU_DIRECTION_RX) {
++        if (a->direction == SGU_DIRECTION_RX && ctx->queue_depth == 1) {
+             if (op->phase != SGU_OP_STANDBY || READ_ONCE(ctx->failed)) {
+                 spin_unlock_irqrestore(&ctx->lock, flags);
+                 return -EINVAL;
+@@ -896,6 +1083,127 @@ static int sgu_action_execute(struct tbstream_gpu_context *ctx, unsigned int com
+     }
+ }
+ 
++/* Called and returns with sdev->lock held. Only an owned fence reference
++ * crosses the unlocked interval; operation/window/context pointers never do. */
++static int sgu_action_wait(struct file *file, struct tbstream_dev *sdev,
++                           unsigned int command, struct sgu_action *action)
++{
++    unsigned long deadline = jiffies + msecs_to_jiffies(1000);
++
++    for (;;) {
++        struct tbstream_gpu_context *ctx = sdev->gpu_context;
++        struct dma_fence *dependency = NULL;
++        long waited;
++        unsigned long slice;
++        int ret;
++
++        if (!ctx)
++            return -ENXIO;
++        ret = sgu_action_execute(ctx, command, action, &dependency);
++        if (ret != -EAGAIN || (command != SGU_IOC_SUBMIT && command != SGU_IOC_RX_REPOST) ||
++            (file->f_flags & O_NONBLOCK)) {
++            dma_fence_put(dependency);
++            return ret;
++        }
++        if (time_after_eq(jiffies, deadline)) {
++            dma_fence_put(dependency);
++            return -ETIMEDOUT;
++        }
++        slice = min_t(unsigned long, deadline - jiffies, msecs_to_jiffies(20));
++        mutex_unlock(&sdev->lock);
++        if (dependency) {
++            waited = dma_fence_wait_timeout(dependency, true, slice);
++        } else {
++            /* Reservation lock contention: yield instead of waiting for our
++             * own queued RX fences and accidentally serializing the queue. */
++            schedule_timeout_interruptible(1);
++            waited = signal_pending(current) ? -ERESTARTSYS : 1;
++        }
++        dma_fence_put(dependency);
++        mutex_lock(&sdev->lock);
++        if (waited < 0)
++            return waited;
++        /* Revalidate endpoint, generation, phase and sequence on every retry.
++         * STOP/RELEASE/disconnect and the other direction can run while waiting. */
++    }
++}
++
++static int sgu_queue_ioctl(struct tbstream_gpu_context *ctx, void __user *user)
++{
++    struct sgu_queue_config q;
++    unsigned long flags;
++    u32 depth;
++
++    if (copy_from_user(&q, user, sizeof(q)))
++        return -EFAULT;
++    if (memcmp(&q.fence, &ctx->identity, sizeof(q.fence)))
++        return -ESTALE;
++    if (q.maximum_depth || q.features || q.reserved || q.depth > SGU_MAX_QUEUE_DEPTH)
++        return -EINVAL;
++    if (q.depth && (ctx->imported || ctx->started || READ_ONCE(ctx->failed)))
++        return -EBUSY;
++    depth = q.depth ? q.depth : ctx->queue_depth;
++    q.depth = depth;
++    q.maximum_depth = SGU_MAX_QUEUE_DEPTH;
++    q.features = SGU_CAP_MULTI_OP | SGU_CAP_NONBLOCK_SUBMIT | SGU_CAP_SYNC_FILE |
++                 SGU_CAP_SESSION_RECOVERY | SGU_CAP_DMA_TIMEOUT;
++    if (copy_to_user(user, &q, sizeof(q)))
++        return -EFAULT;
++    spin_lock_irqsave(&ctx->lock, flags);
++    ctx->queue_depth = depth;
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    return 0;
++}
++
++static int sgu_export_sync_file(struct tbstream_gpu_context *ctx, void __user *user)
++{
++    struct sgu_sync_file request;
++    struct sgu_hw_operation *op;
++    struct dma_fence *fence;
++    struct sync_file *sync;
++    unsigned long flags;
++    int fd, ret;
++
++    if (copy_from_user(&request, user, sizeof(request)))
++        return -EFAULT;
++    ret = sgu_live(ctx, &request.fence, true);
++    if (ret)
++        return ret;
++    if (request.fd != -1 || request.reserved)
++        return -EINVAL;
++    op = sgu_find_operation(ctx, request.direction, request.handle, request.sequence);
++    if (!op)
++        return -ESTALE;
++    spin_lock_irqsave(&ctx->lock, flags);
++    if (op->phase != SGU_OP_PENDING && op->phase != SGU_OP_COMPLETE && op->phase != SGU_OP_TAKEN) {
++        spin_unlock_irqrestore(&ctx->lock, flags);
++        return -EINVAL;
++    }
++    fence = dma_fence_get(op->fence);
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    if (!fence)
++        return -ENOENT;
++    fd = get_unused_fd_flags(O_CLOEXEC);
++    if (fd < 0) {
++        dma_fence_put(fence);
++        return fd;
++    }
++    sync = sync_file_create(fence);
++    dma_fence_put(fence);
++    if (!sync) {
++        put_unused_fd(fd);
++        return -ENOMEM;
++    }
++    request.fd = fd;
++    if (copy_to_user(user, &request, sizeof(request))) {
++        fput(sync->file);
++        put_unused_fd(fd);
++        return -EFAULT;
++    }
++    fd_install(fd, sync->file);
++    return 0;
++}
++
+ static long tbstream_gpu_ioctl(struct file *file, unsigned int command, unsigned long argument)
+ {
+     struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+@@ -952,18 +1260,37 @@ static long tbstream_gpu_ioctl(struct file *file, unsigned int command, unsigned
+     } else if (command == SGU_IOC_PREPARE) {
+         struct sgu_prepare request;
+ 
+-        ret = copy_from_user(&request, user, sizeof(request)) ? -EFAULT : sgu_prepare_operation(ctx, &request);
++        if (ctx->queue_depth != 1)
++            ret = -EOPNOTSUPP;
++        else
++            ret = copy_from_user(&request, user, sizeof(request)) ? -EFAULT :
++                  sgu_prepare_operation(ctx, &request, 0);
++    } else if (command == SGU_IOC_PREPARE_SLOT) {
++        struct sgu_prepare_slot request;
++
++        if (copy_from_user(&request, user, sizeof(request)))
++            ret = -EFAULT;
++        else if (request.reserved)
++            ret = -EINVAL;
++        else
++            ret = sgu_prepare_operation(ctx, &request.operation, request.slot);
++    } else if (command == SGU_IOC_QUEUE) {
++        ret = sgu_queue_ioctl(ctx, user);
++    } else if (command == SGU_IOC_EXPORT_SYNC_FILE) {
++        ret = sgu_export_sync_file(ctx, user);
+     } else if (command == SGU_IOC_EVENT) {
+         ret = sgu_event_ioctl(ctx, user);
+     } else if (command == SGU_IOC_ARM || command == SGU_IOC_SUBMIT || command == SGU_IOC_CANCEL ||
+-               command == SGU_IOC_RX_REPOST || command == SGU_IOC_RETIRE || command == SGU_IOC_STOP || command == SGU_IOC_RELEASE) {
++               command == SGU_IOC_RX_REPOST || command == SGU_IOC_RETIRE || command == SGU_IOC_STOP ||
++               command == SGU_IOC_RELEASE || command == SGU_IOC_RECOVER) {
+         struct sgu_action action;
+ 
+         if (copy_from_user(&action, user, sizeof(action))) {
+             ret = -EFAULT;
+             goto unlock;
+         }
+-        ret = sgu_action_execute(ctx, command, &action);
++        ret = sgu_action_wait(file, sdev, command, &action);
++        ctx = sdev->gpu_context; /* the wait may have dropped sdev->lock */
+         if (!ret && copy_to_user(user, &action, sizeof(action))) {
+             WRITE_ONCE(ctx->failed, true); /* never treat a lost side-effect reply as rollback */
+             ret = -EFAULT;
+@@ -982,13 +1309,16 @@ static __poll_t tbstream_gpu_poll(struct file *file, poll_table *wait)
+     struct tbstream_gpu_context *ctx = READ_ONCE(sdev->gpu_context);
+     unsigned long flags;
+     __poll_t mask = 0;
++    u32 direction, slot;
+ 
+     poll_wait(file, &sdev->wait, wait);
+     if (!ctx)
+         return EPOLLERR | EPOLLHUP;
+     spin_lock_irqsave(&ctx->lock, flags);
+-    if (ctx->operations[0].event_pending || ctx->operations[1].event_pending)
+-        mask |= EPOLLIN | EPOLLRDNORM;
++    for (direction = 0; direction < 2; ++direction)
++        for (slot = 0; slot < ctx->queue_depth; ++slot)
++            if (ctx->operations[direction][slot].event_pending)
++                mask |= EPOLLIN | EPOLLRDNORM;
+     if (READ_ONCE(ctx->failed) || READ_ONCE(sdev->stream) != ctx->stream_owner || READ_ONCE(sdev->removed))
+         mask |= EPOLLERR | EPOLLHUP;
+     spin_unlock_irqrestore(&ctx->lock, flags);
+diff --git a/drivers/thunderbolt/gpu_stream_logic.h b/drivers/thunderbolt/gpu_stream_logic.h
+index 14e774d..0c14109 100644
+--- a/drivers/thunderbolt/gpu_stream_logic.h
++++ b/drivers/thunderbolt/gpu_stream_logic.h
+@@ -103,6 +103,33 @@ static inline int sgu_prepare_valid(const struct sgu_prepare *p, __u32 frames, _
+     return 1;
+ }
+ 
++/* Apply the original wire validation before reserving the terminal bank. */
++static inline int sgu_prepare_queue_valid(const struct sgu_prepare *p, __u32 frames,
++                                         __u32 depth, __u32 *payload_frames)
++{
++    __u64 terminal;
++
++    if (!depth || depth > SGU_MAX_QUEUE_DEPTH || depth >= frames ||
++        !sgu_prepare_valid(p, frames, payload_frames))
++        return 0;
++    terminal = (__u64)(frames - depth) * SGU_FRAME_BYTES;
++    return p->pool_offset < terminal && p->payload_bytes <= terminal - p->pool_offset;
++}
++
++static inline int sgu_frame_ranges_overlap(__u64 a, __u32 na, __u64 b, __u32 nb)
++{
++    if (!na || !nb)
++        return 0;
++    return a <= b ? b - a < (__u64)na * SGU_FRAME_BYTES :
++                    a - b < (__u64)nb * SGU_FRAME_BYTES;
++}
++
++/* Separate timelines: failing one enqueue must not signal another slot. */
++static inline int sgu_owns_fence_context(__u64 base, __u64 context)
++{
++    return context >= base && context - base < 2U * SGU_MAX_QUEUE_DEPTH;
++}
++
+ static inline int sgu_controller_queue_batch(struct sgu_controller_lifetime *l, __u32 count)
+ {
+     if (!count || count > 2U * SGU_MAX_FRAMES || l->stop_confirmed ||
+diff --git a/include/uapi/linux/strix_gpu_stream.h b/include/uapi/linux/strix_gpu_stream.h
+index 4ad3d43..739cdee 100644
+--- a/include/uapi/linux/strix_gpu_stream.h
++++ b/include/uapi/linux/strix_gpu_stream.h
+@@ -12,6 +12,7 @@
+ #define SGU_FRAME_BYTES 4096U
+ #define SGU_EVENT_BATCH 64U
+ #define SGU_MAX_FRAMES 4096U
++#define SGU_MAX_QUEUE_DEPTH 8U
+ #define SGU_MAX_SG_ENTRIES 65536U
+ #define SGU_MAX_IMPORTED_BYTES (128ULL * 1024ULL * 1024ULL)
+ 
+@@ -33,11 +34,19 @@
+ #define SGU_FRAME_ERROR_PROTOCOL 8U
+ #define SGU_FRAME_ERROR_CANCELED 16U
+ #define SGU_FRAME_ERROR_STANDBY_ARRIVAL 32U
++#define SGU_FRAME_ERROR_TIMEOUT 64U
+ 
+ #define SGU_RESULT_NONE 0U
+ #define SGU_RESULT_CANCEL_REQUESTED 1U
+ #define SGU_RESULT_CONTROLLER_STOPPED 2U
+ #define SGU_RESULT_RX_REPOSTED 3U
++#define SGU_RESULT_SESSION_RECOVERED 4U
++
++#define SGU_CAP_MULTI_OP 1U
++#define SGU_CAP_NONBLOCK_SUBMIT 2U
++#define SGU_CAP_SYNC_FILE 4U
++#define SGU_CAP_SESSION_RECOVERY 8U
++#define SGU_CAP_DMA_TIMEOUT 16U
+ 
+ /* Observed endpoint identity; import generation zero means no active import. */
+ struct sgu_fence {
+@@ -149,6 +158,55 @@ struct sgu_event {
+     struct sgu_frame_result frames[SGU_EVENT_BATCH];
+ };
+ 
++/* Optional extensions: old command sizes and the default depth=1 are unchanged.
++ * QUEUE input: exact QUERY identity, depth=0 to query or 1..maximum_depth to
++ * configure before IMPORT; maximum_depth/features/reserved must be zero.
++ * Depth > 1 reserves the final `depth` frames as per-slot terminal storage.
++ * DMA mappings requiring CPU cache sync cannot use the multi-operation mode.
++ * Features describe software interfaces, NOT hardware qualification. */
++struct sgu_queue_config {
++    struct sgu_fence fence;
++    __u32 depth;
++    __u32 maximum_depth;
++    __u32 features;
++    __u32 reserved;
++};
++
++/* Slot must be < configured depth. Payload reserves whole frame slots and
++ * cannot overlap another unretired operation or any terminal slot.
++ * Terminal offset = (ring_frames - depth + slot) * SGU_FRAME_BYTES.
++ * SUBMIT order must have increasing sequence numbers in each direction.
++ * In depth>1 mode RX_REPOST is unsupported: RETIRE after consuming EVENT,
++ * then PREPARE_SLOT/SUBMIT another operation without stopping either ring.
++ * Coordinate the same slot geometry and submission order with the peer. */
++struct sgu_prepare_slot {
++    struct sgu_prepare operation;
++    __u32 slot;
++    __u32 reserved;
++};
++
++/* Export a submitted operation's local controller fence (not a remote ACK).
++ * Input fd=-1, reserved=0. Success installs an O_CLOEXEC sync_file descriptor.
++ * An exported fence remains valid after RETIRE/RELEASE/close.
++ * Never substitute one operation's fence for all accesses to the DMA-BUF:
++ * other slots can still be using the allocation. */
++struct sgu_sync_file {
++    struct sgu_fence fence;
++    __aligned_u64 handle;
++    __aligned_u64 sequence;
++    __u32 direction;
++    __s32 fd;
++    __aligned_u64 reserved;
++};
++
++/* RECOVER uses sgu_action with zero handle/sequence/direction. It stops only
++ * this session, requires proven local quiescence, releases its imports and
++ * clears its failure state. A fresh strictly larger peer-agreed epoch is
++ * mandatory. It does NOT reset the NHI, retrain the cable, or certify the peer.
++ * Success returns the unimported identity in fence and SESSION_RECOVERED.
++ * Blocking SUBMIT/RX_REPOST waits for foreign fences without holding the
++ * device mutex; O_NONBLOCK returns EAGAIN without publishing/enqueuing. */
++
+ /* Experimental numbers local to this opt-in device mode, not allocated stock
+  * USB4STREAM ioctls. Exact command/size is checked; unknown commands fail. */
+ #define SGU_IOC_QUERY _IOWR(0xb7, 0x40, struct sgu_query)
+@@ -162,5 +220,9 @@ struct sgu_event {
+ #define SGU_IOC_RETIRE _IOWR(0xb7, 0x48, struct sgu_action)
+ #define SGU_IOC_STOP _IOWR(0xb7, 0x49, struct sgu_action)
+ #define SGU_IOC_RELEASE _IOWR(0xb7, 0x4a, struct sgu_action)
++#define SGU_IOC_QUEUE _IOWR(0xb7, 0x4b, struct sgu_queue_config)
++#define SGU_IOC_EXPORT_SYNC_FILE _IOWR(0xb7, 0x4c, struct sgu_sync_file)
++#define SGU_IOC_RECOVER _IOWR(0xb7, 0x4d, struct sgu_action)
++#define SGU_IOC_PREPARE_SLOT _IOW(0xb7, 0x4e, struct sgu_prepare_slot)
+ 
+ #endif
