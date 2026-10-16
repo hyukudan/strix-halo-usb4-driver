@@ -1,0 +1,63 @@
+name: USB4 audit validation
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: python3 tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source"
+      - run: python3 -m unittest discover -s tests -v
+        env:
+          USB4_SOURCE_TREE: ${{ runner.temp }}/usb4-source
+  kernel-objects:
+    needs: unit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: driver
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: torvalds/linux
+          ref: 72d3fcf802c45d00b300f25b848a93c3a2bd7c7e
+          path: kernel
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y flex bison libelf-dev libssl-dev
+      - name: Reconstruct and compare both reconstruction methods
+        run: |
+          python3 driver/tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source"
+          cd kernel
+          while IFS= read -r patch; do
+            git apply --check "../driver/patches/$patch"
+            git apply "../driver/patches/$patch"
+          done < ../driver/patches/series
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          src = Path(os.environ['RUNNER_TEMP']) / 'usb4-source'
+          for path in src.rglob('*'):
+              if path.is_file():
+                  assert path.read_bytes() == Path(path.relative_to(src)).read_bytes(), path
+          PY
+      - name: Compile affected objects with GPU mode enabled and disabled
+        working-directory: kernel
+        run: |
+          make defconfig
+          scripts/config --module USB4 --module USB4_CONFIGFS --module USB4_STREAM --enable USB4_GPU_STREAM --module USB4_NET --enable DMA_SHARED_BUFFER
+          make olddefconfig
+          grep -q '^CONFIG_USB4_GPU_STREAM=y' .config
+          make -j2 W=1 drivers/thunderbolt/nhi.o drivers/thunderbolt/pci.o drivers/thunderbolt/domain.o drivers/thunderbolt/xdomain.o drivers/thunderbolt/tunnel.o drivers/thunderbolt/stream.o drivers/net/thunderbolt/main.o
+          scripts/config --disable USB4_GPU_STREAM
+          make olddefconfig
+          make -j2 W=1 drivers/thunderbolt/stream.o

@@ -1,0 +1,212 @@
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -248,6 +248,7 @@
+ {
+ 	struct ring_frame *frame, *n;
+ 	struct ring_desc *descriptor;
++	u16 head = ring->head;
+ 	u32 flags;
+ 
+ 	flags = RING_DESC_POSTED;
+@@ -268,9 +269,15 @@
+ 			descriptor->sof = frame->sof;
+ 		}
+ 		ring->head = (ring->head + 1) % ring->size;
+-		if (ring->is_tx)
+-			ring_iowrite_prod(ring, ring->head);
+-		else
+-			ring_iowrite_cons(ring, ring->head);
+ 	}
++
++	if (ring->head == head)
++		return;
++
++	/* Publish the complete descriptor batch before ringing the doorbell. */
++	dma_wmb();
++	if (ring->is_tx)
++		ring_iowrite_prod(ring, ring->head);
++	else
++		ring_iowrite_cons(ring, ring->head);
+ }
+@@ -360,4 +367,27 @@
+ EXPORT_SYMBOL_GPL(__tb_ring_enqueue);
++
++/*
++ * Enqueue a caller-owned frame list atomically. On success the list is
++ * consumed and every frame receives the normal completion/cancel callback.
++ * On failure the list is untouched and no callback is owed. The caller
++ * must initialise all frames and account for all callbacks before entry.
++ */
++int __tb_ring_enqueue_list(struct tb_ring *ring, struct list_head *frames)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	spin_lock_irqsave(&ring->lock, flags);
++	if (ring->running) {
++		list_splice_tail_init(frames, &ring->queue);
++		ring_write_descriptors(ring);
++	} else {
++		ret = -ESHUTDOWN;
++	}
++	spin_unlock_irqrestore(&ring->lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(__tb_ring_enqueue_list);
+ 
+ /**
+  * tb_ring_poll() - Poll one completed frame from the ring
+diff --git a/drivers/thunderbolt/nhi.h b/drivers/thunderbolt/nhi.h
+--- a/drivers/thunderbolt/nhi.h
++++ b/drivers/thunderbolt/nhi.h
+@@ -38,2 +38,3 @@
+ void nhi_shutdown(struct tb_nhi *nhi);
++int __tb_ring_enqueue_list(struct tb_ring *ring, struct list_head *frames);
+ extern const struct dev_pm_ops nhi_pm_ops;
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -14,2 +14,3 @@
+ #include "tb.h"
++#include "nhi.h"
+ #include "gpu_stream_logic.h"
+@@ -123,4 +124,5 @@
+     unsigned long flags;
+     int error = 0;
++    bool wake;
+ 
+     spin_lock_irqsave(&ctx->lock, flags);
+@@ -164,6 +166,9 @@
+     sgu_complete_locked(ctx, op, &signal, &error);
+ unlock:
++    /* EVENT is readable only after the whole operation; errors wake early. */
++    wake = READ_ONCE(ctx->failed) || (op && op->event_pending);
+     spin_unlock_irqrestore(&ctx->lock, flags);
+     sgu_signal(signal, error);
+-    wake_up_interruptible_poll(&ctx->sdev->wait, EPOLLIN | EPOLLRDNORM | EPOLLERR);
++    if (wake)
++        wake_up_interruptible_poll(&ctx->sdev->wait, EPOLLIN | EPOLLRDNORM | EPOLLERR);
+ }
+@@ -347,10 +352,11 @@
+ {
+     struct sgu_window *w = &ctx->windows[op->request.direction];
+     struct tb_ring *ring = op->request.direction == SGU_DIRECTION_TX ? ctx->sdev->tx_ring.ring : ctx->sdev->rx_ring.ring;
++    struct dma_fence *signal = NULL;
+     unsigned long flags;
+-    struct dma_fence *signal = NULL;
++    LIST_HEAD(frames);
+     int ret, error = 0;
+-    u32 i, j;
++    u32 i;
+ 
+     ret = sgu_publish_fence(ctx, op);
+     if (ret)
+@@ -363,7 +369,6 @@
+     op->canceled = false;
+     op->event_pending = false;
+     op->event_cursor = 0;
+-    spin_unlock_irqrestore(&ctx->lock, flags);
+     for (i = 0; i < op->total_frames; ++i) {
+         struct sgu_hw_frame *f = sgu_frame_at(ctx, op, i);
+ 
+@@ -374,39 +379,47 @@
+         f->frame.eof = TBSTREAM_DATA;
+         f->frame.size = op->request.direction == SGU_DIRECTION_RX ? 0 :
+                         f->result.expected_bytes == SGU_FRAME_BYTES ? 0 : f->result.expected_bytes;
+-        spin_lock_irqsave(&ctx->lock, flags);
+-        f->queued = sgu_controller_queue(&ctx->lifetime);
+-        spin_unlock_irqrestore(&ctx->lock, flags);
+-        if (!f->queued) {
+-            ret = -EIO;
+-            break;
+-        }
+-        ret = op->request.direction == SGU_DIRECTION_TX ? tb_ring_tx(ring, &f->frame) : tb_ring_rx(ring, &f->frame);
+-        if (ret) {
+-            spin_lock_irqsave(&ctx->lock, flags);
+-            f->queued = false;
+-            if (!sgu_controller_callback(&ctx->lifetime))
+-                WRITE_ONCE(ctx->failed, true);
+-            spin_unlock_irqrestore(&ctx->lock, flags);
+-            break;
+-        }
+     }
+-    if (ret) {
+-        /* Some frames may already be owned by hardware. Never unwind imports
+-         * or discard their callbacks when a later enqueue fails. */
+-        spin_lock_irqsave(&ctx->lock, flags);
+-        WRITE_ONCE(ctx->failed, true);
+-        op->canceled = true;
+-        for (j = i; j < op->total_frames; ++j) {
+-            struct sgu_hw_frame *f = sgu_frame_at(ctx, op, j);
++    /* Account for the entire operation before any callback can run. */
++    if (!sgu_controller_queue_batch(&ctx->lifetime, op->total_frames)) {
++        ret = -EIO;
++        goto cancel_locked;
++    }
++    for (i = 0; i < op->total_frames; ++i) {
++        struct sgu_hw_frame *f = sgu_frame_at(ctx, op, i);
+ 
+-            f->result.actual_bytes = 0;
+-            f->result.error_flags = SGU_FRAME_ERROR_CANCELED;
+-            --op->remaining;
+-        }
+-        sgu_complete_locked(ctx, op, &signal, &error);
+-        spin_unlock_irqrestore(&ctx->lock, flags);
+-        sgu_signal(signal, error);
++        f->queued = true;
++        list_add_tail(&f->frame.list, &frames);
+     }
++    spin_unlock_irqrestore(&ctx->lock, flags);
++
++    ret = __tb_ring_enqueue_list(ring, &frames);
++    if (!ret)
++        return 0;
++
++    /* Failure is all-or-nothing: none of these slots reached the ring. */
++    spin_lock_irqsave(&ctx->lock, flags);
++    for (i = 0; i < op->total_frames; ++i) {
++        struct sgu_hw_frame *f = sgu_frame_at(ctx, op, i);
++
++        list_del_init(&f->frame.list);
++        f->queued = false;
++        if (!sgu_controller_callback(&ctx->lifetime))
++            WRITE_ONCE(ctx->failed, true);
++    }
++cancel_locked:
++    WRITE_ONCE(ctx->failed, true);
++    op->canceled = true;
++    for (i = 0; i < op->total_frames; ++i) {
++        struct sgu_hw_frame *f = sgu_frame_at(ctx, op, i);
++
++        f->result.actual_bytes = 0;
++        f->result.error_flags = SGU_FRAME_ERROR_CANCELED;
++    }
++    op->remaining = 0;
++    sgu_complete_locked(ctx, op, &signal, &error);
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    sgu_signal(signal, error);
++    wake_up_interruptible_poll(&ctx->sdev->wait, EPOLLIN | EPOLLRDNORM | EPOLLERR);
+     return ret;
+ }
+diff --git a/drivers/thunderbolt/gpu_stream_logic.h b/drivers/thunderbolt/gpu_stream_logic.h
+--- a/drivers/thunderbolt/gpu_stream_logic.h
++++ b/drivers/thunderbolt/gpu_stream_logic.h
+@@ -107,7 +107,13 @@
++static inline int sgu_controller_queue_batch(struct sgu_controller_lifetime *l, __u32 count)
++{
++    if (!count || count > 2U * SGU_MAX_FRAMES || l->stop_confirmed ||
++        l->pending_callbacks > 2U * SGU_MAX_FRAMES - count)
++        return 0;
++    l->pending_callbacks += count;
++    return 1;
++}
++
+ static inline int sgu_controller_queue(struct sgu_controller_lifetime *l)
+ {
+-    if (l->stop_confirmed || l->pending_callbacks >= 2U * SGU_MAX_FRAMES)
+-        return 0;
+-    ++l->pending_callbacks;
+-    return 1;
++    return sgu_controller_queue_batch(l, 1);
+ }
