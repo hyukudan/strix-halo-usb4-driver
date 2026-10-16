@@ -33,7 +33,7 @@ class GpuQueueTests(unittest.TestCase):
         # Replace ONLY the includes; all function bodies are the actual source.
         implementation = re.sub(r"^#include[^\n]*\n", "", implementation, flags=re.MULTILINE)
         unit = tmp / "test.c"
-        unit.write_text('#include "sgu_test_kernel.h"\n#include "gpu_stream_logic.h"\n' +
+        unit.write_text('#include "sgu_test_kernel.h"\n#include "sgu_dependency_status.h"\n#include "gpu_stream_logic.h"\n' +
                         implementation + '\n#include "sgu_queue_cases.h"\n')
         cls.binary = tmp / "test"
         compiler = os.environ.get("CC", "cc")

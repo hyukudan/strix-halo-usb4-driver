@@ -4,3 +4,4 @@
 0004-fence-and-stop-lifetime.patch
 0005-gpu-queues-fences-and-session-recovery.patch
 0006-dma-progress-idle-reset-and-quarantine-reaping.patch
+0007-external-dependency-errors.patch
