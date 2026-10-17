@@ -7,15 +7,17 @@ host memory, plus a DMA-BUF extension that moves data between the two iGPUs
 without staging through TCP.
 
 The series applies to Linux `72d3fcf802c45d00b300f25b848a93c3a2bd7c7e`
-(**7.3-rc5**). All nine patches in [`patches/series`](patches/series) are the
+(**7.3-rc5**). All ten patches in [`patches/series`](patches/series) are the
 driver; `overlay/` is an immutable capture of the original source and is *not*
 the current driver on its own.
 
-> **Status (2026-10-17):** the series applies cleanly, passes the offline test
-> suite and builds with zero warnings. The bandwidth and latency figures below
-> were measured on hardware with the previously deployed module (0001 + MSI-X
-> fixes). The complete 0001–0009 series has **not** yet been loaded on hardware
-> and is not production-qualified. See [Status](#status).
+> **Status (2026-10-17):** the complete 0001–0010 series applies cleanly,
+> passes the offline suite, builds with zero warnings and has been **loaded and
+> exercised on both machines**: host-memory bandwidth and latency, 80 stream
+> open/close cycles, GPU-to-GPU transfers (one-way, duplex, session recovery,
+> controller group reset with and without USB4NET), all with zero kernel
+> warnings. It is not yet installed as the default kernel and is not
+> production-qualified. See [Status](#status).
 
 ## Contents
 
@@ -182,7 +184,8 @@ earlier opposite-direction runs measured ~21.5 Gb/s each way per cable.
 |---|---:|---:|---:|
 | Interrupts, `throttling=8192` (default) | 16–17 µs | 25–26 µs | 148 µs |
 | Interrupts, `throttling=0` | 16.0 µs | 23.7 µs | 142 µs |
-| `busy_poll=1` | **8.2 µs** | **15.7 µs** | 137 µs |
+| `busy_poll=1` (interrupts off) | 8.2 µs | 15.7 µs | 137 µs |
+| **`rx_napi=1 spin_us=25`** (0010, interrupts on) | **8.35 µs** | **15.9 µs** | **118 µs** |
 
 ```mermaid
 xychart-beta
@@ -190,14 +193,17 @@ xychart-beta
     x-axis ["64 B", "4 KiB"]
     y-axis "µs" 0 --> 30
     bar [16.6, 25.4]
-    bar [8.2, 15.7]
+    bar [8.35, 15.9]
 ```
 
-*First bar of each pair: interrupts (default). Second bar: `busy_poll=1`.*
+*First bar of each pair: interrupts (default). Second bar: `rx_napi=1 spin_us=25` (patch 0010).*
 
-Interrupt throttling has a negligible effect at this load. Ring polling halves
-small-message latency, but it consumes a CPU core and is currently mutually
-exclusive with `gpu_direct` (see [Roadmap](#roadmap)). Benchmark source:
+Interrupt throttling has a negligible effect at this load. Patch 0010 gives
+polling-class latency **without disabling interrupts**: the reader polls the RX
+ring for at most `spin_us`, then re-arms the interrupt and sleeps. For bulk
+transfers keep it off (with `spin_us=25` bulk throughput varied between −7 % and
+0 %). The older `busy_poll` mode keeps a core spinning and is mutually exclusive
+with `gpu_direct`. Benchmark source:
 [`tools/pingpong.c`](tools/pingpong.c) (`pingpong server|client /dev/tbstreamN size iters warmup`).
 
 ## What the series adds
@@ -213,6 +219,7 @@ exclusive with `gpu_direct` (see [Roadmap](#roadmap)). Benchmark source:
 | `0007-external-dependency-errors` | Rejects failed external GPU dependencies and keeps readiness fences across retries. |
 | `0008-detached-quarantine-and-notification-lifecycle` | Detached-peer quarantine reclamation by the original owner, bounded XDomain property notifications. |
 | `0009-domain-retirement-and-cooperative-controller-recovery` | Safe retirement of quiescent contexts even with old FDs still open (RCU-protected poll, `kfree_rcu`), explicit group reset for up to 16 owner-held GPU FDs, and optional cooperative USB4NET close/reset/reopen. Unknown or active consumers veto a reset. |
+| `0010-stream-rx-napi-hybrid-completion` | NAPI-style RX completion for streams: `start_poll` wakes the reader straight from the IRQ, the reader reaps frames itself (ring order preserved) and polls for up to `spin_us` before re-arming the interrupt. Halves small-message latency with interrupts kept on. The core no longer warns when stopping a `start_poll` ring that is legitimately masked. |
 
 Design rule throughout: a timeout, process exit, failed MMIO read or missing
 PCI device is **never** treated as proof that DMA has stopped. Memory the
@@ -244,16 +251,37 @@ As published, `main` could not be built:
 
 | Check | Result |
 |---|---|
-| Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 9 patches |
+| Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 10 patches |
 | `prepare_overlay.py` vs applying the series to the kernel | ✅ byte-identical (22 files) |
 | Offline unit tests (`unittest discover`) | ✅ 84 run, OK (1 bundle-only skip) |
-| `thunderbolt.ko`, `thunderbolt_stream.ko`, `thunderbolt_net.ko` with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` |
-| Link negotiation Gen3 × 2 on both cables | ✅ verified in sysfs and lane registers |
-| Host-memory bandwidth/latency on hardware | ✅ deployed module (0001 + MSI-X fixes), see above |
-| GPU DMA-BUF transfers on hardware | ⚠️ limited test with the deployed module (8 × 4 190 208-byte sends verified, 2026-10-15) |
-| Complete 0001–0009 series loaded on hardware | ❌ pending |
-| Recovery, group reset, USB4NET cooperation on hardware | ❌ pending |
-| GitHub Actions | ❌ earlier runs never executed a step; later commits are `[skip ci]` |
+| Modules with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` |
+| Link negotiation Gen3 × 2 on both cables | ✅ sysfs and lane registers; kept across every module reload and controller reset |
+| Complete 0001–0010 series loaded on hardware | ✅ both machines, modules built against the running kernel (exact vermagic and CRCs) |
+| Host-memory bandwidth, integrity, latency (series) | ✅ 41.0–41.5 Gb/s with 4 streams, zero bad chunks; latency as above |
+| Stream open/close stress (series) | ✅ 80 cycles across all 4 streams and both directions (40 with `rx_napi`), zero failures, zero kernel warnings |
+| GPU-to-GPU, one-way (`strix-gpu-queue-visibility`, depth 8) | ✅ 4 windows, 32 operations, 131 104 bytes verified on the GPU |
+| GPU-to-GPU, full duplex and slot reuse | ✅ 16 windows, 128 TX + 128 RX per side, 1 048 832 bytes verified |
+| Live session recovery (`--recover-every 4`) | ✅ 3 recoveries with fresh epochs, all windows verified |
+| Controller group reset (`--controller-reset`) | ✅ 3 real controller resets per side during a duplex session, all windows verified |
+| Cooperative USB4NET reset (`--include-network`) | ✅ 3 resets with USB4NET up on the same controller; ~11 of 146 pings lost during resets, interface restored automatically |
+| GitHub Actions | ⚠️ workflow fixed and both jobs pass locally; runs do not start because the account's Actions billing blocks private-repository jobs |
+| Installed as default kernel, long-running and model-level qualification | ❌ pending |
+
+Receipts of the GPU campaigns are kept on the machines, outside Git
+(`~/usb4-series-hw-20261017/`), as the engine's commissioning guide requires.
+
+Two findings from the hardware runs that matter for anyone reproducing them:
+
+- **The engine's multi-slot runner needs the pool allocation quantum.**
+  `strix-gpu-queue-visibility` on engine `main` declared `full_bytes` =
+  4 198 399 (window + 4095) while the exported DMA-BUF is page-rounded, so the
+  driver's exact identity check rejected `SGU_IOC_IMPORT` with `EINVAL`. The
+  2 MiB `allocation_quantum` fix used by the single-slot tool on 2026-10-15 had
+  not reached engine `main`; with it every campaign passes.
+- **Epochs are strictly increasing per stream device.** Each live recovery
+  consumes one, so after `--recover-every 4` over 16 windows starting at epoch
+  N the next session must use more than N+3. Reusing an older epoch is rejected
+  by `IMPORT` (anti-replay), as intended.
 
 ## The ~21.5 Gb/s per-cable ceiling
 
@@ -307,12 +335,15 @@ projects are as published by them.
 | Controller in published results | AMD NHI, 2 × Strix Halo | Thunderbolt 5 oriented; its docs cite ~40 Gb/s | 2 × Strix Halo (TP=2 vLLM, ~20 tok/s on a 230B MoE) | Intel Barlow Ridge on Strix Halo |
 | Rings per transfer | 1 pair per stream; 4 streams use all data rings | 1 pair per peer ("MIMO" = threads on the same pair) | — | 1 pair per session |
 | Descriptor submission | batched, one doorbell per batch (0003) | one doorbell per frame | — | — |
-| GPU path | DMA-BUF imported and mapped once, zero-copy TX and RX, `dma_resv` fences, `sync_file` | dma-buf attached/mapped per call, no fences; RCCL plugin advertises host pointers only | dma-buf MR | — |
+| GPU path | DMA-BUF imported and mapped once; the controller DMAs straight into and out of the imported GPU allocation (the engine still runs acquire/unpack GPU copies); `dma_resv` fences, `sync_file` | dma-buf attached/mapped per call, no fences; RCCL plugin advertises host pointers only | dma-buf MR | — |
+| Small-message latency | 8.35 µs RTT with interrupts on (0010) | ~13.6 µs best case per its own comments | — | 22–23 µs (10 KiB exchange) |
 | Failure handling | deadlines, quarantine, proven-stop reclamation, group reset | unmaps on signal with DMA possibly in flight | — | self-healing link |
 
-Two ideas from OdinLink are worth adopting (see [Roadmap](#roadmap)): a hybrid
-completion path (interrupts plus bounded busy-wait, compatible with zero-copy)
-and an early ping/pong path verification before declaring a peer ready.
+OdinLink's hybrid completion idea (interrupts plus bounded polling) is
+implemented here as 0010, but NAPI-style: its fixed 3 µs timer and in-parallel
+reaping would spin forever while idle and could reorder RX frames of a byte
+stream. Its early ping/pong path check before declaring a peer ready is still on
+the [Roadmap](#roadmap).
 
 ## Build and test
 
@@ -373,8 +404,13 @@ Streams are created in configfs under
 | `gpu_direct` | 0 | enables the DMA-BUF GPU path for that stream |
 | `in_hopid` / `out_hopid` | -1 | auto allocation |
 
-Module parameters: `thunderbolt.dma_credits` (default 14; the router accepts at
-most 32; no measurable effect on these machines).
+Module parameters:
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `thunderbolt.dma_credits` | 14 | the router accepts at most 32; no measurable effect on these machines |
+| `thunderbolt_stream.rx_napi` | off | 0010: reader-side RX reaping; applies to streams opened afterwards |
+| `thunderbolt_stream.spin_us` | 0 | 0010: polling time before re-arming the RX interrupt; 25 is the measured sweet spot (10 is too short for 4 KiB round trips) |
 
 `thunderbolt_net` is blocked in the lab kernel through modprobe policy so that
 both data ring pairs remain available to USB4STREAM. With it loaded, one stream
@@ -398,26 +434,27 @@ Diagnostics: `python3 tools/usb4_diagnose.py --logs` on both hosts.
 
 ## Roadmap
 
-1. Load the complete 0001–0009 series (plus the amdkfd backport) on one
-   machine, then both: link, bandwidth, latency, GPU direct, recovery, group
-   reset and USB4NET cooperation.
-2. Hybrid completion on the GPU path: bounded busy-wait in the SGU event/wait
-   path and in-line completion reaping only while operations are pending, so
-   that `gpu_direct` gets polling-class latency (~8 µs RTT) without a
-   permanently spinning core.
-3. Optional per-CPU high-priority workqueue for ring work (measure first).
-4. User-space sequence numbers in the GPU terminal frame and a ping/pong path
+1. Build and install the series (plus the amdkfd backport) as the default
+   kernel in a maintenance window, keeping the current kernel as fallback.
+2. Merge the 2 MiB `allocation_quantum` fix into engine `main` for the
+   multi-slot runner.
+3. Extend 0010's NAPI-style completion to the GPU path (SGU rings use their own
+   callbacks today), so `gpu_direct` also gets ~8 µs round trips.
+4. Per-stream `rx_napi`/`spin_us` in configfs, so latency streams and bulk
+   streams can be tuned independently.
+5. User-space sequence numbers in the GPU terminal frame and a ping/pong path
    check before marking a peer ready.
-5. Boot-time check that warns when a link trains below Gen3.
-6. Obtain an AXB35-02 BIOS that includes AMD's USB4 point-to-point change, then
+6. Boot-time check that warns when a link trains below Gen3.
+7. Obtain an AXB35-02 BIOS that includes AMD's USB4 point-to-point change, then
    re-measure the per-ring ceiling.
+8. Restore GitHub Actions billing so the (fixed) workflow runs.
 
 ## Repository layout
 
 | Path | Content |
 |---|---|
-| `patches/series` | The nine-patch series, in order |
-| `patches/audit-series` | Patches applied on top of the captured overlay (0002–0009) |
+| `patches/series` | The ten-patch series, in order |
+| `patches/audit-series` | Patches applied on top of the captured overlay (0002–0010) |
 | `patches/kernel-backports/` | Unmodified upstream fixes applied after the series |
 | `overlay/` | Immutable original source capture (equals pristine + 0001) |
 | `base/` | Hash-pinned upstream files that the capture did not include |
