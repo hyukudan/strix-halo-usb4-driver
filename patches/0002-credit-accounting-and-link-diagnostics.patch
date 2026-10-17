@@ -1,7 +1,27 @@
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -456,11 +456,9 @@ static void ring_clear_msix(const struct tb_ring *ring)
+ 
+ 	index = ring_interrupt_index(ring);
+ 	bit = index & 31;
+-	if (ring->is_tx)
+-		iowrite32(BIT(bit), ring->nhi->iobase + REG_RING_INT_CLEAR);
+-	else
+-		iowrite32(BIT(bit), ring->nhi->iobase + REG_RING_INT_CLEAR +
+-			  4 * (ring->nhi->hop_count / 32));
++	/* Select the bank from the complete TX/RX interrupt index. */
++	iowrite32(BIT(bit), ring->nhi->iobase + REG_RING_INT_CLEAR +
++		  index / 32 * 4);
+ 
+ 	/*
+ 	 * Flush the posted clear before ring work can run and a later
 diff --git a/drivers/thunderbolt/tunnel.c b/drivers/thunderbolt/tunnel.c
 --- a/drivers/thunderbolt/tunnel.c
 +++ b/drivers/thunderbolt/tunnel.c
-@@ -94,4 +94,26 @@
+@@ -92,9 +92,31 @@ MODULE_PARM_DESC(dprx_timeout,
+ 		 __MODULE_STRING(TB_DPRX_TIMEOUT) ")");
+ 
  static unsigned int dma_credits = TB_DMA_CREDITS;
 -module_param(dma_credits, uint, 0644);
 -MODULE_PARM_DESC(dma_credits, "specify custom credits for DMA tunnels (default: "
@@ -31,7 +51,11 @@ diff --git a/drivers/thunderbolt/tunnel.c b/drivers/thunderbolt/tunnel.c
 +MODULE_PARM_DESC(dma_credits,
 +		 "DMA credits for new tunnels, 1..127; not live retuning (default: "
 +		 __MODULE_STRING(TB_DMA_CREDITS) ")");
-@@ -119,4 +141,7 @@
+ 
+ static bool bw_alloc_mode = true;
+ module_param(bw_alloc_mode, bool, 0444);
+@@ -116,6 +138,9 @@ static DEFINE_MUTEX(tb_tunnel_lock);
+ 
  static inline unsigned int tb_usable_credits(const struct tb_port *port)
  {
 +	/* Do not turn inconsistent firmware values into an unsigned budget. */
@@ -39,17 +63,29 @@ diff --git a/drivers/thunderbolt/tunnel.c b/drivers/thunderbolt/tunnel.c
 +		return 0;
  	return port->total_credits - port->ctl_credits;
  }
-@@ -146,3 +171,3 @@
+ 
+@@ -138,7 +163,7 @@ static unsigned int tb_available_credits(const struct tb_port *port,
+ 	pcie = tb_acpi_may_tunnel_pcie() ? sw->max_pcie_credits : 0;
+ 
  	if (tb_acpi_is_xdomain_allowed()) {
 -		spare = min_not_zero(sw->max_dma_credits, dma_credits);
 +		spare = min_not_zero(sw->max_dma_credits, READ_ONCE(dma_credits));
  		/* Add some credits for potential second DMA tunnel */
-@@ -161,2 +186,3 @@
+ 		spare += TB_MIN_DMA_CREDITS;
+ 	} else {
+@@ -151,7 +176,8 @@ static unsigned int tb_available_credits(const struct tb_port *port,
+ 		 * Maximum number of DP streams possible through the
+ 		 * lane adapter.
+ 		 */
 -		if (sw->min_dp_aux_credits + sw->min_dp_main_credits)
 +		if (credits > usb3 + pcie + spare &&
 +		    sw->min_dp_aux_credits + sw->min_dp_main_credits)
  			ndp = (credits - (usb3 + pcie + spare)) /
-@@ -1815,4 +1841,14 @@
+ 			      (sw->min_dp_aux_credits + sw->min_dp_main_credits);
+ 		else
+@@ -1818,9 +1844,19 @@ static int tb_dma_init_rx_path(struct tb_path *path, unsigned int credits)
+ 	 * all the credits (except the ones reserved for control traffic).
+ 	 */
  	hop = &path->hops[0];
 -	tmp = min(tb_usable_credits(hop->in_port), credits);
 +	tmp = tb_usable_credits(hop->in_port);
@@ -66,29 +102,25 @@ diff --git a/drivers/thunderbolt/tunnel.c b/drivers/thunderbolt/tunnel.c
 -	hop->in_port->dma_credits += tmp;
 +	if (tb_port_use_credit_allocation(hop->in_port))
 +		hop->in_port->dma_credits += tmp;
-@@ -1935,2 +1971,2 @@
+ 
+ 	for (i = 1; i < path->path_length; i++) {
+ 		int ret;
+@@ -1932,7 +1968,7 @@ struct tb_tunnel *tb_tunnel_alloc_dma(struct tb *tb, struct tb_port *nhi,
+ 	tunnel->dst_port = dst;
+ 	tunnel->destroy = tb_dma_destroy;
+ 
 -	credits = min_not_zero(dma_credits, nhi->sw->max_dma_credits);
 +	credits = min_not_zero(READ_ONCE(dma_credits), nhi->sw->max_dma_credits);
  	if (credits > TB_MAX_CREDITS) {
-diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
---- a/drivers/thunderbolt/nhi.c
-+++ b/drivers/thunderbolt/nhi.c
-@@ -455,8 +455,6 @@
- 
- 	index = ring_interrupt_index(ring);
- 	bit = index & 31;
--	if (ring->is_tx)
--		iowrite32(BIT(bit), ring->nhi->iobase + REG_RING_INT_CLEAR);
--	else
--		iowrite32(BIT(bit), ring->nhi->iobase + REG_RING_INT_CLEAR +
--			  4 * (ring->nhi->hop_count / 32));
-+	/* Select the bank from the complete TX/RX interrupt index. */
-+	iowrite32(BIT(bit), ring->nhi->iobase + REG_RING_INT_CLEAR +
-+		  index / 32 * 4);
+ 		tb_tunnel_dbg(tunnel, "%u credits do not fit a hop, using %u\n",
+ 			      credits, TB_MAX_CREDITS);
 diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
 --- a/drivers/thunderbolt/xdomain.c
 +++ b/drivers/thunderbolt/xdomain.c
-@@ -1726 +1726,17 @@
+@@ -1720,6 +1720,22 @@ static void tb_xdomain_failed(struct tb_xdomain *xd)
+ 			   msecs_to_jiffies(XDOMAIN_DEFAULT_TIMEOUT));
+ }
+ 
 +static void tb_xdomain_bonding_failed(struct tb_xdomain *xd, int error)
 +{
 +	int ret;
@@ -106,24 +138,35 @@ diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
 +}
 +
  static void tb_xdomain_state_work(struct work_struct *work)
-@@ -1775,3 +1791,4 @@
+ {
+ 	struct tb_xdomain *xd = container_of(work, typeof(*xd), state_work.work);
+@@ -1767,6 +1783,7 @@ static void tb_xdomain_state_work(struct work_struct *work)
+ 			 * bonding completely and try to continue from
  			 * reading properties.
  			 */
 +			tb_xdomain_bonding_failed(xd, ret);
  			tb_xdomain_queue_properties(xd);
-@@ -1786,4 +1803,5 @@
+ 		} else {
+ 			tb_xdomain_queue_bonding(xd);
+@@ -1778,6 +1795,7 @@ static void tb_xdomain_state_work(struct work_struct *work)
  		if (ret) {
  			if (ret == -EAGAIN)
  				goto retry_state;
 +			tb_xdomain_bonding_failed(xd, ret);
  			tb_xdomain_queue_properties(xd);
-@@ -1799,4 +1817,5 @@
+ 		} else {
+ 			tb_xdomain_queue_link_status2(xd);
+@@ -1789,6 +1807,7 @@ static void tb_xdomain_state_work(struct work_struct *work)
  		if (ret) {
  			if (ret == -EAGAIN)
  				goto retry_state;
 +			tb_xdomain_bonding_failed(xd, ret);
  			tb_xdomain_queue_properties(xd);
-@@ -1808,4 +1827,7 @@
+ 		} else {
+ 			tb_xdomain_queue_bonding_uuid_low(xd);
+@@ -1801,8 +1820,11 @@ static void tb_xdomain_state_work(struct work_struct *work)
+ 		break;
+ 
  	case XDOMAIN_STATE_BONDING_UUID_HIGH:
 -		if (tb_xdomain_bond_lanes_uuid_high(xd) == -EAGAIN)
 +		ret = tb_xdomain_bond_lanes_uuid_high(xd);
@@ -132,3 +175,5 @@ diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
 +		if (ret)
 +			tb_xdomain_bonding_failed(xd, ret);
  		tb_xdomain_queue_properties(xd);
+ 		break;
+ 

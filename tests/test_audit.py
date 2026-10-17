@@ -23,7 +23,10 @@ def load(name, path):
 
 def function(path, name):
     source = (SOURCE / path).read_text()
-    match = re.search(r'\b' + re.escape(name) + r'\([^;{}]*\)\s*\{', source)
+    # Skip kernel-doc/comment lines such as " * name() - ..." which would
+    # otherwise match up to the real definition's opening brace.
+    match = re.search(r'^(?![ \t]*(?:\*|/\*|//))[^\n]*?\b' + re.escape(name) +
+                      r'\([^;{}]*\)\s*\{', source, re.M)
     if not match:
         raise AssertionError(f'{name} not found in {path}')
     start = source.rfind('\n', 0, match.start()) + 1
