@@ -1,0 +1,154 @@
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -697,6 +697,8 @@ static int tbstream_gpu_open(struct tbstream_dev *sdev)
+     if (!ring)
+         goto fail;
+     sdev->tx_ring.ring = ring;
++    /* GPU rings complete through their own callbacks, never start_poll. */
++    sdev->rx_napi = false;
+     ring = tb_ring_alloc_rx(xd->tb->nhi, -1, sdev->ring_size, RING_FLAG_FRAME | RING_FLAG_E2E,
+                             sdev->tx_ring.ring->hop, BIT(TBSTREAM_FRAME_START), BIT(TBSTREAM_DATA), NULL, NULL);
+     if (!ring) {
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -149,7 +149,11 @@ static void ring_interrupt_active(struct tb_ring *ring, bool active)
+ 		"%s interrupt at register %#x bit %d (%#x -> %#x)\n",
+ 		active ? "enabling" : "disabling", reg, interrupt_bit, old, new);
+ 
+-	if (new == old)
++	/*
++	 * A ring with a start_poll() callback is legitimately masked while its
++	 * user polls, so finding it already disabled on stop is not an error.
++	 */
++	if (new == old && !(ring->start_poll && !active))
+ 		dev_WARN(ring->nhi->dev, "interrupt for %s %d is already %s\n",
+ 			 RING_TYPE(ring), ring->hop,
+ 			 str_enabled_disabled(active));
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -159,6 +159,8 @@ struct tbstream_dev {
+ 	unsigned int ring_size;
+ 	unsigned int throttling;
+ 	bool busy_poll;
++	bool rx_napi;
++	bool rx_poll_pending;
+ 	int users;
+ 	bool closed;
+ 	bool removed;
+@@ -291,6 +293,59 @@ static inline bool tbstream_ring_available(const struct tbstream_ring *ring)
+ 	return ring->prod > ring->cons;
+ }
+ 
++static bool rx_napi;
++module_param(rx_napi, bool, 0644);
++MODULE_PARM_DESC(rx_napi,
++		 "Reap RX completions in the reader (start_poll, NAPI style) instead of ring work; applies when a stream is opened (default: false)");
++
++static unsigned int spin_us;
++module_param(spin_us, uint, 0644);
++MODULE_PARM_DESC(spin_us,
++		 "With rx_napi, keep polling the RX ring this many microseconds before re-arming its interrupt (default: 0)");
++
++/* Hard IRQ context, nhi->lock and ring->lock held: the ring is masked. */
++static void tbstream_rx_start_poll(void *data)
++{
++	struct tbstream_dev *sdev = data;
++
++	WRITE_ONCE(sdev->rx_poll_pending, true);
++	wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLRDNORM);
++}
++
++/*
++ * Reap RX completions in the caller, the only consumer while the ring
++ * interrupt is masked, so frames are delivered in ring order. Optionally
++ * keep polling for spin_us, then re-arm the interrupt and reap once more
++ * to close the race with a frame completing just before the unmask.
++ * Called with sdev->lock held.
++ */
++static void tbstream_dev_napi_rx(struct tbstream_dev *sdev, bool spin)
++{
++	struct tb_ring *ring = sdev->rx_ring.ring;
++	struct ring_frame *frame;
++	ktime_t end;
++
++	if (!sdev->rx_napi)
++		return;
++
++	WRITE_ONCE(sdev->rx_poll_pending, false);
++	end = ktime_add_us(ktime_get(), spin ? READ_ONCE(spin_us) : 0);
++	for (;;) {
++		while ((frame = tb_ring_poll(ring)))
++			frame->callback(ring, frame, false);
++		if (tbstream_ring_available(&sdev->rx_ring))
++			return;
++		if (!spin || need_resched() || signal_pending(current) ||
++		    !ktime_before(ktime_get(), end))
++			break;
++		cpu_relax();
++	}
++
++	tb_ring_poll_complete(ring);
++	while ((frame = tb_ring_poll(ring)))
++		frame->callback(ring, frame, false);
++}
++
+ static inline struct tb_xdomain *tbstream_dev_xdomain(struct tbstream_dev *sdev)
+ {
+ 	if (sdev->stream)
+@@ -601,6 +656,8 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 	if (sdev->busy_poll)
+ 		flags |= RING_FLAG_NO_INTERRUPT;
+ 
++	sdev->rx_napi = READ_ONCE(rx_napi) && !sdev->busy_poll;
++	sdev->rx_poll_pending = false;
+ 	ring = tb_ring_alloc_tx(xd->tb->nhi, -1, sdev->ring_size, flags);
+ 	if (!ring)
+ 		return -ENOMEM;
+@@ -615,7 +672,9 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 	eof_mask = BIT(TBSTREAM_DATA) | BIT(TBSTREAM_CLOSE);
+ 
+ 	ring = tb_ring_alloc_rx(xd->tb->nhi, -1, sdev->ring_size, flags,
+-				e2e_tx_hop, sof_mask, eof_mask, NULL, NULL);
++				e2e_tx_hop, sof_mask, eof_mask,
++				sdev->rx_napi ? tbstream_rx_start_poll : NULL,
++				sdev->rx_napi ? sdev : NULL);
+ 	if (!ring) {
+ 		ret = -ENOMEM;
+ 		goto err_free_tx_buffers;
+@@ -695,6 +754,8 @@ static void tbstream_dev_stop(struct tbstream_dev *sdev)
+ 		tb_ring_flush(sdev->tx_ring.ring, 500);
+ 		tb_ring_stop(sdev->tx_ring.ring);
+ 		tb_ring_flush(sdev->rx_ring.ring, 500);
++		if (sdev->rx_napi)
++			tb_ring_poll_complete(sdev->rx_ring.ring);
+ 		tb_ring_stop(sdev->rx_ring.ring);
+ 	}
+ 
+@@ -751,6 +812,7 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 	for (;;) {
+ 		/* When busy polling, advance any completions manually */
+ 		tbstream_dev_poll_ring(sdev, &sdev->rx_ring);
++		tbstream_dev_napi_rx(sdev, !nowait);
+ 
+ 		ret = tbstream_dev_valid(sdev);
+ 		if (ret) {
+@@ -778,6 +840,7 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 		} else {
+ 			ret = wait_event_interruptible(sdev->wait,
+ 					tbstream_ring_available(&sdev->rx_ring) ||
++					READ_ONCE(sdev->rx_poll_pending) ||
+ 					tbstream_dev_valid(sdev) != 0 ||
+ 					tbstream_dev_closed(sdev) ||
+ 					tbstream_dev_removed(sdev));
+@@ -949,6 +1012,8 @@ tbstream_dev_fops_poll(struct file *file, struct poll_table_struct *wait)
+ 
+ 	poll_wait(file, &sdev->wait, wait);
+ 	guard(mutex)(&sdev->lock);
++	if (sdev->rx_ring.ring)
++		tbstream_dev_napi_rx(sdev, false);
+ 	if (tbstream_dev_valid(sdev) != 0) {
+ 		mask |= EPOLLHUP | EPOLLERR;
+ 	} else {

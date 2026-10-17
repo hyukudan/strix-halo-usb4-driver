@@ -6,3 +6,4 @@
 0007-external-dependency-errors.patch
 0008-detached-quarantine-and-notification-lifecycle.patch
 0009-domain-retirement-and-cooperative-controller-recovery.patch
+0010-stream-rx-napi-hybrid-completion.patch
