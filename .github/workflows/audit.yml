@@ -14,10 +14,22 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - run: python3 tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source"
+      # Lifecycle patches need the pristine pinned tb.c, tb.h and USB4NET main.c.
+      - uses: actions/checkout@v4
+        with:
+          repository: torvalds/linux
+          ref: 72d3fcf802c45d00b300f25b848a93c3a2bd7c7e
+          path: pinned-linux
+          persist-credentials: false
+          sparse-checkout: |
+            drivers/thunderbolt
+            drivers/net/thunderbolt
+          sparse-checkout-cone-mode: true
+      - run: python3 tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source" --kernel-source "$GITHUB_WORKSPACE/pinned-linux"
       - run: python3 -m unittest discover -s tests -v
         env:
           USB4_SOURCE_TREE: ${{ runner.temp }}/usb4-source
+          USB4_KERNEL_SOURCE: ${{ github.workspace }}/pinned-linux
   kernel-objects:
     needs: unit
     runs-on: ubuntu-24.04
@@ -36,7 +48,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y flex bison libelf-dev libssl-dev
       - name: Reconstruct and compare both reconstruction methods
         run: |
-          python3 driver/tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source"
+          python3 driver/tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source" --kernel-source "$PWD/kernel"
           cd kernel
           while IFS= read -r patch; do
             git apply --check "../driver/patches/$patch"
@@ -54,7 +66,7 @@ jobs:
         working-directory: kernel
         run: |
           make defconfig
-          scripts/config --module USB4 --module USB4_CONFIGFS --module USB4_STREAM --enable USB4_GPU_STREAM --module USB4_NET --enable DMA_SHARED_BUFFER
+          scripts/config --enable CONFIGFS_FS --module USB4 --module USB4_CONFIGFS --module USB4_STREAM --enable USB4_GPU_STREAM --module USB4_NET --enable DMA_SHARED_BUFFER
           make olddefconfig
           grep -q '^CONFIG_USB4_GPU_STREAM=y' .config
           make -j2 W=1 drivers/thunderbolt/nhi.o drivers/thunderbolt/pci.o drivers/thunderbolt/domain.o drivers/thunderbolt/xdomain.o drivers/thunderbolt/tunnel.o drivers/thunderbolt/stream.o drivers/net/thunderbolt/main.o
