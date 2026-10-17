@@ -1,5 +1,19 @@
 # Strix Halo USB4 driver
 
+**AMD-first · independently developed direct interconnect.** This patch
+series is tailored to AMD Strix Halo USB4 controllers and the direct GPU
+transport needs of our
+[Strix Halo inference engine](https://github.com/hyukudan/strix-halo-engine-lab)
+and the longer-term
+[TensorMeld](https://github.com/hyukudan/tensormeld) cluster.
+It is our own Linux-kernel integration work, not a third-party inference
+runtime or a replacement for the Linux kernel. It requires the specified
+Linux source baseline, AMD hardware and kernel/driver interfaces; those
+platform dependencies are distinct from relying on an external LLM engine.
+The native engine and the interconnect are independently usable and
+qualified in stages: working DMA paths do not alone establish distributed
+inference performance or production readiness.
+
 Linux kernel patch series that turns the native AMD USB4 host controllers of
 two **AMD Ryzen AI Max+ 395 ("Strix Halo")** machines into a direct DMA
 interconnect for distributed LLM inference: USB4STREAM character devices for
