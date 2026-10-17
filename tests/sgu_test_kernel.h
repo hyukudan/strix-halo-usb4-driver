@@ -341,7 +341,7 @@ struct tb_xdomain { struct tb *tb;uuid_t *local_uuid,*remote_uuid;struct device 
 struct tb_service { struct device dev;struct tb_xdomain *xd; };
 struct tbstream { struct tb_service *svc; };
 struct tbstream_gpu_context;
-struct tbstream_dev { struct mutex lock;struct tbstream *stream;struct { struct tb_ring *ring; } tx_ring,rx_ring;struct tbstream_gpu_context *gpu_context;unsigned ring_size,throttling,in_hopid,out_hopid;bool busy_poll,removed,gpu_direct;u64 gpu_last_epoch;int wait,refs,users; };
+struct tbstream_dev { struct mutex lock;struct tbstream *stream;struct { struct tb_ring *ring; } tx_ring,rx_ring;struct tbstream_gpu_context *gpu_context;unsigned ring_size,throttling,in_hopid,out_hopid;bool busy_poll,rx_napi,removed,gpu_direct;u64 gpu_last_epoch;int wait,refs,users; };
 static struct tb_xdomain *tbstream_dev_xdomain(struct tbstream_dev *s) { return s->stream?s->stream->svc->xd:NULL; }
 static struct tbstream *tbstream_get(struct tbstream *s) { return s; }
 static void tbstream_put(struct tbstream *s) { (void)s; }
