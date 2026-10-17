@@ -41,7 +41,7 @@ the current driver on its own.
 |---|---|
 | Machines | 2 × BOSGAME M5 (Sixunited AXB35-02 board, AMI BIOS 3.11, 2026-05-08), 128 GB |
 | USB4 host routers | AMD `1022:158d` and `1022:158e` (one per USB4 port), Parade retimers `1da0:8833` |
-| Cabling | Two 40 Gb/s USB4 cables, crossed between the machines (two independent links) |
+| Cabling | Two 40 Gb/s USB4 cables, each one an independent link between one controller on each machine |
 | Negotiated link | Gen3 × 2 lanes on both cables: **40 Gb/s per cable per direction** |
 | NHI rings | `REG_CAPS` = `0x00000003` → `hop_count` = 3 on all four NHIs: ring 0 is control, **2 data ring pairs per controller** |
 | Kernel in use | `7.3.0-rc5-strix-gpu-bosgame-20261014` |
@@ -82,7 +82,15 @@ flowchart LR
     NA1 <== "USB4 cable 2 · Gen3 x2<br/>40 Gb/s per direction" ==> NB0
 ```
 
-The cables are crossed (front port of one machine to rear port of the other).
+The diagram shows the current cabling (front port of one machine to rear port
+of the other). Any port pairing works and performs the same; what matters is
+knowing which endpoint pairs with which. With this cabling NHI 0 on cluster1
+talks to NHI 1 on cluster2 and vice versa, so stream and network configuration
+pair `/dev/tbstream0` on cluster1 with `/dev/tbstream1` on cluster2, and so on.
+After moving a cable, re-check the pairing from `/run/usb4stream-layout.json`
+and the endpoint UUIDs instead of assuming it. The one port that once trained
+at Gen2 did so regardless of which cable was plugged into it.
+
 Each controller exposes three ring pairs. Ring 0 carries the control channel,
 so each cable has **two data ring pairs**: four USB4STREAM devices per machine
 (`/dev/tbstream0..3`).
@@ -231,9 +239,9 @@ fix `e6895021a328` *drm/amdkfd: fix dma_buf reference leak in
 get_dmabuf_info* (Cc: stable), which affects the DMA-BUF import path. It applies
 cleanly on 7.3-rc5.
 
-### Fixes in branch `fix/apply-build-20261017`
+### Build fixes (2026-10-17, merged in #3)
 
-As published, `main` could not be built:
+Before these fixes the series could not be built:
 
 - **0002 did not apply.** Its `nhi.c` hunk lacked trailing context, so
   `git apply` anchored it to end-of-file and rejected it, and
