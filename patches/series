@@ -8,3 +8,4 @@
 0008-detached-quarantine-and-notification-lifecycle.patch
 0009-domain-retirement-and-cooperative-controller-recovery.patch
 0010-stream-rx-napi-hybrid-completion.patch
+0011-stream-per-stream-napi-and-irq-steering.patch

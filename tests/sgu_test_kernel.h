@@ -347,6 +347,7 @@ static struct tbstream *tbstream_get(struct tbstream *s) { return s; }
 static void tbstream_put(struct tbstream *s) { (void)s; }
 static void tbstream_dev_get(struct tbstream_dev *s) { ++s->refs; }
 static void tbstream_dev_put(struct tbstream_dev *s) { assert(s->refs > 0); --s->refs; }
+static void tbstream_dev_irq_affinity(struct tbstream_dev *s) { (void)s; }
 static int tbstream_dev_valid(struct tbstream_dev *s) { return (!s->stream||s->removed)?-ENODEV:0; }
 static struct tbstream_dev *to_tbstream_dev(void *p) { return p; }
 static int reset_error, reset_calls;
