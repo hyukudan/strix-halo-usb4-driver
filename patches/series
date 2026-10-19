@@ -30,3 +30,4 @@
 0030-stream-spin-us-parameter-bounded.patch
 0031-gpu-nonblock-submit-does-not-sleep-on-mutex.patch
 0032-kernel-doc-stream-tbnet-cm-ops-members.patch
+0033-xdomain-lane-bonding-result-checked.patch
