@@ -1,4 +1,4 @@
-# 0017: streams and services that outlive their connection (2026-10-19)
+# 0017–0018: streams and services that outlive their connection, and AMD teardown recovery (2026-10-19)
 
 State: implemented, offline-tested (unit tests under ASan/UBSan) and
 compile-tested against the pinned 7.3-rc5 with the nodes' running
@@ -153,12 +153,9 @@ same cable survived, with the warnings of section 1.
   **Unverified on hardware.** If the router itself, not the interface, is
   wedged, only a reboot helps.
 
-**Not done, proposed.** A teardown reset that is safe for other users:
-restore upstream's post-teardown interface reset only when the NHI has no
-other non-control ring (the same admission test as the explicit
-`tb_domain_reset_dma()`), after an unplugged XDomain's paths are gone. This
-reintroduces an automatic reset, which the series' design has rejected so
-far. It needs a decision, and a hardware reproduction first.
+**Done in 0018 (decided 2026-10-19).** A teardown reset that is safe for
+other users: upstream's post-teardown interface reset is restored, but only
+when the NHI is idle. See section 7.
 
 **Remaining warning.** After a physical unplug, 0017 stops the rings at
 service removal, within about a second rather than at close. If the AMD
@@ -210,7 +207,8 @@ at least one of these tests fail.
 ## 6. Hardware checks before installing
 
 One node at a time, current kernel as default, peer stable, management over a
-separate network:
+separate network. Items 6–9 also cover 0018. Record the full `dmesg` of both
+nodes for each item.
 
 1. **Probe.** `dmesg` shows `host interface reset` once per NHI, then Gen3 × 2
    on both links. Then run the README regression campaigns (bandwidth,
@@ -231,3 +229,120 @@ separate network:
 5. **Wedge recovery (opportunistic).** If an NHI ever wedges like NHI1 did,
    try unbind and bind before rebooting, and record whether the interface
    reset brings back the host router.
+6. **Unplug under traffic on one cable while the other cable keeps traffic
+   (0017 + 0018).** Run RAM traffic on the streams of both cables (each cable
+   on its own NHI) and pull one cable. On the pulled side:
+   - the stream processes fail as in item 2;
+   - within about 1 s, `host interface reset after DMA teardown (attempt N)`
+     appears for that NHI's domain;
+   - the control channel keeps answering (no endless `timeout reading config
+     space`);
+   - the cable can be replugged and the streams reopened without a reboot.
+
+   On the other cable, traffic continues without a single error or stall
+   (its NHI is not reset). Repeat with a second stream, or a GPU session,
+   still open on the pulled NHI. Expect no reset, then after about 5 s one
+   `no host interface reset after DMA teardown: NHI in use after 10
+   attempts (...)` line with the ring counts.
+7. **Reboot with streams open, modules loaded.** Run RAM traffic (and a
+   `gpu_direct` session) on both cables and run `systemctl reboot` without
+   stopping the processes or unloading any module, with kdump armed. The
+   reboot completes, with no oops in `device_shutdown` or in the stream
+   release path. Each stream is stopped by `.shutdown` or by service
+   removal, before the NHI.
+8. **rmmod with live XDomains.** With both peers connected and no stream
+   open, run `modprobe -r thunderbolt_stream thunderbolt_net thunderbolt`.
+   Check:
+   - `host disconnected` for each XDomain;
+   - nothing left in `/sys/bus/thunderbolt/devices`;
+   - no "TX/RX ring N is still active" warning from `nhi_shutdown()`;
+   - no teardown reset logged after the domain removal started.
+
+   Then `modprobe thunderbolt` (probe: `host interface reset`, Gen3 × 2).
+   Repeat once with a stream open: the module must refuse to unload while
+   the file holds it.
+9. **unbind/bind of one NHI.** With XDomains connected and streams open on
+   that NHI, unbind it:
+   - it returns within 30 s;
+   - the streams fail with `-ENODEV`;
+   - the XDomains and services are unregistered (sysfs empty for that domain).
+
+   Then bind: `host interface reset`, Gen3 × 2, and the streams reopen
+   (after their old files are closed). The other NHI keeps its traffic
+   throughout.
+
+## 7. 0018: automatic recovery after a DMA teardown, only on an idle NHI
+
+**Decision (2026-10-19).** Restore upstream's recovery of the AMD TX hang
+after a DMA path teardown, but never at the cost of another user of the NHI.
+
+**Implementation** (`dma_recovery.c`, called from `domain.c` and `tb.c`):
+
+- **Trigger.** Every successful `tb_domain_disconnect_xdomain_paths()`
+  schedules it: a stream close, a failed open, a service removal or
+  `gpu_direct` teardown. So does the CM's own teardown of an unplugged
+  XDomain's paths in the hotplug handler, for when no service driver tears
+  them down. Only on the AMD NHIs of `nhi_dma_reset_supported()` (Strix
+  Halo included), only while the domain is not going away, and only with the
+  new `thunderbolt.teardown_reset` parameter on (`Y` by default, writable at
+  runtime).
+- **Admission.** The delayed work (100 ms) calls the existing reset with an
+  empty owner set. It is the same admission as the explicit
+  `tb_domain_reset_dma()`, and the reset happens only if:
+  - no ring is allocated on the NHI besides the control ring, which the
+    reset itself stops and restarts. Rings of another stream, of USB4NET or
+    of a GPU context (open or quarantined) all count, idle or not;
+  - the CM has no DMA tunnel left;
+  - no other reset is in progress;
+  - the interface is v1 (`REG_CAPS` version < 2);
+  - the device is present and registered.
+- **Never waits for the domain lock.** It uses `mutex_trylock()`, so a CM
+  stuck in control-channel timeouts cannot block it, and it never blocks
+  the CM.
+- **Bounded.** Up to 10 attempts, 500 ms apart: about 5 s, enough for the
+  tearing-down owner to free its rings. A new teardown restarts the budget.
+  The work never runs during or after domain removal (`dma_shutdown`
+  refuses scheduling, removal and release cancel it), or across system
+  suspend or hibernation (cancelled in `tb_domain_suspend()` and
+  `tb_domain_freeze_noirq()`).
+- **dmesg** (domain device, e.g. `thunderbolt domain1:`):
+  - success: `host interface reset after DMA teardown (attempt N)`;
+  - other users: `no host interface reset after DMA teardown: NHI in use
+    after 10 attempts (T TX and R RX rings allocated besides control; a DMA
+    tunnel or a reset in progress also prevents it)`;
+  - lock never free: the same line with `domain lock busy`;
+  - reset failed (`REG_CAPS` read-back mismatch or the control channel did
+    not restart): `host interface reset after DMA teardown failed: <errno>,
+    new rings are refused until the NHI is probed again`. The series' rule
+    applies: the hardware state is no longer trusted, and recovery needs an
+    unbind and bind.
+
+**Limits.**
+
+- It recovers a hang of the host interface (DMA rings, E2E, control
+  ring). A wedged router or hop table is not reset; that still needs a
+  reboot.
+- It is skipped whenever anything else still uses the NHI, including a
+  GPU context that stays quarantined after an unplug. In that case the
+  warning says so, and recovery needs closing or reaping it, then an
+  unbind and bind, which runs the probe-time reset of 0017.
+- Both are unverified on hardware: section 6, items 6–9.
+
+**Tests** (`tests/dma_teardown_cases.h` in `test_dma_recovery`, run against
+the actual `dma_recovery.c`):
+
+| Case | Checks |
+|---|---|
+| `teardown_reset_idle` | only user torn down: one reset, control channel restarted, info line |
+| `teardown_reset_other_stream` | **another stream active on the same NHI: no reset**, 10 attempts, one warning with the ring counts; same for a lone idle ring |
+| `teardown_reset_waits_for_owner` | the owner's own rings freed after the first attempt: reset at attempt 2 |
+| `teardown_reset_lock_busy` | domain lock held: no wait, reset once free; held throughout: bounded, `domain lock busy` |
+| `teardown_reset_tunnel_veto` | a DMA tunnel still in the CM: no reset |
+| `teardown_reset_gated` | other vendor, parameter off, `dma_shutdown`, `going_away`: not scheduled; v2: refused, no retry; removal after queuing: one `-ENODEV`, no retry |
+| `teardown_reset_failure` | failed reset: error line, admission stays closed, no retry |
+| `teardown_reset_budget_restarts` | a new teardown restarts the 10 attempts |
+
+`test_domain_teardown` adds `teardown_reset_wiring`, which checks where it is
+scheduled and cancelled. Its removal-order case now also checks that the
+work is cancelled before the DMA owners are retired. Each part was removed
+one at a time (mutation check); every removal makes at least one test fail.
