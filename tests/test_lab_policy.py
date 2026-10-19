@@ -116,13 +116,32 @@ class RingBudgetTests(unittest.TestCase):
             for stream in ('data0', 'data1'):
                 (self.sys / f'kernel/config/thunderbolt/stream/{domain}-2.0/{stream}').mkdir(parents=True)
         (devices / '0-0:2.1').mkdir()          # router port device, not a service
+        for domain, pci in ((0, '0000:c7:00.5'), (1, '0000:c7:00.6')):
+            (self.sys / f'bus/pci/devices/{pci}/domain{domain}').mkdir(parents=True)
+        self.interrupts = self.root / 'interrupts'
+        self.held(0, 0)
 
-    def budget(self, kernel=LAB_BUILD):
-        return diag.ring_budget(self.sys, modprobe_dir=self.modprobe, kernel=kernel)
+    def held(self, rings0, rings1):
+        """/proc/interrupts with control (2) + data ring vectors per NHI."""
+        lines = ['           CPU0       CPU1']
+        irq = 50
+        for pci, data in (('0000:c7:00.5', rings0), ('0000:c7:00.6', rings1)):
+            for vector in range(2 + data):
+                lines.append(f' {irq}:          0          9  IR-PCI-MSIX-{pci}    '
+                             f'{vector}-edge      thunderbolt')
+                irq += 1
+        lines.append(' 99:          0          0  IR-PCI-MSIX-0000:c4:00.0    0-edge      nvme0q0')
+        self.interrupts.write_text('\n'.join(lines) + '\n')
+
+    def budget(self, kernel=LAB_BUILD, **kw):
+        return diag.ring_budget(self.sys, modprobe_dir=self.modprobe, kernel=kernel,
+                                interrupts=self.interrupts, **kw)
 
     def test_lab_layout_fits_and_requires_policy(self):
         report = self.budget()
-        self.assertEqual({d: v['used'] for d, v in report['domains'].items()}, {'0': 2, '1': 2})
+        self.assertEqual({d: v['planned'] for d, v in report['domains'].items()}, {'0': 2, '1': 2})
+        self.assertEqual({d: v['held_data_rings'] for d, v in report['domains'].items()},
+                         {'0': 0, '1': 0})
         self.assertEqual(len(report['problems']), 1)
         self.assertIn('usb4stream-dedicated.conf missing', report['problems'][0])
         (self.modprobe / 'usb4stream-dedicated.conf').write_text('x')
@@ -137,23 +156,80 @@ class RingBudgetTests(unittest.TestCase):
         (self.sys / 'module/thunderbolt_net').mkdir(parents=True)
         report = self.budget()
         self.assertEqual(report['domains']['1']['usb4net_services'], ['1-2.1'])
-        self.assertEqual(report['domains']['1']['used'], 3)
+        self.assertEqual(report['domains']['1']['planned'], 3)
         self.assertTrue(report['thunderbolt_net_loaded'])
         self.assertEqual(len(report['problems']), 3)
         self.assertTrue(any('budget of 2' in p for p in report['problems']))
+
+    def test_held_rings_come_from_msix_vectors(self):
+        (self.modprobe / 'usb4stream-dedicated.conf').write_text('x')
+        self.assertEqual(diag.held_rings(self.interrupts.read_text()),
+                         {'0000:c7:00.5': 0, '0000:c7:00.6': 0})
+        self.held(4, 2)             # both streams open on NHI0, one on NHI1
+        report = self.budget()
+        self.assertEqual(report['domains']['0']['held_pairs'], 2)
+        self.assertEqual(report['domains']['1']['held_data_rings'], 2)
+        self.assertEqual(len(report['problems']), 2)
+        self.assertTrue(all('already held' in p for p in report['problems']))
+        self.assertEqual(self.budget(allow_held=True)['problems'], [])
+
+    def test_orphaned_gpu_context_after_rmdir_is_detected(self):
+        # rmdir removed both groups of domain 1, but a retained GPU context
+        # still holds a TX/RX pair: configfs shows nothing, the vectors do.
+        (self.modprobe / 'usb4stream-dedicated.conf').write_text('x')
+        for stream in ('data0', 'data1'):
+            (self.sys / f'kernel/config/thunderbolt/stream/1-2.0/{stream}').rmdir()
+        self.held(0, 2)
+        report = self.budget(allow_held=True)
+        self.assertEqual(report['domains']['1']['planned'], 0)
+        self.assertEqual(report['domains']['1']['held_pairs'], 1)
+        self.assertEqual(len(report['problems']), 1)
+        self.assertIn('2 data rings held but only 0 configured consumers', report['problems'][0])
+        self.assertIn('gpu_reap_orphans', report['problems'][0])
+
+    def test_quarantine_and_kernel_log_evidence(self):
+        (self.modprobe / 'usb4stream-dedicated.conf').write_text('x')
+        (self.sys / 'kernel/config/thunderbolt/stream/0-2.0/data1/gpu_quarantine').write_text('1\n')
+        (self.sys / 'kernel/config/thunderbolt/stream/1-2.0/data0/busy_poll').write_text('1\n')
+        log = ['oct 20 kernel: tbstream: tbstream3: GPU context still quarantined after rmdir, '
+               'retry with /sys/module/thunderbolt_stream/parameters/gpu_reap_orphans',
+               'oct 20 kernel: thunderbolt 0000:c7:00.6: ring 3 leaked by an abandoned DMA owner',
+               'oct 20 kernel: thunderbolt domain0: host interface reset after DMA teardown '
+               'pending: NHI in use (2 TX and 2 RX rings allocated besides control; ...)']
+        report = self.budget(kernel_log=log)
+        problems = report['problems']
+        self.assertEqual(len(problems), 3, problems)
+        self.assertIn('0-2.0/data1 has a quarantined GPU context', problems[0])
+        self.assertTrue(any('orphaned GPU context kept after rmdir' in p for p in problems))
+        self.assertTrue(any('ring leaked by an abandoned DMA owner' in p for p in problems))
+        self.assertTrue(any('busy_poll streams (1-2.0/data0)' in n for n in report['notes']))
+        self.assertTrue(any('teardown reset pending' in n for n in report['notes']))
+
+    def test_unreadable_interrupts_is_reported(self):
+        self.interrupts.unlink()
+        report = self.budget()
+        self.assertIsNone(report['domains']['0']['held_data_rings'])
+        self.assertTrue(any('held rings unknown' in n for n in report['notes']))
 
     def test_require_budget_exit_status(self):
         import contextlib
         import io
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             status = diag.main(['--sysfs-root', str(self.sys), '--modprobe-dir', str(self.modprobe),
-                                '--require-budget'])
+                                '--interrupts', str(self.interrupts), '--require-budget'])
         expected = 1 if diag.platform.release().startswith('7.3.0-rc5' + ck.LAB_PREFIX) else 0
         self.assertEqual(status, expected)
         (self.sys / 'kernel/config/thunderbolt/stream/0-2.0/data2').mkdir()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(diag.main(['--sysfs-root', str(self.sys), '--modprobe-dir',
-                                        str(self.modprobe), '--require-budget']), 1)
+                                        str(self.modprobe), '--interrupts', str(self.interrupts),
+                                        '--require-budget']), 1)
+        self.held(2, 0)
+        (self.sys / 'kernel/config/thunderbolt/stream/0-2.0/data2').rmdir()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(diag.main(['--sysfs-root', str(self.sys), '--modprobe-dir',
+                                        str(self.modprobe), '--interrupts', str(self.interrupts),
+                                        '--require-budget', '--allow-held']), expected)
 
 
 if __name__ == '__main__':

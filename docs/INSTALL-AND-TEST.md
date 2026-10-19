@@ -223,9 +223,18 @@ USB4NET reservation: in the lab kernels `thunderbolt_net` would take one of
 the two data ring pairs of each NHI. `tools/lab/usb4stream-dedicated.conf` (the
 policy deployed on the nodes) blocks it on releases matching
 `7.3.0-rc5-strix-gpu-bosgame-*` and leaves stock kernels untouched.
-`tools/usb4_diagnose.py` reports the ring consumers per domain (configured
-streams and services bound to thunderbolt-net) against that budget;
-`--require-budget` exits 1 when they do not fit, so run it before every test.
+`tools/usb4_diagnose.py` reports, per domain, the planned consumers (configured
+streams and services bound to thunderbolt-net) and the data rings actually
+held now: every ring with an MSI-X vector of that NHI in `/proc/interrupts`,
+which also covers GPU contexts retained after close or `rmdir` (orphans that
+no configfs group shows). `--require-budget` exits 1 when planned consumers do
+not fit, when rings are already held (`--allow-held` relaxes that while a run
+is in progress), when more rings are held than there are configured
+consumers, or when configfs shows a quarantined GPU context; with `--logs` the
+kernel's orphan, retained and abandoned-ring messages count too. Not visible
+in `/proc/interrupts`: busy_poll rings (no interrupts) and rings whose IRQ was
+released when their owner was abandoned; the kernel log is the evidence for
+those. Run it before every test.
 
 Install (maintenance window, as root, on each node):
 
