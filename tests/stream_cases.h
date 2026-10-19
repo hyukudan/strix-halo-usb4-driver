@@ -271,6 +271,7 @@ int main(int argc, char **argv)
         { "close_waits_for_tx_slot", close_waits_for_tx_slot },
         { "partial_io_is_accounted", partial_io_is_accounted },
         { "close_does_not_flush_rx", close_does_not_flush_rx },
+        { "spin_us_parameter_is_bounded", spin_us_parameter_is_bounded },
     };
 
     assert(argc == 2);

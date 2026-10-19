@@ -418,3 +418,29 @@ static void close_does_not_flush_rx(void)
     }
     unplug_and_remove(&e, 0);
 }
+
+/* A11: the module parameter could set any spin, while configfs stopped at
+ * TBSTREAM_DEV_MAX_SPIN_US: a reader then busy-polled with rx_lock held for
+ * as long as the parameter said. */
+static void spin_us_parameter_is_bounded(void)
+{
+    struct kernel_param kp = { &spin_us };
+    struct endpoint e;
+
+    assert(spin_us_set("1000", &kp) == 0 && spin_us == 1000);
+    assert(spin_us_set("1001", &kp) == -EINVAL && spin_us == 1000);
+    assert(spin_us_set("4294967295", &kp) == -EINVAL && spin_us == 1000);
+    assert(spin_us_set("x", &kp) == -EINVAL && spin_us == 1000);
+    assert(spin_us_set("25", &kp) == 0 && spin_us == 25);
+    /* A value that got there anyway (written before the setter, a racing
+     * write) is still capped where a stream uses it. */
+    spin_us = 100000;
+    endpoint_init(&e, 1);
+    e.dev.cfg_spin_us = -1;
+    assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+    assert(e.dev.rx_spin_us == TBSTREAM_DEV_MAX_SPIN_US);
+    assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+    spin_us = 0;
+    assert_nothing_held();
+    unplug_and_remove(&e, 0);
+}
