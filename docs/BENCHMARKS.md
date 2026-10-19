@@ -35,6 +35,11 @@ cc -O2 -Wall -o ~/bin/pingpong tools/pingpong.c
 3. Link: `python3 tools/lab/usb4stream_describe.py --summary` must show every
    cable used at the intended speed (Gen3 × 2 = 40 Gb/s). A cable that trained
    lower, or with an unknown speed, invalidates a comparison with earlier runs.
+   As root, `python3 tools/usb4_diagnose.py --registers` (or `--lanecap` for the
+   text capture format) also reads `LANE_ADP_CS_0/1` of both lane adapters of
+   every USB4 port and the sideband `LINK_CONF`/`TXFFE`, and exits 1 when sysfs
+   (cached at enumeration) disagrees with the live registers. Keep that output
+   with the run.
 4. Stream settings: the configfs attributes of each stream (`ring_size`,
    `throttling`, `busy_poll`, `rx_napi`, `spin_us`, `irq_cpu`) and the module
    parameters; `run_stream_bench.py` stores them.
