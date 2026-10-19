@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh /run/usb4stream-layout.json after a USB4 hotplug
+# Read-only: re-runs usb4stream-describe; never touches configfs or modules.
+ConditionKernelVersion=7.3.0-rc5-strix-gpu-bosgame-*
+After=usb4stream-lab.service
+Requisite=usb4stream-lab.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/usb4stream-describe --logs --output /run/usb4stream-layout.json --summary
+TimeoutStartSec=30
