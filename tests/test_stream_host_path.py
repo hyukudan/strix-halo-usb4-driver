@@ -24,7 +24,8 @@ CASES = ('open_failure_is_not_sticky', 'frame_arrays_use_kvcalloc', 'spin_withou
          'detach_without_open_files', 'stop_is_idempotent', 'shutdown_detaches',
          'open_fails_fast_without_domain', 'open_fails_fast_without_xdomain', 'open_nonblock_eagain',
          'open_wait_is_bounded', 'open_waits_for_peer', 'open_wait_ends_when_xdomain_goes',
-         'open_wait_is_interruptible', 'open_timeout_settings')
+         'open_wait_is_interruptible', 'open_timeout_settings',
+         'stream_deref_under_lock')
 STRUCTS = ('tbstream_frame', 'tbstream_ring', 'tbstream_dev', 'tbstream_group', 'tbstream')
 FUNCTIONS = ('tbstream_ring_free', 'tbstream_ring_available', 'tbstream_rx_start_poll',
              'tbstream_dev_napi_rx_locked', 'tbstream_dev_napi_rx', 'tbstream_dev_napi_spin',
@@ -33,7 +34,8 @@ FUNCTIONS = ('tbstream_ring_free', 'tbstream_ring_available', 'tbstream_rx_start
              'tbstream_dev_tx_callback', 'tbstream_dev_alloc_tx_buffers', 'tbstream_dev_start',
              'tbstream_dev_tx_drained', 'tbstream_dev_poll_ring', 'tbstream_dev_stop',
              'tbstream_valid', 'tbstream_dev_valid', 'tbstream_dev_removed', 'tbstream_dev_closed',
-             'tbstream_dev_detached', 'to_tbstream_dev', 'tbstream_dev_completed_rx',
+             'tbstream_dev_detached', 'tbstream_dev_attached', 'to_tbstream_dev',
+             'tbstream_dev_completed_rx',
              'tbstream_dev_consume_rx', 'tbstream_dev_alloc_tx', 'tbstream_dev_send_data',
              'tbstream_dev_send_close', 'tbstream_dev_lock', 'tbstream_dev_fops_read_iter',
              'tbstream_dev_fops_write_iter', 'tbstream_dev_fops_poll', 'tbstream_dev_open_timeout',

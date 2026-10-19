@@ -81,8 +81,10 @@ static bool mutex_trylock(struct mutex *m)
     return true;
 }
 static void mutex_unlock(struct mutex *m) { atomic_store(&m->held, false); assert(!pthread_mutex_unlock(&m->m)); }
-static bool mutex_held_by_me(struct mutex *m)
+static bool mutex_held_by_me(const struct mutex *m)
 {
+    if (!m)
+        return false;
     return atomic_load(&m->held) && pthread_equal(atomic_load(&m->owner), pthread_self());
 }
 #define lockdep_assert_held(m) assert(mutex_held_by_me(m))
@@ -254,7 +256,25 @@ static struct tb_ring *tb_ring_alloc_rx(struct tb_nhi *nhi, int hop, int size, u
 }
 static void tb_ring_start(struct tb_ring *r) { assert(!r->running); r->running = true; }
 static void tb_ring_throttling(struct tb_ring *r, unsigned int t) { (void)r; (void)t; }
-static bool tb_ring_flush(struct tb_ring *r, unsigned int ms) { (void)r; (void)ms; return true; }
+/* Like the real one: returns once nothing is in flight, else times out.
+ * Posted RX buffers stay in flight until data arrives. */
+static atomic_int rx_flushes;
+static bool tb_ring_flush(struct tb_ring *r, unsigned int ms)
+{
+    ktime_t end = ktime_add_ms(ktime_get(), ms);
+    bool empty;
+
+    if (!r->is_tx)
+        atomic_fetch_add(&rx_flushes, 1);
+    for (;;) {
+        pthread_mutex_lock(&r->lock);
+        empty = list_empty(&r->posted);
+        pthread_mutex_unlock(&r->lock);
+        if (empty || !ktime_before(ktime_get(), end))
+            return empty;
+        usleep(1000);
+    }
+}
 static void tb_ring_stop(struct tb_ring *r)
 {
     struct list_head all;
@@ -292,10 +312,31 @@ static int ring_enqueue(struct tb_ring *r, struct ring_frame *f)
     pthread_mutex_unlock(&r->lock);
     return 0;
 }
-static int tb_ring_rx(struct tb_ring *r, struct ring_frame *f) { assert(!r->is_tx); return ring_enqueue(r, f); }
+/* Audit A4: the controller may complete an RX frame as soon as it is
+ * posted (paths and ring already up during open), and the ring work then
+ * runs its callback at once. Counts down to the posting that completes. */
+static int rx_early_complete_after = -1;
+static int tb_ring_rx(struct tb_ring *r, struct ring_frame *f)
+{
+    int ret;
+
+    assert(!r->is_tx);
+    ret = ring_enqueue(r, f);
+    if (!ret && inject(&rx_early_complete_after)) {
+        pthread_mutex_lock(&r->lock);
+        list_del_init(&f->list);
+        pthread_mutex_unlock(&r->lock);
+        f->size = 64; f->eof = 2; f->sof = 1; f->flags = 0;
+        f->callback(r, f, false);
+    }
+    return ret;
+}
+static int tx_fail_after = -1;
 static int tb_ring_tx(struct tb_ring *r, struct ring_frame *f)
 {
     assert(r->is_tx);
+    if (inject(&tx_fail_after))
+        return -ESHUTDOWN;
     atomic_fetch_add(&tx_frames, 1);
     return ring_enqueue(r, f);
 }
@@ -323,6 +364,39 @@ static size_t tb_ring_size(const struct tb_ring *r) { return r->size; }
 static struct device *tb_ring_dma_device(struct tb_ring *r) { return &r->nhi->dev; }
 static size_t tb_ring_frame_size(const struct ring_frame *f) { return f->size ? f->size : TB_MAX_FRAME_SIZE; }
 /* The controller completes the oldest posted RX descriptor. */
+/* The controller sends the oldest posted TX frame; the ring work runs its
+ * callback (interrupt mode). Returns whether there was one. */
+static bool complete_tx(struct tb_ring *r)
+{
+    struct ring_frame *f = NULL;
+
+    /* Under the ring lock, so tb_ring_stop() waits for a running callback
+     * like the real one (flush_work) before the frames can be freed. */
+    pthread_mutex_lock(&r->lock);
+    if (r->running && !list_empty(&r->posted)) {
+        f = container_of(r->posted.next, struct ring_frame, list);
+        list_del_init(&f->list);
+        f->callback(r, f, false);
+    }
+    pthread_mutex_unlock(&r->lock);
+    return f;
+}
+
+/* With RING_DESC_CRC_ERROR / RING_DESC_BUFFER_OVERRUN, as the descriptor
+ * reports a damaged frame. */
+static void complete_rx_flags(struct tb_ring *r, u32 size, u32 flags)
+{
+    struct ring_frame *f;
+
+    pthread_mutex_lock(&r->lock);
+    assert(!list_empty(&r->posted));
+    f = container_of(r->posted.next, struct ring_frame, list);
+    list_del_init(&f->list);
+    f->size = size; f->eof = 2; f->sof = 1; f->flags = flags;
+    list_add_tail(&f->list, &r->done);
+    pthread_mutex_unlock(&r->lock);
+}
+
 static void complete_rx(struct tb_ring *r, u32 size)
 {
     struct ring_frame *f;
@@ -341,8 +415,18 @@ static void complete_rx(struct tb_ring *r, u32 size)
  * and tb_approve_xdomain_paths() then returns -ENOMEM without logging. */
 struct tb { struct tb_nhi *nhi; };
 struct tb_xdomain { struct tb *tb; bool is_unplugged; int hopids; };
-struct tb_service { struct tb_xdomain *xd; void *drvdata; };
-static struct tb_xdomain *tb_service_parent(struct tb_service *svc) { return svc->xd; }
+struct tb_service { struct tb_xdomain *xd; void *drvdata; struct device dev; };
+#define tb_to_service(d) container_of(d, struct tb_service, dev)
+#define __maybe_unused __attribute__((unused))
+/* Audit A2: a stream may be freed by a concurrent detach, so whatever looks
+ * inside it must hold the device mutex. Cases set the mutex to check. */
+static struct mutex *stream_deref_lock;
+static bool mutex_held_by_me(const struct mutex *m);
+static struct tb_xdomain *tb_service_parent(struct tb_service *svc)
+{
+    assert(!stream_deref_lock || mutex_held_by_me(stream_deref_lock));
+    return svc->xd;
+}
 struct cm_tunnel { struct tb_xdomain *xd; int out_hopid, tx_hop, in_hopid, rx_hop; bool used; };
 static struct cm_tunnel tunnels[8];
 static int enable_fail;
@@ -399,16 +483,31 @@ struct file { int f_flags; void *private_data; };
 struct kiocb { struct file *ki_filp; int ki_flags; };
 struct iov_iter { unsigned char *buf; size_t count; };
 static size_t iov_iter_count(const struct iov_iter *i) { return i->count; }
+/* Audit A8: bytes the user buffer accepts before a fault (-1: no fault). */
+static long iov_budget = -1;
+static size_t iov_take(size_t size)
+{
+    size_t n = size;
+
+    if (iov_budget >= 0) {
+        n = min(size, (size_t)iov_budget);
+        iov_budget -= n;
+    }
+    return n;
+}
 static size_t copy_page_to_iter(struct page *p, size_t off, size_t size, struct iov_iter *i)
 {
+    size = iov_take(size);
     memcpy(i->buf, p->data + off, size); i->buf += size; i->count -= size;
     return size;
 }
 static size_t copy_page_from_iter(struct page *p, size_t off, size_t size, struct iov_iter *i)
 {
+    size = iov_take(size);
     memcpy(p->data + off, i->buf, size); i->buf += size; i->count -= size;
     return size;
 }
+static void iov_iter_revert(struct iov_iter *i, size_t n) { i->buf -= n; i->count += n; }
 static void poll_wait(struct file *f, wait_queue_head_t *w, struct poll_table_struct *pt) { (void)f; (void)w; (void)pt; }
 static void cond_resched(void) { sched_yield(); }
 static void wake_up_interruptible(wait_queue_head_t *w) { (void)w; atomic_fetch_add(&wakeups, 1); }
@@ -461,6 +560,24 @@ static void *tb_service_get_drvdata(struct tb_service *svc) { return svc->drvdat
 static bool rx_napi;
 static unsigned int spin_us;
 static unsigned int open_timeout_ms = 30000;
+/* Module parameter plumbing for the spin_us setter. */
+struct kernel_param { unsigned int *arg; };
+static int kstrtouint(const char *s, unsigned int base, unsigned int *res)
+{
+    char *end;
+    unsigned long v;
+
+    errno = 0;
+    v = strtoul(s, &end, base);
+    if (errno || end == s || (*end && *end != '\n') || v > 0xffffffffUL)
+        return -EINVAL;
+    *res = v;
+    return 0;
+}
+static int param_set_uint(const char *s, const struct kernel_param *kp)
+{
+    return kstrtouint(s, 0, kp->arg);
+}
 
 /* Bounded open (0019): time in jiffies of 1 ms, the timed wait, and the
  * core's answer about the endpoint's domain and XDomain. */
@@ -475,6 +592,16 @@ static unsigned int open_timeout_ms = 30000;
     for (;;) { \
         if (cond) { __left = __left > 0 ? __left : 1; break; } \
         if (signal_pending(current)) { __left = -ERESTARTSYS; break; } \
+        if (!ktime_before(ktime_get(), __end)) { __left = (cond) ? 1 : 0; break; } \
+        sched_yield(); \
+    } \
+    __left; })
+#define wait_event_timeout(wq, cond, timeout) ({ \
+    long __left = (timeout); \
+    ktime_t __end = ktime_add_ms(ktime_get(), __left); \
+    (void)(wq); \
+    for (;;) { \
+        if (cond) { __left = __left > 0 ? __left : 1; break; } \
         if (!ktime_before(ktime_get(), __end)) { __left = (cond) ? 1 : 0; break; } \
         sched_yield(); \
     } \

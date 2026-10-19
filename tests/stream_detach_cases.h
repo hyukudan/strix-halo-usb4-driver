@@ -149,7 +149,9 @@ static void reconnect_refuses_stale_endpoint(void)
     unplug_and_remove(&e, 0);
     tbstream_group_attach_stream(&e.stream[1]);
     assert(e.dev.stream == &e.stream[1] && e.dev.detached);
+    mutex_lock(&e.dev.lock);
     assert(!tbstream_dev_valid(&e.dev)); /* the endpoint itself is valid again */
+    mutex_unlock(&e.dev.lock);
     assert_stale_file(&e);
     assert(!e.dev.tx_ring.ring && !tunnel_count());
     second = (struct file){ O_NONBLOCK, &e.dev.misc };

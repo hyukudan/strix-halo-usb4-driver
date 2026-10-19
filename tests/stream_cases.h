@@ -239,6 +239,7 @@ static void irq_affinity_is_restored(void)
 
 #include "stream_detach_cases.h"
 #include "stream_open_cases.h"
+#include "stream_audit_cases.h"
 
 int main(int argc, char **argv)
 {
@@ -263,6 +264,7 @@ int main(int argc, char **argv)
         { "open_wait_ends_when_xdomain_goes", open_wait_ends_when_xdomain_goes },
         { "open_wait_is_interruptible", open_wait_is_interruptible },
         { "open_timeout_settings", open_timeout_settings },
+        { "stream_deref_under_lock", stream_deref_under_lock },
     };
 
     assert(argc == 2);
