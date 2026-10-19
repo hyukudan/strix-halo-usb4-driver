@@ -148,3 +148,67 @@ static void early_rx_completion_is_kept(void)
     assert_nothing_held();
     unplug_and_remove(&e, 0);
 }
+
+/* A6: a frame with a CRC error or a buffer overrun was counted, nobody was
+ * woken, and read() returned its contents as valid data: a silent hole or
+ * garbage in a byte stream. Now the data before it is delivered, then every
+ * read fails with -EIO until the file is closed, and poll reports it. */
+static void damaged_rx_frame_fails_stream(void)
+{
+    unsigned flags[] = { RING_DESC_CRC_ERROR, RING_DESC_BUFFER_OVERRUN };
+
+    for (int i = 0; i < 2; ++i) {
+        struct endpoint e;
+        unsigned char buf[256];
+        int woken;
+
+        endpoint_init(&e, 1);
+        assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+        e.file.f_flags = O_NONBLOCK;
+        complete_rx(e.dev.rx_ring.ring, 64);
+        complete_rx_flags(e.dev.rx_ring.ring, 64, flags[i]);
+        complete_rx(e.dev.rx_ring.ring, 64);
+        woken = atomic_load(&wakeups);
+        /* One good frame, then the hole: only the good bytes. */
+        assert(file_read(&e, buf, sizeof(buf)) == 64);
+        assert(atomic_load(&wakeups) > woken); /* the damaged frame woke readers */
+        assert(file_read(&e, buf, sizeof(buf)) == -EIO);
+        assert(file_read(&e, buf, sizeof(buf)) == -EIO);
+        assert(tbstream_dev_fops_poll(&e.file, NULL) & EPOLLERR);
+        assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+        /* A new open starts a new stream. */
+        e.file.f_flags = 0;
+        assert(tbstream_dev_fops_open(NULL, &e.file) == 0 && !e.dev.rx_failed);
+        e.file.f_flags = O_NONBLOCK;
+        complete_rx(e.dev.rx_ring.ring, 64);
+        assert(file_read(&e, buf, sizeof(buf)) == 64);
+        assert(!(tbstream_dev_fops_poll(&e.file, NULL) & EPOLLERR));
+        assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+        assert_nothing_held();
+        unplug_and_remove(&e, 0);
+    }
+    /* Interrupt mode: the ring work runs the damaged frame's callback alone,
+     * and that callback must wake a sleeping reader (it used to only log). */
+    for (int i = 0; i < 2; ++i) {
+        struct endpoint e;
+        struct ring_frame *f;
+        unsigned char buf[64];
+        int woken;
+
+        endpoint_init(&e, 0);
+        assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+        complete_rx_flags(e.dev.rx_ring.ring, 64, flags[i]);
+        f = tb_ring_poll(e.dev.rx_ring.ring);
+        assert(f);
+        woken = atomic_load(&wakeups);
+        f->callback(e.dev.rx_ring.ring, f, false);
+        assert(atomic_load(&wakeups) == woken + 1);
+        e.file.f_flags = O_NONBLOCK;
+        assert(file_read(&e, buf, sizeof(buf)) == -EIO);
+        assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+        assert_nothing_held();
+        unplug_and_remove(&e, 0);
+    }
+}
+
+struct tx_completer { struct tb_ring *ring; int delay_ms; };

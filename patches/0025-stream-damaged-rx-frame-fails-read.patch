@@ -1,0 +1,82 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -140,6 +140,8 @@ struct tbstream_ring {
+  * @busy_poll: Instead of interrupts, busy poll the rings
+  * @users: Number of times @cdev has been opened
+  * @closed: CLOSE packet was received
++ * @rx_failed: A received frame was damaged (CRC error or buffer overrun):
++ *	       the byte stream has a hole, reads fail with -EIO until close
+  * @removed: Userspace removed the ConfigFS group underneath.
+  * @detached: The open files lost their rings: the stream went away (the
+  *	      rings were stopped then) or a resume could not restart them.
+@@ -182,6 +184,7 @@ struct tbstream_dev {
+ 	cpumask_var_t irq_saved[2];
+ 	int users;
+ 	bool closed;
++	bool rx_failed;
+ 	bool removed;
+ 	bool detached;
+ 	unsigned int domain_index;
+@@ -571,12 +574,21 @@ tbstream_dev_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 	sf->completed = true;
+ 	sdev->rx_ring.prod++;
+ 
+-	if (sf->frame.flags & RING_DESC_CRC_ERROR)
+-		pr_warn("RX CRC error\n");
+-	else if (sf->frame.flags & RING_DESC_BUFFER_OVERRUN)
+-		pr_warn("RX buffer overrun\n");
+-	else
+-		wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLRDNORM);
++	/* read() fails the stream when it reaches this frame */
++	if (sf->frame.flags & (RING_DESC_CRC_ERROR | RING_DESC_BUFFER_OVERRUN)) {
++		pr_warn_ratelimited("%s: RX %s, reads fail from this frame on\n",
++				    sdev->misc.name,
++				    sf->frame.flags & RING_DESC_CRC_ERROR ?
++				    "CRC error" : "buffer overrun");
++		wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLRDNORM | EPOLLERR);
++		return;
++	}
++	wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLRDNORM);
++}
++
++static inline bool tbstream_frame_damaged(const struct tbstream_frame *sf)
++{
++	return sf->frame.flags & (RING_DESC_CRC_ERROR | RING_DESC_BUFFER_OVERRUN);
+ }
+ 
+ static struct tbstream_frame *
+@@ -821,6 +833,7 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 			!sdev->busy_poll;
+ 	sdev->rx_spin_us = sdev->cfg_spin_us < 0 ? READ_ONCE(spin_us) : sdev->cfg_spin_us;
+ 	sdev->rx_poll_pending = false;
++	sdev->rx_failed = false;
+ 	ring = tb_ring_alloc_tx(xd->tb->nhi, -1, sdev->ring_size, flags);
+ 	if (!ring) {
+ 		ret = -ENOMEM;
+@@ -1070,6 +1083,16 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 			}
+ 			break;
+ 		}
++		/*
++		 * A damaged frame leaves a hole in the byte stream: deliver
++		 * what came before it, then fail every later read.
++		 */
++		if (tbstream_frame_damaged(sf)) {
++			sdev->rx_failed = true;
++			if (!nbytes)
++				ret = -EIO;
++			break;
++		}
+ 
+ 		sf_size = tb_ring_frame_size(&sf->frame);
+ 		size = min(iov_iter_count(to), sf_size);
+@@ -1219,6 +1242,8 @@ tbstream_dev_fops_poll(struct file *file, struct poll_table_struct *wait)
+ 		tbstream_dev_napi_rx(sdev);
+ 	if (tbstream_dev_valid(sdev) != 0) {
+ 		mask |= EPOLLHUP | EPOLLERR;
++	} else if (sdev->rx_failed) {
++		mask |= EPOLLERR;
+ 	} else {
+ 		if (tbstream_ring_available(&sdev->tx_ring))
+ 			mask |= EPOLLOUT | EPOLLWRNORM;

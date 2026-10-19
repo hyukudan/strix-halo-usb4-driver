@@ -267,6 +267,7 @@ int main(int argc, char **argv)
         { "stream_deref_under_lock", stream_deref_under_lock },
         { "resume_failure_fails_open_files", resume_failure_fails_open_files },
         { "early_rx_completion_is_kept", early_rx_completion_is_kept },
+        { "damaged_rx_frame_fails_stream", damaged_rx_frame_fails_stream },
     };
 
     assert(argc == 2);

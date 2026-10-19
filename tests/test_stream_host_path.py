@@ -27,13 +27,15 @@ CASES = ('open_failure_is_not_sticky', 'frame_arrays_use_kvcalloc', 'spin_withou
          'open_wait_is_interruptible', 'open_timeout_settings',
          'stream_deref_under_lock',
          'resume_failure_fails_open_files',
-         'early_rx_completion_is_kept')
+         'early_rx_completion_is_kept',
+         'damaged_rx_frame_fails_stream')
 STRUCTS = ('tbstream_frame', 'tbstream_ring', 'tbstream_dev', 'tbstream_group', 'tbstream')
 FUNCTIONS = ('tbstream_ring_free', 'tbstream_ring_available', 'tbstream_rx_start_poll',
              'tbstream_dev_napi_rx_locked', 'tbstream_dev_napi_rx', 'tbstream_dev_napi_spin',
              'tbstream_dev_irq_pin', 'tbstream_dev_irq_affinity', 'tbstream_dev_irq_affinity_restore',
              'tbstream_dev_xdomain', 'tbstream_dev_rx_callback', 'tbstream_dev_alloc_rx_buffers',
-             'tbstream_dev_tx_callback', 'tbstream_dev_alloc_tx_buffers', 'tbstream_dev_start',
+             'tbstream_frame_damaged', 'tbstream_dev_tx_callback', 'tbstream_dev_alloc_tx_buffers',
+             'tbstream_dev_start',
              'tbstream_dev_tx_drained', 'tbstream_dev_poll_ring', 'tbstream_dev_stop',
              'tbstream_valid', 'tbstream_dev_valid', 'tbstream_dev_removed', 'tbstream_dev_closed',
              'tbstream_dev_detached', 'tbstream_dev_attached', 'to_tbstream_dev',
