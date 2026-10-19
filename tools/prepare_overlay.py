@@ -12,6 +12,82 @@ import tempfile
 REPO = Path(__file__).resolve().parents[1]
 
 
+def tree_inventory(root: Path) -> set[str]:
+    """Relative POSIX paths of every regular file below root.
+
+    Symlinks (to files or directories) and special files are rejected instead of
+    being followed or copied, so nothing outside the hashed inventory slips in.
+    """
+    found = set()
+    for top, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs + files:
+            path = Path(top) / name
+            if path.is_symlink():
+                raise ValueError(f'Symlink not allowed: {path.relative_to(root).as_posix()}')
+            if name in files and not path.is_file():
+                raise ValueError(f'Special file not allowed: {path.relative_to(root).as_posix()}')
+        found.update((Path(top) / name).relative_to(root).as_posix() for name in files)
+    return found
+
+
+def safe_relative(name: str) -> Path:
+    relative = Path(name)
+    if (not isinstance(name, str) or relative.is_absolute() or '..' in relative.parts
+            or not relative.parts or relative.as_posix() != name):
+        raise ValueError(f'Invalid inventory path: {name!r}')
+    return relative
+
+
+def copy_overlay(repo: Path, tree: Path, manifest: dict) -> None:
+    """Copy exactly the manifest's captured files, each verified as it is read.
+
+    Any extra, missing, duplicate or symlinked entry under overlay/ fails before
+    anything is published; only the bytes that were hashed are written.
+    """
+    overlay = repo / 'overlay'
+    if overlay.is_symlink() or not overlay.is_dir():
+        raise ValueError('overlay/ must be a real directory')
+    items = manifest['modified_files']
+    names = [item['path'] for item in items]
+    if len(set(names)) != len(names):
+        raise ValueError('Duplicate overlay inventory path')
+    actual = tree_inventory(overlay)
+    extra, missing = sorted(actual - set(names)), sorted(set(names) - actual)
+    if extra or missing:
+        raise ValueError(f'Overlay inventory mismatch: unexpected {extra}, missing {missing}')
+    ready = []
+    for item in items:
+        relative = safe_relative(item['path'])
+        data = (overlay / relative).read_bytes()
+        if hashlib.sha256(data).hexdigest() != item['snapshot_sha256']:
+            raise ValueError(f"Snapshot hash mismatch: {overlay / relative}")
+        ready.append((tree / relative, data))
+    tree.mkdir()
+    for target, data in ready:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+
+
+def audit_series(repo: Path) -> list[Path]:
+    """patches/audit-series must be patches/series without 0001, all regular files."""
+    def entries(name):
+        return [line for line in (repo / 'patches' / name).read_text().splitlines()
+                if line and not line.startswith('#')]
+    audit = entries('audit-series')
+    series_path = repo / 'patches/series'
+    if series_path.exists() and audit != entries('series')[1:]:
+        raise ValueError('patches/audit-series must equal patches/series without 0001')
+    result = []
+    for name in audit:
+        if Path(name).name != name or not name.endswith('.patch'):
+            raise ValueError(f'Invalid patch name: {name}')
+        patch = repo / 'patches' / name
+        if patch.is_symlink() or not patch.is_file():
+            raise ValueError(f'Missing or symlinked patch: {name}')
+        result.append(patch)
+    return result
+
+
 def copy_additional_base(repo: Path, tree: Path) -> None:
     """Add hash-pinned upstream files absent from the immutable capture.
 
@@ -32,7 +108,7 @@ def copy_additional_base(repo: Path, tree: Path) -> None:
     names = [item['path'] for item in files]
     if len(set(names)) != len(names):
         raise ValueError('Duplicate additional-base file')
-    actual = {str(p.relative_to(base)) for p in base.rglob('*') if p.is_file() or p.is_symlink()}
+    actual = tree_inventory(base) if base.is_dir() and not base.is_symlink() else None
     if set(names) != actual:
         raise ValueError('Additional-base inventory mismatch')
     for item in files:
@@ -115,17 +191,14 @@ def materialize(output: Path, repo: Path = REPO, kernel_source: Path | None = No
     if output.exists():
         raise ValueError(f"Refusing to overwrite {output}")
     manifest = json.loads((repo / 'provenance/source-manifest.json').read_text())
-    for item in manifest['modified_files']:
-        path = repo / 'overlay' / item['path']
-        if hashlib.sha256(path.read_bytes()).hexdigest() != item['snapshot_sha256']:
-            raise ValueError(f"Snapshot hash mismatch: {path}")
+    patches = audit_series(repo)
     original = repo / 'patches/0001-usb4-current-source.patch'
     if hashlib.sha256(original.read_bytes()).hexdigest() != manifest['combined_patch_sha256']:
         raise ValueError('Original combined patch hash mismatch')
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.usb4-', dir=output.parent) as tmp:
         tree = Path(tmp) / 'source'
-        shutil.copytree(repo / 'overlay', tree)
+        copy_overlay(repo, tree, manifest)
         copy_additional_base(repo, tree)
         copy_external_base(repo, tree, kernel_source)
         # Never inherit a surrounding repository: git apply otherwise silently
@@ -134,12 +207,7 @@ def materialize(output: Path, repo: Path = REPO, kernel_source: Path | None = No
         for key in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'):
             env.pop(key, None)
         env['GIT_CEILING_DIRECTORIES'] = str(tree.parent)
-        for name in (repo / 'patches/audit-series').read_text().splitlines():
-            if not name or name.startswith('#'):
-                continue
-            if Path(name).name != name:
-                raise ValueError(f'Invalid patch name: {name}')
-            patch = repo / 'patches' / name
+        for patch in patches:
             subprocess.run(['git', 'apply', '--check', str(patch)], cwd=tree, env=env, check=True)
             subprocess.run(['git', 'apply', '--whitespace=error-all', str(patch)], cwd=tree, env=env, check=True)
         shutil.move(str(tree), str(output))

@@ -99,7 +99,7 @@ the current driver on its own.
 | Cabling | Two 40 Gb/s USB4 cables, each one an independent link between one controller on each machine |
 | Negotiated link | Gen3 × 2 lanes on both cables: **40 Gb/s per cable per direction** |
 | NHI rings | `REG_CAPS` = `0x00000003` → `hop_count` = 3 on all four NHIs: ring 0 is control, **2 data ring pairs per controller** |
-| Kernel in use | `7.3.0-rc5-strix-gpu-bosgame-20261014` |
+| Kernel in use | `7.3.0-rc5-strix-gpu-bosgame-20261019det` on both nodes (2026-10-19); each build has its own `-strix-gpu-bosgame-<id>` |
 
 ### Topology
 
@@ -233,9 +233,12 @@ link speed after every boot.
 
 Both machines, 2026-10-17, deployed module (`thunderbolt` srcversion
 `89426D53…`, `thunderbolt_stream` `C8E785E6…`). Host-memory transfers with
-`stream_mem_bench`: 8 GiB per stream, 1 MiB writes, position-dependent pattern
-verified by the receiver (zero bad chunks in every run). Aggregates are computed
-over a common receiver-clock window.
+[`tools/stream_mem_bench.c`](tools/stream_mem_bench.c): 8 GiB per stream, 1 MiB
+writes, position-dependent pattern verified by the receiver (zero bad chunks in
+every run). Aggregates are computed over a common receiver-clock window. These
+are lab observations: the raw per-run logs of both ends were kept on the
+machines and are not in this repository. [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
+lists what a reproducible measurement must record.
 
 ### Bandwidth (one direction)
 
@@ -291,7 +294,10 @@ ring for at most `spin_us`, then re-arms the interrupt and sleeps. For bulk
 transfers keep it off (with `spin_us=25` bulk throughput varied between −7 % and
 0 %). The older `busy_poll` mode keeps a core spinning and is mutually exclusive
 with `gpu_direct`. Benchmark source:
-[`tools/pingpong.c`](tools/pingpong.c) (`pingpong server|client /dev/tbstreamN size iters warmup`).
+[`tools/pingpong.c`](tools/pingpong.c) (`pingpong server|client /dev/tbstreamN size iters warmup [timeout_ms]`;
+both ends verify the full payload, each round trip is bounded by `timeout_ms`).
+How to reproduce and record both benchmarks:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## What the series adds
 
@@ -369,8 +375,8 @@ Before these fixes the series could not be built:
 |---|---|
 | Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 39 patches (0012–0039: checked offline in WSL and on cluster1, 2026-10-20) |
 | `prepare_overlay.py` vs applying the series to the kernel | ✅ byte-identical (22 files) |
-| Offline unit tests (`unittest discover`) | ✅ 171 run, OK (1 bundle-only skip) with 0001–0039; every patch 0020–0039 also passes on its own |
-| Modules with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` (0001–0017, 0001–0018 and 0001–0019: full `vmlinux modules` builds with modpost on cluster1, 2026-10-19; 0001–0032, 0001–0035 and 0001–0039: `vmlinux modules` with GPU on, then all modules relinked with GPU off, modpost both times, no kernel-doc warnings left) |
+| Offline unit tests (`unittest discover`) | ✅ 261 run, OK (1 bundle-only skip) with 0001–0039 (kernel and tools suites merged); every patch 0020–0039 also passes on its own |
+| Modules with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` (0001–0017, 0001–0018 and 0001–0019: full `vmlinux modules` builds with modpost on cluster1, 2026-10-19; 0001–0032, 0001–0035 and 0001–0039: `vmlinux modules` with GPU on, then all modules relinked with GPU off, modpost both times, no kernel-doc warnings left; `tools/check_build_log.py` makes any diagnostic in this series' files fatal in CI) |
 | Link negotiation Gen3 × 2 on both cables | ✅ sysfs and lane registers; kept across every module reload and controller reset |
 | Complete 0001–0010 series loaded on hardware (0011 measured separately; 0012–0039 not yet) | ✅ both machines, modules built against the running kernel (exact vermagic and CRCs) |
 | Host-memory bandwidth, integrity, latency (series) | ✅ 41.0–41.5 Gb/s with 4 streams, zero bad chunks; latency as above |
@@ -380,7 +386,7 @@ Before these fixes the series could not be built:
 | Live session recovery (`--recover-every 4`) | ✅ 3 recoveries with fresh epochs, all windows verified |
 | Controller group reset (`--controller-reset`) | ✅ 3 real controller resets per side during a duplex session, all windows verified |
 | Cooperative USB4NET reset (`--include-network`) | ✅ 3 resets with USB4NET up on the same controller; ~11 of 146 pings lost during resets, interface restored automatically |
-| GitHub Actions | ✅ `unit` and `kernel-objects` pass ([first green run](https://github.com/hyukudan/strix-halo-usb4-driver/actions/runs/39063359195)) |
+| GitHub Actions | `unit` (offline and tools tests) and `kernel-modules` (full `vmlinux modules` link with modpost, GPU on and off, diagnostics in this series' files fatal); `hip-integration` builds the engine's HIP target in a ROCm container on every push and PR, at the engine commit pinned in `provenance/software-validation.json` (it fails until that commit is published). None of the three jobs has run on GitHub with these changes yet. Earlier `kernel-objects` runs compiled selected objects only ([first green run](https://github.com/hyukudan/strix-halo-usb4-driver/actions/runs/39063359195)) |
 | Installed as default kernel, long-running and model-level qualification | ❌ pending |
 
 Receipts of the GPU campaigns are kept on the machines, outside Git
@@ -392,8 +398,8 @@ Two findings from the hardware runs that matter for anyone reproducing them:
   `strix-gpu-queue-visibility` on engine `main` declared `full_bytes` =
   4 198 399 (window + 4095) while the exported DMA-BUF is page-rounded, so the
   driver's exact identity check rejected `SGU_IOC_IMPORT` with `EINVAL`. The
-  2 MiB `allocation_quantum` fix used by the single-slot tool on 2026-10-15 had
-  not reached engine `main`; with it every campaign passes.
+  2 MiB `allocation_quantum` fix is now on engine `main` (commit `01001be`);
+  with it every campaign passes.
 - **Epochs are strictly increasing per stream device.** Each live recovery
   consumes one, so after `--recover-every 4` over 16 windows starting at epoch
   N the next session must use more than N+3. Reusing an older epoch is rejected
@@ -472,7 +478,7 @@ The builder needs a pristine checkout of the pinned kernel. It validates `tb.c`,
 `tb.h` and USB4NET `main.c` from it against `provenance/lifecycle-base.json`.
 
 ```sh
-git -C ../linux-pinned init -q
+git init -q ../linux-pinned
 git -C ../linux-pinned fetch --depth 1 https://github.com/torvalds/linux.git \
     72d3fcf802c45d00b300f25b848a93c3a2bd7c7e
 git -C ../linux-pinned checkout -q FETCH_HEAD
@@ -488,23 +494,31 @@ mocked kernel, HIP, MMIO and DMA boundaries. They do not emulate the NHI.
 
 ### Apply the series and build the modules
 
-```sh
-cd ../linux-pinned
-while read -r p; do git apply --check "$OLDPWD/patches/$p" && git apply "$OLDPWD/patches/$p"; done \
-    < "$OLDPWD/patches/series"
-git apply "$OLDPWD"/patches/kernel-backports/*.patch      # optional, recommended
+`tools/apply-series.sh` is the one canonical way to apply the series: it
+validates the series file first, checks each patch before applying it and stops
+with a non-zero status at the first one that fails (the tree is then partial:
+start again from a pristine copy).
 
+```sh
+tools/apply-series.sh --with-backports ../linux-pinned   # backports optional, recommended
+cd ../linux-pinned
 cp /boot/config-"$(uname -r)" .config
 scripts/kconfig/merge_config.sh -m .config "$OLDPWD/config/usb4-gpu.fragment"
+scripts/config --set-str LOCALVERSION "-strix-gpu-bosgame-$(date +%Y%m%d)a"
 make olddefconfig
+python3 "$OLDPWD/tools/check_kconfig.py" .config --kernelrelease "$(make -s kernelrelease)"
 make -j"$(nproc)" W=1
-make -j"$(nproc)" W=1 M=drivers/thunderbolt modules
 ```
 
+The fragment's `LOCALVERSION` is a placeholder that `check_kconfig.py` rejects:
+every build needs its own identity under `-strix-gpu-bosgame-`, so it never
+reuses the module directory (and backup) of an installed kernel, and the check
+also catches options that Kconfig dropped (`CONFIGFS_FS` and its dependants).
 Loadable modules must match the running kernel exactly (vermagic and
 MODVERSIONS CRCs). Build them from the same tree and configuration as that
 kernel, or build and install a complete new kernel with its own
-`LOCALVERSION`.
+`LOCALVERSION`, next to the previous one: see
+[docs/INSTALL-AND-TEST.md](docs/INSTALL-AND-TEST.md) section 1b.
 
 ## Runtime configuration
 
@@ -538,11 +552,17 @@ Module parameters:
 | `thunderbolt.gen3_retrain` | 0 | 0035: port resets allowed to bring a new XDomain link from Gen2 to Gen3 (at most 3); only with the lane adapter and the port (LINK_CONF Gen3 Support) advertising Gen3 and no DMA tunnel or data ring; every decision is logged |
 | `thunderbolt_stream.gpu_reap_orphans` | — | 0013, write-only: `1` reaps quarantined GPU contexts whose configfs stream was removed (`rmdir`); `EBUSY` if some still lack a stop proof |
 
-`thunderbolt_net` is blocked in the lab kernel through modprobe policy so that
+`thunderbolt_net` is blocked in the lab kernels through the modprobe policy
+[`tools/lab/usb4stream-dedicated.conf`](tools/lab/usb4stream-dedicated.conf)
+(installed as `/etc/modprobe.d/usb4stream-dedicated.conf`; it only applies to
+`7.3.0-rc5-strix-gpu-bosgame-*`, stock kernels keep USB4 networking) so that
 both data ring pairs remain available to USB4STREAM. With it loaded, one stream
-per controller is lost.
+per controller is lost. `python3 tools/usb4_diagnose.py --require-budget` shows
+the ring consumers per controller and fails if they exceed the budget.
 
-Diagnostics: `python3 tools/usb4_diagnose.py --logs` on both hosts;
+Diagnostics: `python3 tools/usb4_diagnose.py --logs` on both hosts (as root,
+add `--registers` or `--lanecap` to compare sysfs with `LANE_ADP_CS_0/1` and the
+sideband `LINK_CONF`/`TXFFE` of both lane adapters of every port);
 `python3 tools/lab/usb4stream_describe.py --logs --summary` for the cable
 topology.
 
@@ -553,7 +573,8 @@ topology.
   into freed memory. If the GPU needs passthrough for performance, set it per
   IOMMU group (NHI groups stay `DMA-FQ`) instead of passing `iommu=pt` or
   `amd_iommu=off` globally.
-- Keep a known-good boot entry. Use a distinct `LOCALVERSION` for every build.
+- Keep a known-good boot entry. Use a distinct `LOCALVERSION` for every build
+  (`-strix-gpu-bosgame-<id>`; `tools/check_kconfig.py` rejects a reused one).
 - Bring up one machine first, verify both links (Gen3 × 2), run the bandwidth,
   latency and GPU tests, then the second machine.
 - The IOMMU type of an NHI group can only be changed while no driver is bound.
@@ -564,8 +585,9 @@ topology.
 
 1. Build and install the series (plus the amdkfd backport) as the default
    kernel in a maintenance window, keeping the current kernel as fallback.
-2. Merge the 2 MiB `allocation_quantum` fix into engine `main` for the
-   multi-slot runner.
+2. ~~Merge the 2 MiB `allocation_quantum` fix into engine `main`~~: done
+   (`01001be`). Next engine step: adopt the 0016 terminal format and its
+   capability negotiation (audit B15).
 3. Extend 0010's NAPI-style completion to the GPU path (SGU rings use their own
    callbacks today), so `gpu_direct` also gets ~8 µs round trips.
 4. ~~Per-stream `rx_napi`/`spin_us` in configfs~~: done in 0011 (plus
@@ -588,8 +610,8 @@ topology.
 | `base/` | Hash-pinned upstream files that the capture did not include |
 | `provenance/` | Source manifests, pinned hashes, reference patches |
 | `config/usb4-gpu.fragment` | Kconfig options needed by the driver |
-| `tools/` | `prepare_overlay.py`, `validate_native.py`, `usb4_diagnose.py`, `pingpong.c` (latency benchmark) |
-| `tools/lab/` | Lab stream setup (`setup-usb4stream-lab`, `usb4stream-lab.service`) and the read-only topology report `usb4stream_describe.py` (`usb4stream-describe`) |
+| `tools/` | `apply-series.sh` (canonical patch application), `prepare_overlay.py`, `validate_native.py` and `update_validation_manifest.py`, `check_kconfig.py`, `usb4_diagnose.py`, `pingpong.c` (latency) and `stream_mem_bench.c` (bandwidth) |
+| `tools/lab/` | Lab stream setup (`setup-usb4stream-lab`, `usb4stream-lab.service` and a drop-in example), the USB4NET modprobe policy, the read-only topology report `usb4stream_describe.py` (`usb4stream-describe`) and its hotplug refresh |
 | `tests/` | Offline regression tests |
 | `docs/` | Design and audit reports per patch level |
 
