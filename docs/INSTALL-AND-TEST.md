@@ -217,7 +217,10 @@ a warning, and `--merge` refuses two reports with the same host name.
 The layout is a snapshot. The optional udev rule
 `tools/lab/90-usb4stream-describe.rules` re-runs the read-only describe through
 `usb4stream-describe-refresh.service` whenever a USB4 peer or stream service
-appears or disappears, so `/run/usb4stream-layout.json` follows replugs.
+appears or disappears, so `/run/usb4stream-layout.json` follows replugs. The
+rule restarts the unit, so an event during a pass always gets a pass after it,
+and each pass repeats (`--until-stable 5`) until the sysfs/configfs inventory
+did not change while it ran; otherwise the layout carries a warning.
 
 USB4NET reservation: in the lab kernels `thunderbolt_net` would take one of
 the two data ring pairs of each NHI. `tools/lab/usb4stream-dedicated.conf` (the
