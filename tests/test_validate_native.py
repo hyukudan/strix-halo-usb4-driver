@@ -5,7 +5,9 @@ Fixture repositories contain no driver code. The repository tests check that
 the shipped manifest matches the shipped series and, when USB4_SOURCE_TREE is
 set, the reconstructed source.
 """
+import contextlib
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -252,6 +254,20 @@ class KconfigCheckTests(unittest.TestCase):
             self.assertIn('does not end with',
                           ck.check(self.good(), self.FRAGMENT, kernelrelease='7.3.0-rc5+',
                                    modules_root=tmp)[0])
+
+    def test_cli_forbid_accepts_values_starting_with_dash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / '.config'
+            cfg.write_text(self.good())
+            used = '-strix-gpu-bosgame-20261020a'           # what uname -r | sed gives
+            for args in (['--forbid', used], [f'--forbid={used}'],
+                         ['--forbid', '-strix-gpu-bosgame-x', '--forbid', used]):
+                with self.subTest(args=args), contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(ck.main([str(cfg), *args]), 1)
+                    self.assertIn('already used', err.getvalue())
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ck.main([str(cfg), '--forbid', '-strix-gpu-bosgame-other']), 0)
 
     def test_cli_exit_status(self):
         with tempfile.TemporaryDirectory() as tmp:
