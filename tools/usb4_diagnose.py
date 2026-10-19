@@ -33,17 +33,56 @@ def direction(device, which):
     return dict(speed_gbps_per_lane=speed, lanes=lanes, raw_gbps=total,
                 raw_speed=raw_speed, raw_lanes=raw_lanes)
 
-def ring_budget(root, configfs=None, modprobe_dir=Path('/etc/modprobe.d'), kernel=None):
+MSIX = re.compile(r'PCI-MSIX-(\S+)\s+(\d+)-edge\s+(.*)$')
+CONTROL_RINGS = 2        # control TX + RX hold the first two vectors of every NHI
+EVIDENCE = (('GPU context still quarantined after rmdir', 'orphaned GPU context kept after rmdir'),
+            ('GPU contexts retained', 'GPU contexts retained (DMA stop unproved)'),
+            ('leaked by an abandoned DMA owner', 'ring leaked by an abandoned DMA owner'),
+            ('host interface reset after DMA teardown pending', 'teardown reset pending'))
+
+
+def nhi_by_domain(root):
+    """{domain: PCI address} from sysfs (bus/pci/devices/<bdf>/domainN)."""
+    out = {}
+    base = root / 'bus/pci/devices'
+    for pci in sorted(base.glob('*')) if base.is_dir() else []:
+        for child in pci.glob('domain*'):
+            if child.name[6:].isdecimal():
+                out[int(child.name[6:])] = pci.name
+    return out
+
+
+def held_rings(interrupts_text):
+    """{PCI address: data rings holding an MSI-X vector} from /proc/interrupts."""
+    vectors = {}
+    for line in interrupts_text.splitlines():
+        match = MSIX.search(line)
+        if match and 'thunderbolt' in match[3].split(', '):
+            vectors[match[1]] = vectors.get(match[1], 0) + 1
+    return {pci: max(0, count - CONTROL_RINGS) for pci, count in vectors.items()}
+
+
+def ring_budget(root, configfs=None, modprobe_dir=Path('/etc/modprobe.d'), kernel=None,
+                interrupts=Path('/proc/interrupts'), kernel_log=None, allow_held=False):
     """Ring-pair consumers per Thunderbolt domain against the lab budget.
 
-    Consumers: configured USB4STREAM endpoints (configfs groups) and services
-    bound to thunderbolt-net. Read-only; problems are listed, never fixed.
+    Two views, both read-only:
+    - planned: configured USB4STREAM endpoints (configfs groups) and services
+      bound to thunderbolt-net;
+    - held now: data rings that hold an MSI-X vector of the domain's NHI in
+      /proc/interrupts. This includes open streams, USB4NET and GPU contexts
+      retained after close or rmdir (orphans), which no configfs group shows.
+    Rings created without interrupts (busy_poll streams) and rings whose IRQ
+    was released when their owner was abandoned are not visible there; for
+    those the kernel log (kernel_log) is the evidence, and configfs
+    gpu_quarantine shows quarantined contexts whose group still exists.
     """
     configfs = Path(configfs) if configfs else root / 'kernel/config/thunderbolt/stream'
     domains = {}
 
     def slot(domain):
-        return domains.setdefault(domain, dict(streams=[], usb4net_services=[]))
+        return domains.setdefault(domain, dict(streams=[], usb4net_services=[], quarantined=[],
+                                               busy_poll=[]))
 
     try:
         groups = sorted(configfs.iterdir()) if configfs.is_dir() else []
@@ -57,7 +96,14 @@ def ring_budget(root, configfs=None, modprobe_dir=Path('/etc/modprobe.d'), kerne
             names = sorted(p.name for p in group.iterdir() if p.is_dir())
         except OSError:
             continue
-        slot(int(match[1]))['streams'] += [f'{group.name}/{n}' for n in names]
+        item = slot(int(match[1]))
+        for name in names:
+            key = f'{group.name}/{name}'
+            item['streams'].append(key)
+            if read(group / name / 'gpu_quarantine') == '1':
+                item['quarantined'].append(key)
+            if read(group / name / 'busy_poll') == '1':
+                item['busy_poll'].append(key)
     devices = root / 'bus/thunderbolt/devices'
     for dev in sorted(devices.glob('*')) if devices.is_dir() else []:
         match = SERVICE.match(dev.name)
@@ -69,16 +115,51 @@ def ring_budget(root, configfs=None, modprobe_dir=Path('/etc/modprobe.d'), kerne
             continue
         if driver in ('thunderbolt-net', 'thunderbolt_net'):
             slot(int(match[1]))['usb4net_services'].append(dev.name)
-    problems = []
+    try:
+        held = held_rings(Path(interrupts).read_text())
+        held_error = None
+    except OSError as exc:
+        held, held_error = None, f'{interrupts}: {exc.strerror or exc}'
+    nhis = nhi_by_domain(root)
+    for domain in nhis:
+        slot(domain)
+    problems, notes = [], []
     for domain, item in sorted(domains.items()):
         item['budget'] = LAB_DATA_RING_PAIRS
-        item['used'] = len(item['streams']) + len(item['usb4net_services'])
+        item['nhi'] = nhis.get(domain)
+        item['planned'] = len(item['streams']) + len(item['usb4net_services'])
+        rings = held.get(item['nhi'], 0) if held is not None and item['nhi'] else None
+        item['held_data_rings'] = rings
+        item['held_pairs'] = None if rings is None else (rings + 1) // 2
         if item['usb4net_services']:
             problems.append(f'domain {domain}: thunderbolt-net bound to '
                             f'{", ".join(item["usb4net_services"])} takes a ring pair')
-        if item['used'] > item['budget']:
-            problems.append(f'domain {domain}: {item["used"]} ring-pair consumers for a budget '
+        if item['planned'] > item['budget']:
+            problems.append(f'domain {domain}: {item["planned"]} ring-pair consumers for a budget '
                             f'of {item["budget"]}; some stream opens will fail')
+        for key in item['quarantined']:
+            problems.append(f'domain {domain}: {key} has a quarantined GPU context that keeps '
+                            'its rings (gpu_recover reap/reset)')
+        if item['held_pairs']:
+            if item['held_pairs'] > item['planned']:
+                problems.append(f'domain {domain}: {item["held_data_rings"]} data rings held but '
+                                f'only {item["planned"]} configured consumers: a GPU context '
+                                'retained after close or rmdir (orphan; reap with '
+                                'thunderbolt_stream.gpu_reap_orphans) or another ring owner')
+            elif not allow_held:
+                problems.append(f'domain {domain}: {item["held_data_rings"]} data rings already '
+                                'held (open streams, USB4NET or a retained GPU context); close '
+                                'them before a test')
+        if item['busy_poll']:
+            notes.append(f'domain {domain}: busy_poll streams ({", ".join(item["busy_poll"])}) '
+                         'run without interrupts; their rings are not counted as held')
+    for line in kernel_log or []:
+        for needle, label in EVIDENCE:
+            if needle in line:
+                (notes if label == 'teardown reset pending' else problems).append(
+                    f'kernel log: {label}: {line.strip()}')
+    if held_error:
+        notes.append(f'held rings unknown ({held_error})')
     net_loaded = (root / 'module/thunderbolt_net').exists()
     policy = Path(modprobe_dir) / POLICY
     lab_kernel = (kernel or platform.release()).startswith('7.3.0-rc5-strix-gpu-bosgame-')
@@ -89,7 +170,10 @@ def ring_budget(root, configfs=None, modprobe_dir=Path('/etc/modprobe.d'), kerne
         problems.append('thunderbolt_net is loaded on a lab kernel')
     return dict(domains={str(d): v for d, v in sorted(domains.items())},
                 thunderbolt_net_loaded=net_loaded, modprobe_policy=str(policy),
-                modprobe_policy_present=policy.is_file(), problems=problems)
+                modprobe_policy_present=policy.is_file(), problems=problems, notes=notes,
+                limits='held rings come from MSI-X vectors in /proc/interrupts: rings without '
+                       'interrupts (busy_poll) and rings of abandoned owners (IRQ released) '
+                       'are only visible through the kernel log (--logs)')
 
 
 def collect(root):
@@ -298,8 +382,11 @@ def main(argv=None):
     parser.add_argument('--logs', action='store_true', help='Also read recent filtered kernel logs')
     parser.add_argument('--modprobe-dir', type=Path, default=Path('/etc/modprobe.d'))
     parser.add_argument('--require-budget', action='store_true',
-                        help='exit 1 if USB4NET or extra consumers take the lab ring pairs '
-                             '(run before every benchmark)')
+                        help='exit 1 if USB4NET, held rings or extra consumers take the lab ring '
+                             'pairs (run before every benchmark)')
+    parser.add_argument('--allow-held', action='store_true',
+                        help='do not flag rings held by configured consumers (monitoring a run)')
+    parser.add_argument('--interrupts', type=Path, default=Path('/proc/interrupts'))
     parser.add_argument('--registers', action='store_true',
                         help='also read LANE_ADP_CS_0/1 of both lane adapters of every USB4 port '
                              'and sideband LINK_CONF/TXFFE from debugfs (root; read-only) and '
@@ -309,7 +396,6 @@ def main(argv=None):
                         help='with --registers, print the lab lanecap text instead of JSON')
     args = parser.parse_args(argv)
     report = collect(args.sysfs_root)
-    report['ring_budget'] = ring_budget(args.sysfs_root, modprobe_dir=args.modprobe_dir)
     if args.registers or args.lanecap:
         report['lanes'] = lane_registers(args.sysfs_root, args.debugfs_root)
     if args.logs:
@@ -317,11 +403,15 @@ def main(argv=None):
             result = subprocess.run(['journalctl', '-k', '-b', '--no-pager', '-n', '2000'],
                                     text=True, capture_output=True, timeout=15)
             report['kernel_log'] = [line for line in result.stdout.splitlines()
-                                    if re.search(r'thunderbolt|usb4|lane bonding|\bnhi\b', line, re.I)]
+                                    if re.search(r'thunderbolt|tbstream|usb4|lane bonding|\bnhi\b', line, re.I)]
             if result.returncode or result.stderr.strip():
                 report['log_warning'] = result.stderr.strip() or 'journalctl failed'
         except (OSError, subprocess.TimeoutExpired) as exc:
             report['log_warning'] = str(exc)
+    report['ring_budget'] = ring_budget(args.sysfs_root, modprobe_dir=args.modprobe_dir,
+                                        interrupts=args.interrupts,
+                                        kernel_log=report.get('kernel_log'),
+                                        allow_held=args.allow_held)
     if args.lanecap:
         print(lanecap_text(report, platform.node()))
     else:
