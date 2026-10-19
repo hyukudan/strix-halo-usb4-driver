@@ -100,14 +100,40 @@ static void test_teardown_reset_lock_busy(void)
     assert(!writes && !pm_refs);
     mutex_unlock(&f.tb.lock);
     assert(run_attempts(&f) == 1 && writes == 1 && strstr(last_info, "(attempt 3)"));
-    /* Held for the whole budget: bounded, then reported. */
+    /* Held past the fast attempts with no consumer: transient contention,
+     * retried slowly, logged once. (It used to park, and nothing re-armed
+     * it once the lock was released.) */
     teardown_init(&f);
     free_stream_rings(&f);
     mutex_lock(&f.tb.lock);
     tb_domain_schedule_teardown_reset(&f.tb);
-    assert(run_attempts(&f) == 10 && writes == 1);
-    assert(strstr(last_info, "pending: domain lock busy (0 TX and 0 RX rings"));
+    for (int i = 0; i < 10; ++i)
+        assert(run_delayed(&f.tb.teardown_reset_work));
+    assert(writes == 1 && f.tb.teardown_reset_work.pending && f.tb.teardown_reset_work.delay_ms == 2000);
+    assert(f.nhi.teardown_reset_slow && !f.nhi.teardown_reset_parked);
+    assert(strstr(last_info, "pending: domain lock busy, retried every 2000 ms"));
+    {
+        int logged = infos;
+
+        assert(run_delayed(&f.tb.teardown_reset_work) && run_delayed(&f.tb.teardown_reset_work));
+        assert(infos == logged && f.tb.teardown_reset_work.delay_ms == 2000 && writes == 1);
+    }
     mutex_unlock(&f.tb.lock);
+    assert(run_attempts(&f) == 1 && writes == 2 && !f.nhi.teardown_reset_pending && !f.nhi.teardown_reset_slow);
+    /* Slow retries that then find a consumer: parked, and its ring re-arms it. */
+    teardown_init(&f);
+    free_stream_rings(&f);
+    mutex_lock(&f.tb.lock);
+    tb_domain_schedule_teardown_reset(&f.tb);
+    for (int i = 0; i < 10; ++i)
+        assert(run_delayed(&f.tb.teardown_reset_work));
+    f.nhi.tx_rings[4] = &f.other;
+    mutex_unlock(&f.tb.lock);
+    assert(run_delayed(&f.tb.teardown_reset_work) && writes == 2);
+    assert(!f.tb.teardown_reset_work.pending && f.nhi.teardown_reset_parked && !f.nhi.teardown_reset_slow);
+    f.nhi.tx_rings[4] = NULL;
+    tb_nhi_ring_freed(&f.nhi);
+    assert(run_attempts(&f) == 1 && writes == 3);
 }
 
 /* A DMA tunnel still in the CM inventory (another XDomain's stream) vetoes
@@ -316,7 +342,8 @@ static void test_teardown_reset_pending_at_removal(void)
 }
 
 /* Suspend stops the attempts but keeps the reset pending; resume re-arms
- * it with a fresh budget. */
+ * it with a fresh budget. Between the two nothing queues it: not the free
+ * of the last ring (the real hook), not a new path teardown. */
 static void test_teardown_reset_pending_across_suspend(void)
 {
     struct recovery_fixture f;
@@ -326,10 +353,65 @@ static void test_teardown_reset_pending_across_suspend(void)
     assert(run_delayed(&f.tb.teardown_reset_work) && !writes);
     tb_domain_teardown_reset_stop(&f.tb, false);   /* tb_domain_suspend() */
     assert(!f.tb.teardown_reset_work.pending && f.nhi.teardown_reset_pending);
-    free_stream_rings(&f);
+    free_ring(&f, true, 2);
+    free_ring(&f, false, 3);
+    assert(!f.tb.teardown_reset_work.pending);
+    tb_domain_schedule_teardown_reset(&f.tb);
+    assert(!f.tb.teardown_reset_work.pending && f.nhi.teardown_reset_pending && !writes);
     tb_domain_teardown_reset_resume(&f.tb);        /* tb_domain_complete() */
     assert(f.tb.teardown_reset_work.pending && f.tb.teardown_reset_attempts == 0);
     assert(run_attempts(&f) == 1 && writes == 1 && strstr(last_info, "(attempt 1)"));
     tb_domain_teardown_reset_resume(&f.tb);
     assert(!f.tb.teardown_reset_work.pending);
+}
+
+/* Review of F: the reset releases the domain lock and its PM reference before
+ * it returns. A request made in that window (paths set up and torn down by
+ * another thread) was wiped when the finished run cleared the pending state,
+ * and its queued run then found nothing to do. */
+static struct recovery_fixture *hook_fixture;
+static void request_during_reset(void)
+{
+    tb_domain_schedule_teardown_reset(&hook_fixture->tb);
+}
+
+static void test_teardown_reset_request_during_reset(void)
+{
+    struct recovery_fixture f;
+
+    teardown_fresh(&f);
+    free_stream_rings(&f);
+    tb_domain_schedule_teardown_reset(&f.tb);
+    hook_fixture = &f;
+    pm_put_hook = request_during_reset;
+    assert(run_delayed(&f.tb.teardown_reset_work) && writes == 1 && !pm_put_hook);
+    assert(f.nhi.teardown_reset_pending && f.tb.teardown_reset_work.pending);
+    assert(run_attempts(&f) == 1 && writes == 2 && !f.nhi.teardown_reset_pending);
+    /* No request in between: the run clears it, nothing more runs. */
+    tb_domain_schedule_teardown_reset(&f.tb);
+    assert(run_attempts(&f) == 1 && writes == 3 && !f.nhi.teardown_reset_pending);
+}
+
+/* The other stream frees its last ring while the final fast attempt is
+ * finishing (after its admission found the ring): that free re-arms it, so
+ * the attempt must not park on top and log "pending". */
+static void free_other_stream_rings(void)
+{
+    free_ring(hook_fixture, true, 2);
+    free_ring(hook_fixture, false, 3);
+}
+
+static void test_teardown_reset_ring_freed_during_attempt(void)
+{
+    struct recovery_fixture f;
+
+    teardown_fresh(&f);
+    tb_domain_schedule_teardown_reset(&f.tb);
+    for (int i = 0; i < 9; ++i)
+        assert(run_delayed(&f.tb.teardown_reset_work));
+    hook_fixture = &f;
+    pm_put_hook = free_other_stream_rings;
+    assert(run_delayed(&f.tb.teardown_reset_work) && !writes && !pm_put_hook);
+    assert(!f.nhi.teardown_reset_parked && !infos && f.tb.teardown_reset_work.pending);
+    assert(run_attempts(&f) == 1 && writes == 1 && !f.nhi.teardown_reset_pending);
 }

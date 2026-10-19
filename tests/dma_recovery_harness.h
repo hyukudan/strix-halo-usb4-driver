@@ -114,7 +114,7 @@ static void *dev_get_drvdata(const struct device *d) { return d->drvdata; }
 struct pci_dev { unsigned vendor, device; bool present, master, master_stuck, config_fail, relaxed, devctl_fail; struct device dev; };
 struct tb_nhi;
 struct tb_ring { spinlock_t lock; struct tb_nhi *nhi; bool is_tx, running; unsigned hop; struct list_head queue, in_flight; };
-struct tb_nhi { spinlock_t lock; struct device *dev; struct tb_ring *tx_rings[8], *rx_rings[8]; bool going_away, dma_resetting, dma_shutdown; unsigned dma_retained; bool dma_revoked, dma_abandoned, teardown_reset_pending, teardown_reset_parked; unsigned hop_count; unsigned char *iobase; };
+struct tb_nhi { spinlock_t lock; struct device *dev; struct tb_ring *tx_rings[8], *rx_rings[8]; bool going_away, dma_resetting, dma_shutdown; unsigned dma_retained; bool dma_revoked, dma_abandoned, teardown_reset_pending, teardown_reset_parked, teardown_reset_slow, teardown_reset_suspended; unsigned teardown_reset_gen; unsigned hop_count; unsigned char *iobase; };
 struct tb_ctl { struct tb_nhi *nhi; };
 struct tb;
 struct tb_cm_ops { int (*dma_paths_busy)(struct tb *, int, int); };
@@ -142,7 +142,18 @@ static unsigned char bar[0x40000];
 static u32 caps;
 static int pm_runtime_resume_and_get(struct device *d) { (void)d; if(pm_error)return pm_error; ++pm_refs;return 0; }
 static void pm_runtime_mark_last_busy(struct device *d) { (void)d; }
-static void pm_runtime_put_autosuspend(struct device *d) { (void)d;assert(pm_refs>0);--pm_refs; }
+/* Runs once at the end of the reset, after the domain lock was released:
+ * what another thread may do in that window. */
+static void (*pm_put_hook)(void);
+static void pm_runtime_put_autosuspend(struct device *d)
+{
+    void (*hook)(void) = pm_put_hook;
+
+    (void)d; assert(pm_refs > 0); --pm_refs;
+    pm_put_hook = NULL;
+    if (hook)
+        hook();
+}
 static u32 ioread32(void *address) { assert((unsigned char *)address==bar+REG_CAPS); ++reads;return writes&&broken_readback?~0U:caps; }
 static void iowrite32(u32 value,void *address) { assert(value==1 && (unsigned char *)address==bar+0x39858);++writes; }
 static void usleep_range(unsigned a,unsigned b) { assert(a==10000&&b==20000); }
