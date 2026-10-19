@@ -21,7 +21,7 @@ host memory, plus a DMA-BUF extension that moves data between the two iGPUs
 without staging through TCP.
 
 The series applies to Linux `72d3fcf802c45d00b300f25b848a93c3a2bd7c7e`
-(**7.3-rc5**). All ten patches in [`patches/series`](patches/series) are the
+(**7.3-rc5**). All sixteen patches in [`patches/series`](patches/series) are the
 driver; `overlay/` is an immutable capture of the original source and is *not*
 the current driver on its own.
 
@@ -32,6 +32,14 @@ the current driver on its own.
 > controller group reset with and without USB4NET), all with zero kernel
 > warnings. It is not yet installed as the default kernel and is not
 > production-qualified. See [Status](#status).
+>
+> **Review fixes (2026-10-19, 0012–0016):** offline-tested and object-built
+> only, **not yet run on hardware**. They fix a use-after-free and a hang on
+> reboot/unbind with an armed `gpu_direct` session, a stream open failure that
+> left every later open of that NHI failing with `ENOMEM`, the 0011 spin held
+> under the device mutex, and add an opt-in kernel-validated GPU terminal
+> frame. Validate them on the nodes before installing:
+> [docs/REVIEW-FIXES-2026-10-19.md](docs/REVIEW-FIXES-2026-10-19.md).
 
 ## Contents
 
@@ -148,7 +156,7 @@ sequenceDiagram
     E1->>K1: import DMA-BUF window (once)
     E2->>K2: import DMA-BUF window (once)
     E2->>K2: post RX slots on the GPU window
-    E1->>K1: submit op (waits on GPU fence)
+    E1->>K1: submit op (waits only on dma_resv fences, see note)
     K1->>K1: batch descriptors, one doorbell (0003)
     K1->>L: DMA from GPU memory, 4 KiB frames
     L->>K2: frames land directly in GPU memory
@@ -156,6 +164,17 @@ sequenceDiagram
     K1-->>E1: TX completion fence
     Note over K1,K2: deadlines and quarantine: memory stays mapped<br/>until the controller is proven stopped
 ```
+
+**Synchronization contract with HIP/ROCm.** SUBMIT and RX_REPOST wait only for
+fences published in the DMA-BUF's `dma_resv` (DRM command submission, Vulkan
+implicit sync). HIP kernels run on KFD user queues that publish no such fence,
+so with HIP memory the kernel cannot see GPU work: the application **must**
+finish the producer (for example `hipStreamSynchronize`/`hipEventSynchronize`)
+before SUBMIT, and finish every consumer of an RX window before RX_REPOST or
+PREPARE of that slot. Otherwise the DMA reads data the GPU has not written yet,
+or overwrites data it is still reading, with no error. This is the current
+contract, pending confirmation on hardware and a design decision on explicit
+in-fences; see [docs/REVIEW-FIXES-2026-10-19.md](docs/REVIEW-FIXES-2026-10-19.md).
 
 The link speed is read from `/sys/bus/thunderbolt/devices/*/{rx,tx}_speed`
 (20.0 Gb/s per lane × 2 lanes). Current link speed and CLx state can be
@@ -242,6 +261,12 @@ with `gpu_direct`. Benchmark source:
 | `0008-detached-quarantine-and-notification-lifecycle` | Detached-peer quarantine reclamation by the original owner, bounded XDomain property notifications. |
 | `0009-domain-retirement-and-cooperative-controller-recovery` | Safe retirement of quiescent contexts even with old FDs still open (RCU-protected poll, `kfree_rcu`), explicit group reset for up to 16 owner-held GPU FDs, and optional cooperative USB4NET close/reset/reopen. Unknown or active consumers veto a reset. |
 | `0010-stream-rx-napi-hybrid-completion` | NAPI-style RX completion for streams: `start_poll` wakes the reader straight from the IRQ, the reader reaps frames itself (ring order preserved) and polls for up to `spin_us` before re-arming the interrupt. Halves small-message latency with interrupts kept on. The core no longer warns when stopping a `start_poll` ring that is legitimately masked. |
+| `0011-stream-per-stream-napi-and-irq-steering` | Per-stream configfs `rx_napi`, `spin_us` and `irq_cpu` (pins the stream's TX/RX ring interrupts, CPU and GPU path), applied at open; `-1` keeps the module-wide behaviour. |
+| `0012-cm-unlink-tunnels-on-stop` | `tb_stop()` unlinks every tunnel it frees, so the DMA inventory queried by domain retirement is empty instead of pointing at freed tunnels (use-after-free on reboot/unbind with an armed `gpu_direct` session). The query refuses a stale inventory after stop. |
+| `0013-bounded-domain-release-and-dma-revocation` | A GPU context that cannot prove its DMA stopped no longer hangs reboot/unbind: domain teardown revokes and verifies the NHI's PCI bus mastering and releases such contexts (pending fences fail with `-ENODEV`); without that proof they are abandoned (leaked, never touched again) and the wait for the domain is bounded (30 s). After a configfs `rmdir`, quarantined contexts are reaped through `gpu_reap_orphans`. |
+| `0014-stream-open-error-path-and-frame-arrays` | A stream open that failed after its DMA paths were enabled left the tunnel behind, so every later open of both streams of that NHI failed with `ENOMEM` until a module reload. The error path now disables the paths and frees everything; failures are logged. Frame bookkeeping arrays use `kvcalloc` (no order-4 allocation). |
+| `0015-stream-spin-outside-device-mutex-and-irq-restore` | The `spin_us` busy-poll runs under a separate RX lock, without the device mutex, so `write()`/`poll()` of the same stream are no longer blocked for up to 1 ms. The previous IRQ affinity is restored when the stream stops; an offline `irq_cpu` or a refused change is logged. |
+| `0016-gpu-kernel-validated-terminal-frame` | Opt-in `SGU_PREPARE_TERMINAL_HEADER`: TX sends a kernel-built terminal header, RX receives it in kernel memory and validates length, epoch, sequence, size and slot; a mismatch fails the operation with `SGU_FRAME_ERROR_TERMINAL` instead of silently shifting data. Advertised by `SGU_CAP_TERMINAL_HEADER`; the ABI layout and `abi_minor` are unchanged. |
 
 Design rule throughout: a timeout, process exit, failed MMIO read or missing
 PCI device is **never** treated as proof that DMA has stopped. Memory the
@@ -273,12 +298,12 @@ Before these fixes the series could not be built:
 
 | Check | Result |
 |---|---|
-| Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 10 patches |
+| Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 16 patches (0012–0016: checked offline in WSL, 2026-10-19) |
 | `prepare_overlay.py` vs applying the series to the kernel | ✅ byte-identical (22 files) |
-| Offline unit tests (`unittest discover`) | ✅ 84 run, OK (1 bundle-only skip) |
+| Offline unit tests (`unittest discover`) | ✅ 98 run, OK (1 bundle-only skip) with 0012–0016 |
 | Modules with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` |
 | Link negotiation Gen3 × 2 on both cables | ✅ sysfs and lane registers; kept across every module reload and controller reset |
-| Complete 0001–0010 series loaded on hardware | ✅ both machines, modules built against the running kernel (exact vermagic and CRCs) |
+| Complete 0001–0010 series loaded on hardware (0011 measured separately; 0012–0016 not yet) | ✅ both machines, modules built against the running kernel (exact vermagic and CRCs) |
 | Host-memory bandwidth, integrity, latency (series) | ✅ 41.0–41.5 Gb/s with 4 streams, zero bad chunks; latency as above |
 | Stream open/close stress (series) | ✅ 80 cycles across all 4 streams and both directions (40 with `rx_napi`), zero failures, zero kernel warnings |
 | GPU-to-GPU, one-way (`strix-gpu-queue-visibility`, depth 8) | ✅ 4 windows, 32 operations, 131 104 bytes verified on the GPU |
@@ -425,6 +450,10 @@ Streams are created in configfs under
 | `busy_poll` | 0 | `1` halves small-message latency but burns a core; **rejected while `gpu_direct=1`** |
 | `gpu_direct` | 0 | enables the DMA-BUF GPU path for that stream |
 | `in_hopid` / `out_hopid` | -1 | auto allocation |
+| `rx_napi` | -1 | 0011: per-stream override of the module parameter (-1/0/1); ignored on `gpu_direct` streams |
+| `spin_us` | -1 | 0011: per-stream RX polling time, 0..1000 µs. Since 0015 the spin does not hold the device mutex: a writer or `poll()` on the same stream is not delayed by it |
+| `irq_cpu` | -1 | 0011: CPU for the stream's TX/RX ring interrupts; restored on close since 0015. irqbalance can move them again: ban these IRQs in irqbalance if the placement must hold |
+| `gpu_quarantine` (RO) / `gpu_recover` (WO) | — | quarantined GPU context; write `reap` or `reset` (CAP_SYS_ADMIN, no open FD) |
 
 Module parameters:
 
@@ -433,6 +462,8 @@ Module parameters:
 | `thunderbolt.dma_credits` | 14 | the router accepts at most 32; no measurable effect on these machines |
 | `thunderbolt_stream.rx_napi` | off | 0010: reader-side RX reaping; applies to streams opened afterwards |
 | `thunderbolt_stream.spin_us` | 0 | 0010: polling time before re-arming the RX interrupt; 25 is the measured sweet spot (10 is too short for 4 KiB round trips) |
+| `thunderbolt_stream.gpu_dma_timeout_ms` / `gpu_standby_timeout_ms` | 30000 / 300000 | GPU DMA deadlines |
+| `thunderbolt_stream.gpu_reap_orphans` | — | 0013, write-only: `1` reaps quarantined GPU contexts whose configfs stream was removed (`rmdir`); `EBUSY` if some still lack a stop proof |
 
 `thunderbolt_net` is blocked in the lab kernel through modprobe policy so that
 both data ring pairs remain available to USB4STREAM. With it loaded, one stream
@@ -462,10 +493,11 @@ Diagnostics: `python3 tools/usb4_diagnose.py --logs` on both hosts.
    multi-slot runner.
 3. Extend 0010's NAPI-style completion to the GPU path (SGU rings use their own
    callbacks today), so `gpu_direct` also gets ~8 µs round trips.
-4. Per-stream `rx_napi`/`spin_us` in configfs, so latency streams and bulk
-   streams can be tuned independently.
-5. User-space sequence numbers in the GPU terminal frame and a ping/pong path
-   check before marking a peer ready.
+4. ~~Per-stream `rx_napi`/`spin_us` in configfs~~: done in 0011 (plus
+   `irq_cpu`), reworked in 0015.
+5. ~~Sequence numbers in the GPU terminal frame~~: kernel-validated header in
+   0016 (opt-in). Still open: a ping/pong path check before marking a peer
+   ready, and an end-to-end payload checksum in the engine.
 6. Boot-time check that warns when a link trains below Gen3.
 7. Obtain an AXB35-02 BIOS that includes AMD's USB4 point-to-point change, then
    re-measure the per-ring ceiling.
@@ -474,8 +506,8 @@ Diagnostics: `python3 tools/usb4_diagnose.py --logs` on both hosts.
 
 | Path | Content |
 |---|---|
-| `patches/series` | The ten-patch series, in order |
-| `patches/audit-series` | Patches applied on top of the captured overlay (0002–0010) |
+| `patches/series` | The sixteen-patch series, in order |
+| `patches/audit-series` | Patches applied on top of the captured overlay (0002–0016) |
 | `patches/kernel-backports/` | Unmodified upstream fixes applied after the series |
 | `overlay/` | Immutable original source capture (equals pristine + 0001) |
 | `base/` | Hash-pinned upstream files that the capture did not include |
@@ -495,6 +527,9 @@ Reports describe the state at their own patch level:
 4. [External dependencies](docs/EXTERNAL-DEPENDENCIES-2026-10-16.md), patch 0007.
 5. [Detached lifecycle](docs/LIFECYCLE-2026-10-16.md), patch 0008.
 6. [Cooperative recovery and retirement](docs/SOFTWARE-COMPLETION-2026-10-16.md), patch 0009.
+7. 0010 and 0011 are described by their commit messages and the tables above.
+8. [Review fixes](docs/REVIEW-FIXES-2026-10-19.md), patches 0012–0016, with the
+   hardware validation steps still pending.
 
 The matching engine is `hyukudan/strix-halo-engine-lab`; its multi-slot entry
 point is `strix-gpu-queue-visibility` (`lab/gpu_queue`, `--queue-depth 2..8`).
