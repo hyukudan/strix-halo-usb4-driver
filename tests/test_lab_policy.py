@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Lab kernel identity, service condition, USB4NET policy and ring budget agree."""
 import configparser
+import contextlib
+import io
 import fnmatch
 import importlib.util
 import os
@@ -95,6 +97,47 @@ class LabPolicyTests(unittest.TestCase):
                        'tools/check_kconfig.py', '--kernelrelease',
                        'previous kernel', 'usb4_diagnose.py --require-budget'):
             self.assertIn(needle, doc)
+
+
+def load_script(name, path):
+    from importlib.machinery import SourceFileLoader
+    loader = SourceFileLoader(name, str(path))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(module)
+    return module
+
+
+class ReviewedDropinTests(unittest.TestCase):
+    tool = load_script('reviewed_kernel_dropin', LAB / 'reviewed-kernel-dropin')
+
+    def test_drop_in_allows_exactly_the_reviewed_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'usb4stream-lab.service.d/10-reviewed-kernel.conf'
+            self.assertEqual(self.tool.main([LAB_BUILD, '--output', str(out)]), 0)
+            text = out.read_text()
+            values = conditions(out)
+        self.assertEqual(values, [LAB_BUILD])
+        self.assertIn('[Unit]\nConditionKernelVersion=\nConditionKernelVersion=' + LAB_BUILD,
+                      text)
+        self.assertTrue(allowed(values, LAB_BUILD))
+        for release in ('7.3.0-rc5-strix-gpu-bosgame-20261020b',
+                        '7.3.0-rc5-strix-gpu-bosgame-20261019det') + OTHERS:
+            self.assertFalse(allowed(values, release), release)
+
+    def test_rejects_patterns_and_non_reviewable_identities(self):
+        bad = ('7.3.0-rc5-strix-gpu-bosgame-*', '7.3.0-rc5-strix-gpu-bosgame-2026102?',
+               '7.3.0-rc5', '6.17.0-5-generic', '7.3.0-rc5-strix-gpu-bosgame-20261014',
+               '7.3.0-rc5' + ck.PLACEHOLDER, '7.3.0-rc5-strix-gpu-bosgame-a b')
+        for release in bad:
+            with self.subTest(release=release), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(self.tool.main([release]), 1)
+                self.assertIn('reviewed-kernel-dropin:', err.getvalue())
+
+    def test_install_doc_generates_it(self):
+        doc = (REPO / 'docs/INSTALL-AND-TEST.md').read_text()
+        self.assertIn('tools/lab/reviewed-kernel-dropin "$(make -s', doc)
+        self.assertIn('10-reviewed-kernel.conf', doc)
 
 
 class RingBudgetTests(unittest.TestCase):
