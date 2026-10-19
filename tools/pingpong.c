@@ -5,7 +5,12 @@
 //
 // Every payload carries a position/iteration pattern that both ends verify in
 // full. Each round trip must finish within timeout_ms (default 5000); the
-// server waits up to max(60 s, timeout_ms) for the first message. Exit codes:
+// server waits up to max(60 s, timeout_ms) for the first message. The deadline
+// is a CLOCK_MONOTONIC instant checked before every read()/write(); a POSIX
+// timer on that clock interrupts a blocked call at the deadline and then every
+// 10 ms, so a signal that lands between two calls cannot be lost. Blocking I/O
+// is kept on purpose: O_NONBLOCK would bypass the driver's in-read RX polling
+// (rx_napi/spin_us) and change what is measured. Exit codes:
 // 2 usage, 4 open/alloc, 5 I/O error or EOF, 6 payload mismatch, 7 timeout.
 #define _GNU_SOURCE
 #include <errno.h>
@@ -25,10 +30,19 @@
 #define PP_MAX_ITERS 10000000UL
 #define PP_MAX_TIMEOUT_MS 3600000UL
 #define PP_START_TIMEOUT_MS 60000UL
+#define PP_RETICK_NS 10000000L	/* re-interrupt every 10 ms once the deadline passed */
+
+/* Test hook: runs between the two transfers of a round trip. */
+#ifndef PP_BETWEEN_OPS
+#define PP_BETWEEN_OPS() do { } while (0)
+#endif
 
 enum { PP_OK = 0, PP_USAGE = 2, PP_SETUP = 4, PP_IO = 5, PP_MISMATCH = 6, PP_TIMEOUT = 7 };
 
 static volatile sig_atomic_t expired;
+static timer_t deadline_timer;
+static struct timespec deadline;
+static int armed;		/* no deadline unless armed */
 
 static void on_alarm(int sig)
 {
@@ -39,26 +53,59 @@ static void on_alarm(int sig)
 static int install_alarm(void)
 {
 	struct sigaction sa;
+	struct sigevent ev;
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = on_alarm;	/* no SA_RESTART: blocked I/O returns EINTR */
 	sigemptyset(&sa.sa_mask);
-	return sigaction(SIGALRM, &sa, NULL);
+	if (sigaction(SIGALRM, &sa, NULL))
+		return -1;
+	memset(&ev, 0, sizeof(ev));
+	ev.sigev_notify = SIGEV_SIGNAL;
+	ev.sigev_signo = SIGALRM;
+	return timer_create(CLOCK_MONOTONIC, &ev, &deadline_timer);
 }
 
+/* Absolute monotonic deadline `ms` from now; first signal then, then every 10 ms. */
 static void arm(unsigned long ms)
 {
-	struct itimerval t = { { 0, 0 }, { (time_t)(ms / 1000), (suseconds_t)(ms % 1000) * 1000 } };
+	struct itimerspec t;
 
+	clock_gettime(CLOCK_MONOTONIC, &deadline);
+	deadline.tv_sec += (time_t)(ms / 1000);
+	deadline.tv_nsec += (long)(ms % 1000) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000L;
+	}
 	expired = 0;
-	setitimer(ITIMER_REAL, &t, NULL);
+	armed = 1;
+	memset(&t, 0, sizeof(t));
+	t.it_value = deadline;
+	t.it_interval.tv_nsec = PP_RETICK_NS;
+	timer_settime(deadline_timer, TIMER_ABSTIME, &t, NULL);
 }
 
 static void disarm(void)
 {
-	struct itimerval t = { { 0, 0 }, { 0, 0 } };
+	struct itimerspec t;
 
-	setitimer(ITIMER_REAL, &t, NULL);
+	memset(&t, 0, sizeof(t));
+	timer_settime(deadline_timer, 0, &t, NULL);
+	armed = 0;
+}
+
+static int past_deadline(void)
+{
+	struct timespec now;
+
+	if (!armed)
+		return 0;
+	if (expired)
+		return 1;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return now.tv_sec > deadline.tv_sec ||
+	       (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec);
 }
 
 /* Parse a decimal/hex unsigned value in [lo, hi]; reject sign, junk, overflow. */
@@ -95,18 +142,18 @@ static long pp_check(const unsigned char *buf, const unsigned char *want, size_t
 	return -1;
 }
 
-/* Move exactly n bytes; retry EINTR until the armed deadline expires. */
+/* Move exactly n bytes before the armed deadline; EINTR is retried until then. */
 static int full(int fd, unsigned char *b, size_t n, int wr)
 {
 	while (n) {
-		ssize_t r = wr ? write(fd, b, n) : read(fd, b, n);
+		ssize_t r;
 
+		if (past_deadline())
+			return PP_TIMEOUT;
+		r = wr ? write(fd, b, n) : read(fd, b, n);
 		if (r < 0) {
-			if (errno == EINTR) {
-				if (expired)
-					return PP_TIMEOUT;
-				continue;
-			}
+			if (errno == EINTR)
+				continue;	/* the loop head decides */
 			return PP_IO;
 		}
 		if (r == 0) {
@@ -206,6 +253,7 @@ static int pp_run(int fd, const struct pp_args *a, FILE *out)
 		arm(limit);
 		double t0 = now();
 		ret = full(fd, tx, a->size, 1);
+		PP_BETWEEN_OPS();
 		if (!ret)
 			ret = full(fd, rx, a->size, 0);
 		double dt = (now() - t0) * 1e6;
