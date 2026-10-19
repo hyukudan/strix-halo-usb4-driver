@@ -526,7 +526,9 @@ both data ring pairs remain available to USB4STREAM. With it loaded, one stream
 per controller is lost. `python3 tools/usb4_diagnose.py --require-budget` shows
 the ring consumers per controller and fails if they exceed the budget.
 
-Diagnostics: `python3 tools/usb4_diagnose.py --logs` on both hosts;
+Diagnostics: `python3 tools/usb4_diagnose.py --logs` on both hosts (as root,
+add `--registers` or `--lanecap` to compare sysfs with `LANE_ADP_CS_0/1` and the
+sideband `LINK_CONF`/`TXFFE` of both lane adapters of every port);
 `python3 tools/lab/usb4stream_describe.py --logs --summary` for the cable
 topology.
 
