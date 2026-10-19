@@ -1,0 +1,17 @@
+#!/usr/bin/python3
+import pathlib,subprocess,json
+subprocess.run(['modprobe','thunderbolt-stream'],check=True)
+root=pathlib.Path('/sys/kernel/config/thunderbolt/stream')
+services=['0-2.0','1-2.0']
+layout={}
+for name in ('data0','data1'):
+ for service in services:
+  group=root/service;group.mkdir(exist_ok=True)
+  stream=group/name;stream.mkdir(exist_ok=True)
+  for key,val in [('ring_size','1024'),('throttling','8192'),('busy_poll','0'),('gpu_direct','0'),('in_hopid','-1'),('out_hopid','-1')]:
+   path=stream/key
+   if key.endswith('hopid') and path.read_text().strip() not in ('0','-1'):continue
+   path.write_text(val+'\n')
+  layout[service+'/'+name]={'device':'/dev/tbstream'+(stream/'index').read_text().strip(),'configfs':str(stream)}
+pathlib.Path('/run/usb4stream-layout.json').write_text(json.dumps(layout,indent=2))
+print(json.dumps(layout,indent=2))
