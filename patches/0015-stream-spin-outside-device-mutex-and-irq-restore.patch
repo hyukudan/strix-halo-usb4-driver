@@ -1,0 +1,246 @@
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -966,6 +966,7 @@ static void tbstream_gpu_close(struct tbstream_dev *sdev)
+     sgu_unregister_client(ctx);
+     sgu_release_detached_hopids(ctx);
+     sgu_release_windows(ctx);
++    tbstream_dev_irq_affinity_restore(sdev);
+     tb_ring_free(sdev->rx_ring.ring);
+     tb_ring_free(sdev->tx_ring.ring);
+     sdev->rx_ring.ring = NULL;
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -10,6 +10,7 @@
+ #define pr_fmt(fmt) "tbstream: " fmt
+ 
+ #include <linux/interrupt.h>
++#include <linux/irq.h>
+ #include <linux/delay.h>
+ #include <linux/configfs.h>
+ #include <linux/compat.h>
+@@ -166,6 +167,11 @@ struct tbstream_dev {
+ 	int cfg_spin_us;
+ 	unsigned int rx_spin_us;
+ 	int irq_cpu;
++	/* NAPI RX reaping and the RX ring lifetime against it; nests inside @lock */
++	struct mutex rx_lock;
++	/* Ring IRQs moved to @irq_cpu (0 = none) and their previous affinity */
++	int irq_pinned[2];
++	cpumask_var_t irq_saved[2];
+ 	int users;
+ 	bool closed;
+ 	bool removed;
+@@ -324,15 +330,18 @@ static void tbstream_rx_start_poll(void *data)
+  * interrupt is masked, so frames are delivered in ring order. Optionally
+  * keep polling for spin_us, then re-arm the interrupt and reap once more
+  * to close the race with a frame completing just before the unmask.
+- * Called with sdev->lock held.
++ * Called with rx_lock held. The device mutex is not required: a spinning
++ * reader does not hold it, so write() and poll() of the stream proceed.
+  */
+-static void tbstream_dev_napi_rx(struct tbstream_dev *sdev, bool spin)
++static void tbstream_dev_napi_rx_locked(struct tbstream_dev *sdev, bool spin)
+ {
+ 	struct tb_ring *ring = sdev->rx_ring.ring;
+ 	struct ring_frame *frame;
+ 	ktime_t end;
+ 
+-	if (!sdev->rx_napi)
++	lockdep_assert_held(&sdev->rx_lock);
++	/* No ring: the stream was stopped (suspend) underneath the reader. */
++	if (!sdev->rx_napi || !ring)
+ 		return;
+ 
+ 	WRITE_ONCE(sdev->rx_poll_pending, false);
+@@ -353,22 +362,97 @@ static void tbstream_dev_napi_rx(struct tbstream_dev *sdev, bool spin)
+ 		frame->callback(ring, frame, false);
+ }
+ 
++/*
++ * Reap once without spinning. Called with sdev->lock held. If another
++ * reader is spinning it owns rx_lock and is reaping already.
++ */
++static void tbstream_dev_napi_rx(struct tbstream_dev *sdev)
++{
++	if (!sdev->rx_napi || !mutex_trylock(&sdev->rx_lock))
++		return;
++	tbstream_dev_napi_rx_locked(sdev, false);
++	mutex_unlock(&sdev->rx_lock);
++}
++
++/*
++ * Bounded busy-poll before a blocking reader sleeps, without the device
++ * mutex (up to spin_us, at most TBSTREAM_DEV_MAX_SPIN_US). Returns %true
++ * if RX frames became available; the caller re-checks under sdev->lock.
++ * The caller holds an open file, so the rings exist unless a system
++ * suspend stopped them, which tbstream_dev_stop() does under rx_lock.
++ */
++static bool tbstream_dev_napi_spin(struct tbstream_dev *sdev)
++{
++	bool available;
++
++	if (!READ_ONCE(sdev->rx_napi) || !READ_ONCE(sdev->rx_spin_us))
++		return false;
++	if (mutex_lock_interruptible(&sdev->rx_lock))
++		return false;
++	tbstream_dev_napi_rx_locked(sdev, true);
++	available = sdev->rx_ring.ring && tbstream_ring_available(&sdev->rx_ring);
++	mutex_unlock(&sdev->rx_lock);
++	return available;
++}
++
+ /*
+  * Ring vectors are requested when a stream is opened, so their CPU is
+  * chosen afresh every time. Keeping the completion interrupt next to the
+  * thread that consumes it avoids cross-CCD wake-ups, which dominate the
+  * latency tail on Strix Halo. Best effort: a failure only loses the hint.
++ * The previous affinity is restored when the stream stops, because the
++ * Linux IRQ of an MSI-X vector is reused by the next ring (USB4NET, another
++ * stream). irqbalance may still move a pinned vector: ban these IRQs there
++ * (IRQBALANCE_BANNED_CPULIST or --banirq) if the placement must hold.
+  */
++static void tbstream_dev_irq_pin(struct tbstream_dev *sdev, int slot,
++				 struct tb_ring *ring, int cpu)
++{
++	const struct cpumask *previous;
++	int irq = ring ? ring->irq : 0;
++	int ret;
++
++	if (irq <= 0 || sdev->irq_pinned[slot])
++		return;
++	previous = irq_get_affinity_mask(irq);
++	if (!previous)
++		return;
++	cpumask_copy(sdev->irq_saved[slot], previous);
++	ret = irq_set_affinity(irq, cpumask_of(cpu));
++	if (ret) {
++		pr_info_ratelimited("%s: IRQ %d stays on its CPU, irq_cpu %d failed: %d\n",
++				    sdev->misc.name, irq, cpu, ret);
++		return;
++	}
++	sdev->irq_pinned[slot] = irq;
++}
++
+ static void tbstream_dev_irq_affinity(struct tbstream_dev *sdev)
+ {
+ 	int cpu = READ_ONCE(sdev->irq_cpu);
+ 
+-	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu))
++	if (cpu < 0)
+ 		return;
+-	if (sdev->tx_ring.ring && sdev->tx_ring.ring->irq > 0)
+-		irq_set_affinity(sdev->tx_ring.ring->irq, cpumask_of(cpu));
+-	if (sdev->rx_ring.ring && sdev->rx_ring.ring->irq > 0)
+-		irq_set_affinity(sdev->rx_ring.ring->irq, cpumask_of(cpu));
++	if (cpu >= nr_cpu_ids || !cpu_online(cpu)) {
++		pr_info_ratelimited("%s: irq_cpu %d is offline, IRQ placement unchanged\n",
++				    sdev->misc.name, cpu);
++		return;
++	}
++	tbstream_dev_irq_pin(sdev, 0, sdev->tx_ring.ring, cpu);
++	tbstream_dev_irq_pin(sdev, 1, sdev->rx_ring.ring, cpu);
++}
++
++/* Before the rings (and with them the IRQs) are freed. */
++static void tbstream_dev_irq_affinity_restore(struct tbstream_dev *sdev)
++{
++	int slot;
++
++	for (slot = 0; slot < 2; slot++) {
++		if (!sdev->irq_pinned[slot])
++			continue;
++		irq_set_affinity(sdev->irq_pinned[slot], sdev->irq_saved[slot]);
++		sdev->irq_pinned[slot] = 0;
++	}
+ }
+ 
+ static inline struct tb_xdomain *tbstream_dev_xdomain(struct tbstream_dev *sdev)
+@@ -393,6 +477,8 @@ static void tbstream_dev_release(struct kref *kref)
+ 		tbstream_put(sdev->stream);
+ 	}
+ 	ida_free(&tbstream_indices, sdev->index);
++	free_cpumask_var(sdev->irq_saved[0]);
++	free_cpumask_var(sdev->irq_saved[1]);
+ 	kfree(sdev->misc.name);
+ 	kfree(sdev);
+ }
+@@ -751,6 +837,7 @@ err_stop:
+ 				 sdev->tx_ring.ring->hop,
+ 				 sdev->in_hopid,
+ 				 sdev->rx_ring.ring->hop);
++	tbstream_dev_irq_affinity_restore(sdev);
+ 	/* Posted RX buffers were canceled by the stop: unmap and free them. */
+ 	tbstream_ring_free(&sdev->rx_ring);
+ err_free_rx:
+@@ -788,6 +875,8 @@ static void tbstream_dev_stop(struct tbstream_dev *sdev)
+ 	}
+ #endif
+ 
++	/* A reader may be spinning on the RX ring without sdev->lock. */
++	guard(mutex)(&sdev->rx_lock);
+ 	if (sdev->busy_poll) {
+ 		/*
+ 		 * When busy polling we must advance the ring ourselves
+@@ -821,6 +910,7 @@ static void tbstream_dev_stop(struct tbstream_dev *sdev)
+ 					 sdev->rx_ring.ring->hop);
+ 	}
+ 
++	tbstream_dev_irq_affinity_restore(sdev);
+ 	tbstream_ring_free(&sdev->rx_ring);
+ 	tb_ring_free(sdev->rx_ring.ring);
+ 	sdev->rx_ring.ring = NULL;
+@@ -866,7 +956,7 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 	for (;;) {
+ 		/* When busy polling, advance any completions manually */
+ 		tbstream_dev_poll_ring(sdev, &sdev->rx_ring);
+-		tbstream_dev_napi_rx(sdev, !nowait);
++		tbstream_dev_napi_rx(sdev);
+ 
+ 		ret = tbstream_dev_valid(sdev);
+ 		if (ret) {
+@@ -891,7 +981,7 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 			if (signal_pending(current))
+ 				return -ERESTARTSYS;
+ 			cond_resched();
+-		} else {
++		} else if (!tbstream_dev_napi_spin(sdev)) {
+ 			ret = wait_event_interruptible(sdev->wait,
+ 					tbstream_ring_available(&sdev->rx_ring) ||
+ 					READ_ONCE(sdev->rx_poll_pending) ||
+@@ -1067,7 +1157,7 @@ tbstream_dev_fops_poll(struct file *file, struct poll_table_struct *wait)
+ 	poll_wait(file, &sdev->wait, wait);
+ 	guard(mutex)(&sdev->lock);
+ 	if (sdev->rx_ring.ring)
+-		tbstream_dev_napi_rx(sdev, false);
++		tbstream_dev_napi_rx(sdev);
+ 	if (tbstream_dev_valid(sdev) != 0) {
+ 		mask |= EPOLLHUP | EPOLLERR;
+ 	} else {
+@@ -1859,9 +1949,17 @@ tbstream_dev_make_group(struct config_group *group, const char *name)
+ 	sdev = kzalloc_obj(*sdev);
+ 	if (!sdev)
+ 		return ERR_PTR(-ENOMEM);
++	if (!zalloc_cpumask_var(&sdev->irq_saved[0], GFP_KERNEL) ||
++	    !zalloc_cpumask_var(&sdev->irq_saved[1], GFP_KERNEL)) {
++		free_cpumask_var(sdev->irq_saved[0]);
++		kfree(sdev);
++		return ERR_PTR(-ENOMEM);
++	}
+ 
+ 	index = ida_alloc(&tbstream_indices, GFP_KERNEL);
+ 	if (index < 0) {
++		free_cpumask_var(sdev->irq_saved[0]);
++		free_cpumask_var(sdev->irq_saved[1]);
+ 		kfree(sdev);
+ 		return ERR_PTR(index);
+ 	}
+@@ -1873,6 +1971,7 @@ tbstream_dev_make_group(struct config_group *group, const char *name)
+ 	sdev->cfg_spin_us = -1;
+ 	sdev->irq_cpu = -1;
+ 	mutex_init(&sdev->lock);
++	mutex_init(&sdev->rx_lock);
+ 	init_waitqueue_head(&sdev->wait);
+ 	INIT_LIST_HEAD(&sdev->list);
+ 	/* This point forward tbstream_dev_put() must be used to release sdev */

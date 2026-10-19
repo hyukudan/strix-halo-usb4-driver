@@ -11,3 +11,4 @@
 0012-cm-unlink-tunnels-on-stop.patch
 0013-bounded-domain-release-and-dma-revocation.patch
 0014-stream-open-error-path-and-frame-arrays.patch
+0015-stream-spin-outside-device-mutex-and-irq-restore.patch
