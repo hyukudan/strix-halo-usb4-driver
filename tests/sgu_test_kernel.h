@@ -295,6 +295,24 @@ static void dma_sync_sgtable_for_device(struct device *d,struct sg_table *t,enum
 #define sg_dma_address(sg) ((sg)->address)
 #define sg_dma_is_swiotlb(sg) ((sg)->bounce)
 static u64 dma_get_mask(struct device *d) { (void)d;return U64_MAX; }
+/* Kernel pages for kernel-validated terminal frames. */
+#define __GFP_ZERO 0x100
+struct page { unsigned char data[4096]; };
+static int page_fail, live_pages, page_syncs;
+static struct page *alloc_page(int flags) {
+    assert(flags & __GFP_ZERO); assert(!signalling_depth);
+    if (page_fail) { page_fail=0; return NULL; }
+    ++live_pages; return calloc(1, sizeof(struct page));
+}
+static void __free_page(struct page *p) { assert(live_pages>0); --live_pages; free(p); }
+static void *page_address(struct page *p) { return p->data; }
+static dma_addr_t dma_map_page(struct device *d,struct page *p,size_t o,size_t n,enum dma_data_direction dir) { (void)d;(void)o;(void)n;(void)dir;return (dma_addr_t)(uintptr_t)p; }
+static int dma_mapping_error(struct device *d,dma_addr_t a) { (void)d;return !a; }
+static void dma_unmap_page(struct device *d,dma_addr_t a,size_t n,enum dma_data_direction dir) { (void)d;(void)a;(void)n;(void)dir; }
+static void dma_sync_single_for_cpu(struct device *d,dma_addr_t a,size_t n,enum dma_data_direction dir) { (void)d;(void)a;(void)n;(void)dir;++page_syncs; }
+static void dma_sync_single_for_device(struct device *d,dma_addr_t a,size_t n,enum dma_data_direction dir) { (void)d;(void)a;(void)n;(void)dir;++page_syncs; }
+static int terminal_warnings;
+#define pr_warn_ratelimited(...) (++terminal_warnings, (void)0)
 static bool dma_need_sync(struct device *d,dma_addr_t a) { (void)d;(void)a;return need_sync; }
 
 typedef struct { unsigned char b[16]; } uuid_t;

@@ -17,7 +17,8 @@ REPO = Path(__file__).resolve().parents[1]
 CASES = ("geometry", "queue", "failure_isolation", "events_legacy", "timeout_recovery",
          "wait_concurrency", "wait_retry_order", "export_lifetime", "admission_rollback", "watchdog_schedule", "max_queue_reuse", "watchdog_mutex_independence", "fence_precedes_event", "stop_before_publication",
          "quarantine_reaping", "explicit_controller_reset", "statistics_snapshot", "detached_reap", "detached_path_proof", "detached_device_guard", "detached_reset_rejected", "group_success", "group_rejections", "group_copy_failure", "domain_retirement_open_fds", "domain_retirement_keeps_unproved_dma", "domain_retirement_foreign_domain", "domain_retirement_concurrent_poll",
-         "domain_revoked_releases_retained", "domain_abandoned_leaks_safely", "orphan_reaping_after_rmdir")
+         "domain_revoked_releases_retained", "domain_abandoned_leaks_safely", "orphan_reaping_after_rmdir",
+         "terminal_header", "terminal_mismatches", "terminal_standby_reuse")
 
 class GpuQueueTests(unittest.TestCase):
     @classmethod
