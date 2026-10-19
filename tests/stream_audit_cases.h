@@ -127,3 +127,24 @@ static void resume_failure_fails_open_files(void)
     unplug_and_remove(&e, 0);
     assert(!atomic_load(&stream_refs) && !atomic_load(&dev_refs));
 }
+
+/* A4: the first RX frame completes while open is still posting buffers.
+ * Before, the counters were zeroed after the posting loop and the frame's
+ * prod increment was lost: its data never reached the reader. */
+static void early_rx_completion_is_kept(void)
+{
+    struct endpoint e;
+    unsigned char buf[128];
+
+    endpoint_init(&e, 0);
+    rx_early_complete_after = 0;
+    assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+    assert(rx_early_complete_after == -1);
+    assert(e.dev.rx_ring.prod == 1 && e.dev.rx_ring.cons == 0);
+    e.file.f_flags = O_NONBLOCK;
+    assert(file_read(&e, buf, sizeof(buf)) == 64);
+    assert(file_read(&e, buf, sizeof(buf)) == -EAGAIN);
+    assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+    assert_nothing_held();
+    unplug_and_remove(&e, 0);
+}

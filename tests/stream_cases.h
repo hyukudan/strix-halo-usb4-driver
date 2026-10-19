@@ -266,6 +266,7 @@ int main(int argc, char **argv)
         { "open_timeout_settings", open_timeout_settings },
         { "stream_deref_under_lock", stream_deref_under_lock },
         { "resume_failure_fails_open_files", resume_failure_fails_open_files },
+        { "early_rx_completion_is_kept", early_rx_completion_is_kept },
     };
 
     assert(argc == 2);
