@@ -19,6 +19,12 @@ FLAGS = ['-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
 
 HARNESS = r'''
 #define PINGPONG_NO_MAIN
+#ifdef LOSE_SIGNAL
+/* Sleep past the deadline between the write and the read, so SIGALRM lands
+ * while no syscall is blocked (the race of a one-shot timer). */
+#include <time.h>
+#define PP_BETWEEN_OPS() do { struct timespec s = { 0, 500000000L }; 	while (nanosleep(&s, &s)) { } } while (0)
+#endif
 #include "%s"
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -94,6 +100,9 @@ class PingPongTests(unittest.TestCase):
         cls.harness = tmp / 'harness'
         subprocess.run([CC, *FLAGS, '-Wno-unused-function', str(harness), '-o', str(cls.harness)],
                        check=True)
+        cls.racy = tmp / 'harness-lose-signal'
+        subprocess.run([CC, *FLAGS, '-Wno-unused-function', '-DLOSE_SIGNAL', str(harness),
+                        '-o', str(cls.racy)], check=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -152,6 +161,21 @@ class PingPongTests(unittest.TestCase):
         result = self.run_harness(2, 64)
         self.assertEqual(result.returncode, 7)
         self.assertIn('timeout', result.stderr)
+
+    def test_deadline_passing_between_syscalls_is_not_lost(self):
+        # The fake peer stalls; the deadline (300 ms) expires during the 500 ms
+        # pause between write and read. The read must still end with a timeout.
+        result = subprocess.run([str(self.racy), '2', '64'], capture_output=True, text=True,
+                                timeout=20)
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn('timeout', result.stderr)
+
+    def test_deadline_uses_monotonic_timer_and_retick(self):
+        src = SOURCE.read_text()
+        self.assertIn('timer_create(CLOCK_MONOTONIC', src)
+        self.assertIn('t.it_interval.tv_nsec = PP_RETICK_NS', src)
+        self.assertIn('if (past_deadline())', src)
+        self.assertNotIn('setitimer', src)
 
     def test_peer_eof_is_an_error(self):
         result = self.run_harness(3, 64)
