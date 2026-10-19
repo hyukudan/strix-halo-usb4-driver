@@ -1,0 +1,247 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -144,6 +144,10 @@ struct tbstream_ring {
+  * @detached: The stream went away while the device was open. Its rings
+  *	      were stopped then; the files opened before only fail until
+  *	      they are closed, even if a new stream is attached meanwhile.
++ * @domain_index: Domain of the connection named by the parent group
++ * @route: Route of that connection's XDomain
++ * @cfg_open_timeout_ms: How long open() waits for the peer's stream service
++ *			 (-1 follows the open_timeout_ms module parameter)
+  * @wait: Waitqueue for open, read and write
+  * @lock: Lock protecting this structure
+  * @tx_ring: Transmit ring
+@@ -179,6 +183,9 @@ struct tbstream_dev {
+ 	bool closed;
+ 	bool removed;
+ 	bool detached;
++	unsigned int domain_index;
++	u64 route;
++	int cfg_open_timeout_ms;
+ 	wait_queue_head_t wait;
+ 	struct mutex lock;
+ 	struct tbstream_ring tx_ring;
+@@ -198,6 +205,8 @@ struct tbstream_dev {
+  *	    no stream attached.
+  * @lock: Lock protecting this structure
+  * @dev_list: List of stream devices
++ * @domain_index: Domain index from the group name
++ * @route: XDomain route from the group name
+  *
+  * This is the ConfigFS directory for one connection to another host.
+  * There can be several &struct stream_dev linked through @dev_list of
+@@ -208,6 +217,8 @@ struct tbstream_group {
+ 	struct tbstream *stream;
+ 	struct mutex lock;
+ 	struct list_head dev_list;
++	unsigned int domain_index;
++	u64 route;
+ };
+ 
+ /**
+@@ -1203,9 +1214,61 @@ tbstream_dev_fops_poll(struct file *file, struct poll_table_struct *wait)
+ 	return mask;
+ }
+ 
++#define TBSTREAM_DEV_MAX_OPEN_TIMEOUT_MS	600000
++
++static unsigned int open_timeout_ms = 30000;
++module_param(open_timeout_ms, uint, 0644);
++MODULE_PARM_DESC(open_timeout_ms,
++		 "How long open() waits for the peer's stream service when its XDomain is connected, in ms, at most 600000 (default: 30000)");
++
++static unsigned int tbstream_dev_open_timeout(const struct tbstream_dev *sdev)
++{
++	int ms = READ_ONCE(sdev->cfg_open_timeout_ms);
++
++	if (ms < 0)
++		return min_t(unsigned int, READ_ONCE(open_timeout_ms),
++			     TBSTREAM_DEV_MAX_OPEN_TIMEOUT_MS);
++	return ms;
++}
++
++/*
++ * No stream is attached, or its XDomain is going away. A connection whose
++ * domain is gone (-ENODEV) or whose XDomain is absent (-ENXIO) cannot come
++ * back while we wait: fail at once. Otherwise the XDomain is there and its
++ * stream service may still appear: -EAGAIN when non-blocking, else wait
++ * interruptibly until @deadline (-ETIMEDOUT), re-checking the XDomain at
++ * least once a second. Called and returns without sdev->lock.
++ */
++static int tbstream_dev_wait_stream(struct tbstream_dev *sdev, bool nonblock,
++				    unsigned long deadline)
++{
++	long remaining;
++	int ret;
++
++	ret = tb_xdomain_presence(sdev->domain_index, sdev->route);
++	if (ret)
++		return ret;
++	if (nonblock)
++		return -EAGAIN;
++	remaining = (long)(deadline - jiffies);
++	if (remaining <= 0)
++		return -ETIMEDOUT;
++
++	ret = wait_event_interruptible_timeout(sdev->wait,
++			tbstream_dev_valid(sdev) == 0 ||
++			tbstream_dev_removed(sdev),
++			min_t(long, remaining, HZ));
++	if (ret < 0)
++		return ret;
++	if (tbstream_dev_removed(sdev))
++		return -ENXIO;
++	return 0;
++}
++
+ static int tbstream_dev_fops_open(struct inode *inode, struct file *file)
+ {
+ 	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
++	unsigned long deadline;
+ 	int ret;
+ 
+ 	tbstream_dev_get(sdev);
+@@ -1222,26 +1285,21 @@ static int tbstream_dev_fops_open(struct inode *inode, struct file *file)
+ 	}
+ #endif
+ 	/*
+-	 * If there is no stream attached yet, block until it appears
+-	 * unless this is opened in non-blocking mode.
++	 * If there is no stream attached yet, wait for it a bounded time,
++	 * unless its connection cannot appear or this is non-blocking.
+ 	 */
++	deadline = jiffies + msecs_to_jiffies(tbstream_dev_open_timeout(sdev));
+ 	while ((ret = tbstream_dev_valid(sdev))) {
+ 		mutex_unlock(&sdev->lock);
+ 
+-		if (ret != -ENXIO || (file->f_flags & O_NONBLOCK))
++		if (ret != -ENXIO)
+ 			goto err_put;
+ 
+-		ret = wait_event_interruptible(sdev->wait,
+-				tbstream_dev_valid(sdev) == 0 ||
+-				tbstream_dev_removed(sdev));
++		ret = tbstream_dev_wait_stream(sdev, file->f_flags & O_NONBLOCK,
++					       deadline);
+ 		if (ret)
+ 			goto err_put;
+ 
+-		if (tbstream_dev_removed(sdev)) {
+-			ret = -ENXIO;
+-			goto err_put;
+-		}
+-
+ 		if (mutex_lock_interruptible(&sdev->lock)) {
+ 			ret = -ERESTARTSYS;
+ 			goto err_put;
+@@ -1496,6 +1554,24 @@ static ssize_t tbstream_dev_irq_cpu_store(struct config_item *item,
+ }
+ CONFIGFS_ATTR(tbstream_dev_, irq_cpu);
+ 
++static ssize_t tbstream_dev_open_timeout_ms_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return sysfs_emit(buf, "%d\n", sdev->cfg_open_timeout_ms);
++}
++
++/* -1 follows the open_timeout_ms module parameter, 0 does not wait. */
++static ssize_t tbstream_dev_open_timeout_ms_store(struct config_item *item,
++						  const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return tbstream_dev_int_store(sdev, &sdev->cfg_open_timeout_ms, buf, count, -1,
++				      TBSTREAM_DEV_MAX_OPEN_TIMEOUT_MS);
++}
++CONFIGFS_ATTR(tbstream_dev_, open_timeout_ms);
++
+ static ssize_t tbstream_dev_index_show(struct config_item *item, char *buf)
+ {
+ 	struct config_group *group = to_config_group(item);
+@@ -1836,6 +1912,7 @@ CONFIGFS_ATTR_WO(tbstream_dev_, gpu_recover);
+ static struct configfs_attribute *tbstream_dev_attrs[] = {
+ 	&tbstream_dev_attr_busy_poll,
+ 	&tbstream_dev_attr_irq_cpu,
++	&tbstream_dev_attr_open_timeout_ms,
+ 	&tbstream_dev_attr_rx_napi,
+ 	&tbstream_dev_attr_spin_us,
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+@@ -2032,6 +2109,9 @@ tbstream_dev_make_group(struct config_group *group, const char *name)
+ 	sdev->throttling = TBSTREAM_DEV_THROTTLING;
+ 	sdev->cfg_rx_napi = -1;
+ 	sdev->cfg_spin_us = -1;
++	sdev->cfg_open_timeout_ms = -1;
++	sdev->domain_index = sg->domain_index;
++	sdev->route = sg->route;
+ 	sdev->irq_cpu = -1;
+ 	mutex_init(&sdev->lock);
+ 	mutex_init(&sdev->rx_lock);
+@@ -2144,6 +2224,8 @@ tbstream_make_group(struct config_group *group, const char *name)
+ 
+ 	mutex_init(&sg->lock);
+ 	INIT_LIST_HEAD(&sg->dev_list);
++	sg->domain_index = domain;
++	sg->route = route;
+ 
+ 	guard(mutex)(&tbstream_lock);
+ 	list_for_each_entry(stream, &tbstream_list, list) {
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -2612,6 +2612,43 @@ struct tb_xdomain *tb_xdomain_find_by_route(struct tb *tb, u64 route)
+ }
+ EXPORT_SYMBOL_GPL(tb_xdomain_find_by_route);
+ 
++/**
++ * tb_xdomain_presence() - Whether an XDomain connection exists right now
++ * @domain: Domain index
++ * @route: Route string of the XDomain in that domain
++ *
++ * For service drivers that wait for a connection by name (configfs), so
++ * that they do not wait for one whose domain is gone or whose cable is
++ * not there. Lookup by name on the bus: needs no domain reference.
++ *
++ * Return: %0 if the XDomain is registered and not unplugged, %-ENXIO if
++ * the domain exists but that XDomain does not (or is going away),
++ * %-ENODEV if the domain itself does not exist.
++ */
++int tb_xdomain_presence(unsigned int domain, u64 route)
++{
++	struct device *dev;
++	char name[32];
++	int ret = -ENXIO;
++
++	snprintf(name, sizeof(name), "domain%u", domain);
++	dev = bus_find_device_by_name(&tb_bus_type, NULL, name);
++	if (!dev)
++		return -ENODEV;
++	put_device(dev);
++
++	/* Routers use the same name format: only an XDomain counts */
++	snprintf(name, sizeof(name), "%u-%llx", domain, route);
++	dev = bus_find_device_by_name(&tb_bus_type, NULL, name);
++	if (!dev)
++		return -ENXIO;
++	if (tb_is_xdomain(dev) && !READ_ONCE(tb_to_xdomain(dev)->is_unplugged))
++		ret = 0;
++	put_device(dev);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(tb_xdomain_presence);
++
+ bool tb_xdomain_handle_request(struct tb *tb, enum tb_cfg_pkg_type type,
+ 			       const void *buf, size_t size)
+ {
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -319,6 +319,7 @@ static inline int tb_xdomain_disable_all_paths(struct tb_xdomain *xd)
+ 
+ struct tb_xdomain *tb_xdomain_find_by_uuid(struct tb *tb, const uuid_t *uuid);
+ struct tb_xdomain *tb_xdomain_find_by_route(struct tb *tb, u64 route);
++int tb_xdomain_presence(unsigned int domain, u64 route);
+ 
+ static inline struct tb_xdomain *
+ tb_xdomain_find_by_uuid_locked(struct tb *tb, const uuid_t *uuid)

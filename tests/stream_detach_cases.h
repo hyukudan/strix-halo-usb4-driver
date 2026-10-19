@@ -35,6 +35,8 @@ static void endpoint_init(struct endpoint *e, int mode)
     mutex_init(&e->sg.lock);
     INIT_LIST_HEAD(&e->sg.dev_list);
     s->group.cg_item.ci_name = "s0";
+    s->domain_index = 1; s->route = 2;
+    s->cfg_open_timeout_ms = -1;
     s->misc.name = "tbstream0";
     s->in_hopid = 8; s->out_hopid = 9;
     s->ring_size = 64; s->throttling = 8192;
