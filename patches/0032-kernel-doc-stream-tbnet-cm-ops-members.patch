@@ -1,0 +1,57 @@
+diff --git a/drivers/net/thunderbolt/main.c b/drivers/net/thunderbolt/main.c
+--- a/drivers/net/thunderbolt/main.c
++++ b/drivers/net/thunderbolt/main.c
+@@ -178,6 +178,8 @@ struct tbnet_ring {
+  * @frame_id: Frame ID use for next Tx packet
+  *            (if %TBNET_MATCH_FRAGS_ID is supported in both ends)
+  * @tx_ring: Software ring holding Tx frames
++ * @recovery_node: Entry in the list of interfaces that a host interface
++ *		   DMA reset closes and reopens (under RTNL)
+  */
+ struct tbnet {
+ 	const struct tb_service *svc;
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -138,6 +138,18 @@ struct tbstream_ring {
+  * @ring_size: Size of the rings
+  * @throttling: Interrupt throttling rate in ns
+  * @busy_poll: Instead of interrupts, busy poll the rings
++ * @rx_napi: The reader reaps RX completions (start_poll) instead of the
++ *	     ring work; set when the stream is started
++ * @rx_poll_pending: The RX interrupt fired and is masked until a reader
++ *		     reaps the ring
++ * @cfg_rx_napi: ConfigFS rx_napi (-1 follows the rx_napi module parameter)
++ * @cfg_spin_us: ConfigFS spin_us (-1 follows the spin_us module parameter)
++ * @rx_spin_us: Effective RX busy-poll time in microseconds, set at start
++ * @irq_cpu: CPU for the ring interrupts (-1 leaves them where they are)
++ * @rx_lock: Serializes RX reaping in the reader against the RX ring
++ *	     lifetime; nests inside @lock
++ * @irq_pinned: Ring IRQs moved to @irq_cpu (0 = none)
++ * @irq_saved: Affinity of those IRQs before they were moved
+  * @users: Number of times @cdev has been opened
+  * @closed: CLOSE packet was received
+  * @rx_failed: A received frame was damaged (CRC error or buffer overrun):
+@@ -177,9 +189,7 @@ struct tbstream_dev {
+ 	int cfg_spin_us;
+ 	unsigned int rx_spin_us;
+ 	int irq_cpu;
+-	/* NAPI RX reaping and the RX ring lifetime against it; nests inside @lock */
+ 	struct mutex rx_lock;
+-	/* Ring IRQs moved to @irq_cpu (0 = none) and their previous affinity */
+ 	int irq_pinned[2];
+ 	cpumask_var_t irq_saved[2];
+ 	int users;
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -506,6 +506,9 @@ struct tb_path {
+  *					 implementation can use to return
+  *					 status of USB4 NVM_AUTH router
+  *					 operation.
++ * @dma_paths_busy: Optional DMA tunnel inventory: whether a DMA tunnel still
++ *		    uses the given rings (-1 for any), see
++ *		    tb_domain_dma_paths_busy()
+  */
+ struct tb_cm_ops {
+ 	int (*driver_ready)(struct tb *tb);
