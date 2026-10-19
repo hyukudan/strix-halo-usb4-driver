@@ -273,6 +273,7 @@ int main(int argc, char **argv)
         { "close_does_not_flush_rx", close_does_not_flush_rx },
         { "spin_us_parameter_is_bounded", spin_us_parameter_is_bounded },
         { "damaged_close_is_not_eof", damaged_close_is_not_eof },
+        { "resume_failure_at_every_step", resume_failure_at_every_step },
     };
 
     assert(argc == 2);

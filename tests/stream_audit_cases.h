@@ -485,3 +485,62 @@ static void damaged_close_is_not_eof(void)
         unplug_and_remove(&e, 0);
     }
 }
+
+/* Review of A3: the resume test only failed the first allocation. Fail each
+ * step of tbstream_dev_start() in turn, up to the RX buffers that are posted
+ * after the paths are enabled: the device fails like a detached one with
+ * nothing left allocated or tunnelled, the other device resumes, a new open
+ * works. */
+struct resume_fault { const char *what; int *after; int value; };
+
+static void resume_failure_at_every_step(void)
+{
+    struct resume_fault faults[] = {
+        { "TX ring", &ring_fail_after, 0 },
+        { "TX frame array", &kvcalloc_fail_after, 0 },
+        { "TX page", &page_fail_after, 0 },
+        { "RX ring", &ring_fail_after, 1 },
+        { "paths", &enable_fail, -EIO },
+        { "RX frame array", &kvcalloc_fail_after, 1 },
+    };
+
+    for (unsigned int i = 0; i < sizeof(faults) / sizeof(faults[0]); ++i) {
+        struct endpoint e;
+        struct tbstream_dev other;
+        struct file other_file;
+        unsigned char buf[64] = { 7 };
+        int rings, pages, arrays, maps;
+
+        endpoint_init(&e, 0);
+        second_dev(&e, &other, &other_file);
+        /* What the other device alone holds when it runs. */
+        assert(tbstream_dev_fops_open(NULL, &other_file) == 0);
+        rings = atomic_load(&live_rings); pages = atomic_load(&live_pages);
+        arrays = atomic_load(&live_arrays); maps = atomic_load(&live_mappings);
+        assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+        assert(tbstream_suspend(&e.svc[0].dev) == 0);
+        *faults[i].after = faults[i].value;
+        assert(tbstream_resume(&e.svc[0].dev) < 0);
+        if (faults[i].after != &enable_fail)
+            assert(*faults[i].after == -1); /* the fault was reached */
+        assert(!enable_fail);
+        assert(e.dev.detached && !e.dev.tx_ring.ring && !e.dev.rx_ring.ring);
+        assert(atomic_load(&live_rings) == rings && atomic_load(&live_pages) == pages);
+        assert(atomic_load(&live_arrays) == arrays && atomic_load(&live_mappings) == maps);
+        assert(tunnel_count() == 1);
+        assert_stale_file(&e);
+        {
+            struct kiocb k = { &other_file, 0 };
+            struct iov_iter it = { buf, sizeof(buf) };
+
+            assert(tbstream_dev_fops_write_iter(&k, &it) == sizeof(buf));
+        }
+        assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+        assert(tbstream_dev_fops_open(NULL, &e.file) == 0 && e.dev.tx_ring.ring && tunnel_count() == 2);
+        assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+        assert(tbstream_dev_fops_release(NULL, &other_file) == 0);
+        assert_nothing_held();
+        unplug_and_remove(&e, 0);
+        assert(!atomic_load(&stream_refs) && !atomic_load(&dev_refs));
+    }
+}
