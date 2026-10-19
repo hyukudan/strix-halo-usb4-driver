@@ -1,0 +1,210 @@
+diff --git a/drivers/thunderbolt/dma_recovery.c b/drivers/thunderbolt/dma_recovery.c
+--- a/drivers/thunderbolt/dma_recovery.c
++++ b/drivers/thunderbolt/dma_recovery.c
+@@ -419,6 +419,23 @@ static void tb_domain_teardown_reset_work(struct work_struct *work)
+ 		 ret == -EAGAIN ? "domain lock busy" : "NHI in use", tx, rx);
+ }
+ 
++/**
++ * tb_nhi_data_rings_idle() - Whether no data ring is allocated on @nhi
++ * @nhi: Host interface
++ *
++ * Return: %true when only the control ring is allocated.
++ */
++bool tb_nhi_data_rings_idle(struct tb_nhi *nhi)
++{
++	unsigned long flags;
++	bool idle;
++
++	spin_lock_irqsave(&nhi->lock, flags);
++	idle = nhi_data_rings_freed(nhi);
++	spin_unlock_irqrestore(&nhi->lock, flags);
++	return idle;
++}
++
+ /**
+  * tb_nhi_ring_freed() - A data ring of @nhi was freed
+  * @nhi: Host interface
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -257,6 +257,8 @@ struct tb_bandwidth_group {
+  * @port: Port number on switch
+  * @disabled: Disabled by eeprom or enabled but not implemented
+  * @bonded: true if the port is bonded (two lanes combined as one)
++ * @gen3_retrains: Port resets made to reach Gen3 since it last trained at
++ *		   Gen3 (see the xdomain gen3_retrain parameter)
+  * @dual_link_port: If the switch is connected using two ports, points
+  *		    to the other port.
+  * @link_nr: Is this primary or secondary port on the dual_link.
+@@ -290,6 +292,7 @@ struct tb_port {
+ 	u8 port;
+ 	bool disabled;
+ 	bool bonded;
++	unsigned int gen3_retrains;
+ 	struct tb_port *dual_link_port;
+ 	u8 link_nr:1;
+ 	struct ida in_hopids;
+@@ -788,6 +791,7 @@ void tb_domain_schedule_teardown_reset(struct tb *tb);
+ void tb_domain_teardown_reset_stop(struct tb *tb, bool removal);
+ void tb_domain_teardown_reset_resume(struct tb *tb);
+ void tb_nhi_ring_freed(struct tb_nhi *nhi);
++bool tb_nhi_data_rings_idle(struct tb_nhi *nhi);
+ int tb_domain_suspend_noirq(struct tb *tb);
+ int tb_domain_resume_noirq(struct tb *tb);
+ int tb_domain_suspend(struct tb *tb);
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -18,6 +18,7 @@
+ #include <linux/uuid.h>
+ #include <linux/workqueue.h>
+ 
++#include "sb_regs.h"
+ #include "tb.h"
+ 
+ #define XDOMAIN_SHORT_TIMEOUT			100	/* ms */
+@@ -63,6 +64,11 @@ struct xdomain_request_work {
+ 
+ static bool tb_xdomain_enabled = true;
+ module_param_named(xdomain, tb_xdomain_enabled, bool, 0444);
++
++static unsigned int gen3_retrain;
++module_param(gen3_retrain, uint, 0644);
++MODULE_PARM_DESC(gen3_retrain,
++		 "reset a USB4 port whose new XDomain link trained below Gen3 although its lane adapter and its port (LINK_CONF Gen3 Support) advertise Gen3, at most this many times (up to 3) until it trains at Gen3; only with no DMA tunnel and no data ring on the host interface (default: 0, off)");
+ MODULE_PARM_DESC(xdomain, "allow XDomain protocol (default: true)");
+ 
+ /*
+@@ -1474,6 +1480,105 @@ static int tb_xdomain_link_state_change(struct tb_xdomain *xd,
+ 	return 0;
+ }
+ 
++#define XDOMAIN_GEN3_RETRAIN_MAX		3
++/* LINK_CONF (sideband 0x0c) byte 1 bit 5: the port and every on-board
++ * retimer to the cable support Gen3 */
++#define USB4_SB_LINK_CONF_GEN3_SUPPORT		BIT(13)
++#define LANE_ADP_CS_0_SUPPORTED_SPEED_GEN3	0x4
++
++/*
++ * Opt-in Gen3 recovery for a new connection that trained below Gen3, run
++ * before its properties are read: no service of this XDomain exists yet.
++ * Only when the local lane adapter supports and targets Gen3 and the local
++ * port advertises Gen3 Support in LINK_CONF; without that bit the limit is
++ * the port or its retimers and a retrain cannot help. Never with a DMA
++ * tunnel in the domain or a data ring on the NHI, never waiting for the
++ * domain lock, at most gen3_retrain resets per port until it trains at
++ * Gen3. Returns -ECONNRESET after a port reset: the handshake starts over
++ * (or the unplug that follows removes the XDomain).
++ */
++static int tb_xdomain_maybe_retrain_gen3(struct tb_xdomain *xd)
++{
++	unsigned int max = min_t(unsigned int, READ_ONCE(gen3_retrain),
++				 XDOMAIN_GEN3_RETRAIN_MAX);
++	struct tb *tb = xd->tb;
++	struct tb_port *port;
++	u32 cs0, cs1, link_conf = 0;
++	int gen, ret;
++
++	port = tb_xdomain_downstream_port(xd);
++	if (!port || !port->cap_usb4 || !port->cap_phy)
++		return 0;
++	gen = tb_port_get_link_generation(port);
++	if (gen < 0)
++		return 0;
++	if (gen >= 3) {
++		if (port->gen3_retrains) {
++			dev_info(&xd->dev, "link trained at Gen%d after %u Gen3 retrain(s)\n",
++				 gen, min(port->gen3_retrains, max));
++			port->gen3_retrains = 0;
++		}
++		return 0;
++	}
++	if (!max)
++		return 0;
++	if (port->gen3_retrains >= max) {
++		/* Once; the counter stays above max until the next Gen3 link */
++		if (port->gen3_retrains == max) {
++			dev_warn(&xd->dev, "link still at Gen%d after %u Gen3 retrain(s), keeping it\n",
++				 gen, max);
++			port->gen3_retrains++;
++		}
++		return 0;
++	}
++	ret = tb_port_read(port, &cs0, TB_CFG_PORT, port->cap_phy + LANE_ADP_CS_0, 1);
++	if (!ret)
++		ret = tb_port_read(port, &cs1, TB_CFG_PORT, port->cap_phy + LANE_ADP_CS_1, 1);
++	if (ret)
++		return 0;
++	if (!(FIELD_GET(LANE_ADP_CS_0_SUPPORTED_SPEED_MASK, cs0) & LANE_ADP_CS_0_SUPPORTED_SPEED_GEN3) ||
++	    FIELD_GET(LANE_ADP_CS_1_TARGET_SPEED_MASK, cs1) != LANE_ADP_CS_1_TARGET_SPEED_GEN3) {
++		dev_info(&xd->dev, "link at Gen%d, lane adapter does not support or target Gen3 (CS_0 %#x, CS_1 %#x), not retraining\n",
++			 gen, cs0, cs1);
++		return 0;
++	}
++	ret = usb4_port_sb_read(port, USB4_SB_TARGET_ROUTER, 0, USB4_SB_LINK_CONF,
++				&link_conf, 3);
++	if (ret) {
++		dev_info(&xd->dev, "link at Gen%d, LINK_CONF unreadable (%d), not retraining\n",
++			 gen, ret);
++		return 0;
++	}
++	if (!(link_conf & USB4_SB_LINK_CONF_GEN3_SUPPORT)) {
++		dev_info(&xd->dev, "link at Gen%d, the port does not advertise Gen3 Support (LINK_CONF %#08x): the limit is the port or its retimers, not retraining\n",
++			 gen, link_conf);
++		return 0;
++	}
++	/* The CM may be removing this XDomain under the lock: never wait */
++	if (!mutex_trylock(&tb->lock)) {
++		dev_info(&xd->dev, "link at Gen%d, domain lock busy, not retraining\n", gen);
++		return 0;
++	}
++	/* The CM inventory under the lock held here: 0 is an affirmative idle */
++	if (!tb->cm_ops->dma_paths_busy || tb->cm_ops->dma_paths_busy(tb, -1, -1) ||
++	    !tb_nhi_data_rings_idle(tb->nhi)) {
++		mutex_unlock(&tb->lock);
++		dev_info(&xd->dev, "link at Gen%d, DMA tunnels or rings in use, not retraining\n",
++			 gen);
++		return 0;
++	}
++	port->gen3_retrains++;
++	dev_info(&xd->dev, "link at Gen%d although both lane adapter and port advertise Gen3: port reset, retrain %u of %u\n",
++		 gen, port->gen3_retrains, max);
++	ret = usb4_port_reset(port);
++	mutex_unlock(&tb->lock);
++	if (ret) {
++		dev_warn(&xd->dev, "port reset for a Gen3 retrain failed (%d)\n", ret);
++		return 0;
++	}
++	return -ECONNRESET;
++}
++
+ /*
+  * Lower UUID side: bond the lanes. A failure is retried a bounded number of
+  * times (lane 1 may come up late), then reported; enumeration continues
+@@ -1564,6 +1669,13 @@ static int tb_xdomain_get_properties(struct tb_xdomain *xd)
+ 	u32 gen = 0;
+ 	int ret;
+ 
++	/* A new connection only: before anything is registered for it */
++	if (!xd->remote_properties) {
++		ret = tb_xdomain_maybe_retrain_gen3(xd);
++		if (ret)
++			return ret;
++	}
++
+ 	dev_dbg(&xd->dev, "requesting remote properties\n");
+ 
+ 	ret = tb_xdp_properties_request(tb->ctl, xd->route, xd->local_uuid,
+@@ -1853,6 +1965,11 @@ static void tb_xdomain_state_work(struct work_struct *work)
+ 		if (ret) {
+ 			if (ret == -EAGAIN)
+ 				goto retry_state;
++			/* Port reset for a Gen3 retrain: the link starts over */
++			if (ret == -ECONNRESET) {
++				xd->state = XDOMAIN_STATE_INIT;
++				goto retry_state;
++			}
+ 			tb_xdomain_failed(xd);
+ 		} else {
+ 			xd->state = XDOMAIN_STATE_ENUMERATED;

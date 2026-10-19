@@ -17,8 +17,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = Path(os.environ.get('USB4_SOURCE_TREE', ROOT / 'audited-overlay'))
-CASES = ('bonding_retried_and_bounded', 'host_reset_result_checked')
-XDOMAIN_DEFINES = ('XDOMAIN_BONDING_RETRIES',)
+CASES = ('bonding_retried_and_bounded', 'host_reset_result_checked', 'gen3_retrain_policy')
+XDOMAIN_DEFINES = ('XDOMAIN_BONDING_RETRIES', 'XDOMAIN_GEN3_RETRAIN_MAX', 'USB4_SB_LINK_CONF_GEN3_SUPPORT',
+                   'LANE_ADP_CS_0_SUPPORTED_SPEED_GEN3')
 
 
 def extract(text, name):
@@ -48,6 +49,7 @@ class CmLinkTests(unittest.TestCase):
         parts = ['#include "cm_link_harness.h"\n']
         parts += [define(cls.xdomain_c, name) for name in XDOMAIN_DEFINES]
         parts += [extract(cls.xdomain_c, 'tb_xdomain_bond_lanes_uuid_low'),
+                  extract(cls.xdomain_c, 'tb_xdomain_maybe_retrain_gen3'),
                   extract(cls.tb_c, 'tb_start_reset_host'),
                   '#include "cm_link_cases.h"\n']
         unit = tmp / 'test.c'
@@ -78,6 +80,12 @@ class CmLinkTests(unittest.TestCase):
                       '\t\ttb_xdomain_queue_properties(xd);\n', work)
         self.assertIn('xd->state_retries = XDOMAIN_BONDING_RETRIES;',
                       extract(self.xdomain_c, 'tb_xdomain_queue_bonding_uuid_low'))
+        self.assertRegex(work, r'\t\t\tif \(ret == -ECONNRESET\) \{\n\t\t\t\txd->state = XDOMAIN_STATE_INIT;\n'
+                               r'\t\t\t\tgoto retry_state;\n\t\t\t\}\n\t\t\ttb_xdomain_failed\(xd\);')
+        self.assertIn('\tif (!xd->remote_properties) {\n\t\tret = tb_xdomain_maybe_retrain_gen3(xd);\n'
+                      '\t\tif (ret)\n\t\t\treturn ret;\n\t}\n',
+                      extract(self.xdomain_c, 'tb_xdomain_get_properties'))
+
     def test_start_wiring(self):
         start = extract(self.tb_c, 'tb_start')
         self.assertIn('\tdiscover = tb_start_reset_host(tb, reset);\n\tif (discover) {', start)
