@@ -1,0 +1,59 @@
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -3058,10 +3058,34 @@ static int tb_scan_finalize_switch(struct device *dev, void *data)
+ 	return 0;
+ }
+ 
++/*
++ * Boot firmware might have created tunnels of its own. Since we cannot be
++ * sure they are usable for us, tear them down and reset the ports to handle
++ * it as new hotplug for USB4 v1 routers (for USB4 v2 and beyond we already
++ * do host reset). Returns whether to discover what the boot firmware left
++ * instead: without a reset, or when the reset failed and its configuration
++ * may still be in place.
++ */
++static bool tb_start_reset_host(struct tb *tb, bool reset)
++{
++	int ret;
++
++	if (!reset || !tb_switch_is_usb4(tb->root_switch))
++		return true;
++	if (usb4_switch_version(tb->root_switch) != 1)
++		return false;
++	ret = tb_switch_reset(tb->root_switch);
++	if (!ret)
++		return false;
++	tb_warn(tb, "host router reset failed (%d), discovering the boot firmware configuration instead\n",
++		ret);
++	return true;
++}
++
+ static int tb_start(struct tb *tb, bool reset)
+ {
+ 	struct tb_cm *tcm = tb_priv(tb);
+-	bool discover = true;
++	bool discover;
+ 	int ret;
+ 
+ 	tb->root_switch = tb_switch_alloc(tb, &tb->dev, 0);
+@@ -3102,18 +3126,7 @@ static int tb_start(struct tb *tb, bool reset)
+ 	/* Enable TMU if it is off */
+ 	tb_switch_tmu_enable(tb->root_switch);
+ 
+-	/*
+-	 * Boot firmware might have created tunnels of its own. Since we
+-	 * cannot be sure they are usable for us, tear them down and
+-	 * reset the ports to handle it as new hotplug for USB4 v1
+-	 * routers (for USB4 v2 and beyond we already do host reset).
+-	 */
+-	if (reset && tb_switch_is_usb4(tb->root_switch)) {
+-		discover = false;
+-		if (usb4_switch_version(tb->root_switch) == 1)
+-			tb_switch_reset(tb->root_switch);
+-	}
+-
++	discover = tb_start_reset_host(tb, reset);
+ 	if (discover) {
+ 		/* Full scan to discover devices added before the driver was loaded. */
+ 		tb_scan_switch(tb->root_switch);

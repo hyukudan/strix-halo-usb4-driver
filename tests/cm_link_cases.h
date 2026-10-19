@@ -59,11 +59,37 @@ static void bonding_retried_and_bounded(void)
     assert(tb_xdomain_bond_lanes_uuid_low(&xd) == -ENODEV && bonding_calls == 1 && !infos);
 }
 
+/* E2: tb_start() ignored the result of the host router reset and went on
+ * as if the boot firmware's tunnels were gone. */
+static void host_reset_result_checked(void)
+{
+    struct tb_switch sw = { .usb4 = true, .version = 1 };
+    struct tb tb = { .root_switch = &sw };
+
+    reset_model();
+    assert(!tb_start_reset_host(&tb, true) && switch_resets == 1 && !warns);
+
+    reset_model();
+    switch_reset_ret = -EIO;
+    assert(tb_start_reset_host(&tb, true) && switch_resets == 1);
+    assert(warns == 1 && strstr(last_warn, "host router reset failed (-5), discovering the boot firmware configuration instead"));
+
+    /* Unchanged cases: no reset requested, USB4 v2 (reset elsewhere), TBT. */
+    reset_model();
+    assert(tb_start_reset_host(&tb, false) && !switch_resets);
+    sw.version = 2;
+    assert(!tb_start_reset_host(&tb, true) && !switch_resets);
+    sw.usb4 = false;
+    assert(tb_start_reset_host(&tb, true) && !switch_resets && !warns);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
     if (!strcmp(argv[1], "bonding_retried_and_bounded"))
         bonding_retried_and_bounded();
+    else if (!strcmp(argv[1], "host_reset_result_checked"))
+        host_reset_result_checked();
     else
         return 2;
     printf("PASS %s\n", argv[1]);
