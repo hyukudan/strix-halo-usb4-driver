@@ -29,6 +29,8 @@ static void rcu_read_unlock(void) { assert(!pthread_rwlock_unlock(&test_rcu_lock
 static void test_kfree_rcu(void *p) { assert(!pthread_rwlock_wrlock(&test_rcu_lock)); free(p); assert(!pthread_rwlock_unlock(&test_rcu_lock)); }
 #define kfree_rcu(ptr, field) test_kfree_rcu(ptr)
 #define TB_DMA_DOMAIN_QUIESCING 1UL
+#define TB_DMA_DOMAIN_DMA_REVOKED 3UL
+#define TB_DMA_DOMAIN_ABANDONED 4UL
 #define TB_DMA_RESET_WITH_NETWORK 1U
 #define NOTIFY_DONE 0
 #define NOTIFY_OK 1
@@ -90,6 +92,12 @@ static int kstrtouint(const char *s, unsigned int base, unsigned int *out) {
     if (errno || v>UINT_MAX) return -ERANGE;
     if (*end && *end!='\n') return -EINVAL;
     *out=v; return 0;
+}
+static int kstrtobool(const char *s, bool *out) {
+    if (!s || !*s) return -EINVAL;
+    if (*s=='1'||*s=='y'||*s=='Y') { *out=true; return 0; }
+    if (*s=='0'||*s=='n'||*s=='N') { *out=false; return 0; }
+    return -EINVAL;
 }
 static int alloc_fail_after=-1;
 static void (*allocation_hook)(void);
@@ -337,6 +345,8 @@ static int __tb_ring_enqueue_list(struct tb_ring *r,struct list_head *frames) {
 }
 struct tb_cm_ops { void *driver_ready; };
 struct tb { struct tb_nhi *nhi;struct tb_cm_ops *cm_ops;struct device dev; };
+static unsigned retained_reports;
+static void tb_domain_dma_retained(struct tb *tb) { (void)tb; ++retained_reports; }
 struct tb_xdomain { struct tb *tb;uuid_t *local_uuid,*remote_uuid;struct device dev;u64 route;bool is_unplugged; };
 struct tb_service { struct device dev;struct tb_xdomain *xd; };
 struct tbstream { struct tb_service *svc; };

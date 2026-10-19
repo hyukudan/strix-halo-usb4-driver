@@ -9,9 +9,12 @@
 #include <string.h>
 #include <pthread.h>
 typedef uint32_t u32;
+typedef uint16_t u16;
 #define TB_DMA_RESET_MAX_RINGS 32U
 #define TB_DMA_DOMAIN_QUIESCING 1UL
 #define TB_DMA_GROUP_RECOVERY 2UL
+#define TB_DMA_DOMAIN_DMA_REVOKED 3UL
+#define TB_DMA_DOMAIN_ABANDONED 4UL
 #define TB_DMA_RESET_WITH_NETWORK 1U
 struct notifier_block { int unused; };
 struct blocking_notifier_head { int unused; };
@@ -19,7 +22,15 @@ struct blocking_notifier_head { int unused; };
 static int blocking_notifier_chain_register(struct blocking_notifier_head *h, struct notifier_block *n) { (void)h;(void)n;return 0; }
 static int blocking_notifier_chain_unregister(struct blocking_notifier_head *h, struct notifier_block *n) { (void)h;(void)n;return 0; }
 static unsigned core_notify_calls;
-static int blocking_notifier_call_chain(struct blocking_notifier_head *h,unsigned long event, void *data) { (void)h;assert(event==TB_DMA_DOMAIN_QUIESCING || event==TB_DMA_GROUP_RECOVERY);assert(data);++core_notify_calls;return 0; }
+static unsigned long core_events[8];
+struct tb;
+static void (*teardown_consumer)(unsigned long event, struct tb *tb);
+static int blocking_notifier_call_chain(struct blocking_notifier_head *h,unsigned long event, void *data) {
+    (void)h;assert(event>=TB_DMA_DOMAIN_QUIESCING && event<=TB_DMA_DOMAIN_ABANDONED);assert(data);
+    assert(core_notify_calls<8);core_events[core_notify_calls++]=event;
+    if (teardown_consumer && event!=TB_DMA_GROUP_RECOVERY) teardown_consumer(event,data);
+    return 0;
+}
 #define BIT(n) (1U << (n))
 #define FIELD_GET(mask,v) (((v) & (mask)) >> __builtin_ctz(mask))
 #define REG_CAPS 0x39640
@@ -38,6 +49,11 @@ static int blocking_notifier_call_chain(struct blocking_notifier_head *h,unsigne
 #define PCI_DEVICE_ID_AMD_1AH_M70H_NHI0 10
 #define PCI_DEVICE_ID_AMD_1AH_M70H_NHI1 11
 #define READ_ONCE(x) (x)
+#define WRITE_ONCE(x,v) ((x)=(v))
+#define dev_warn(...) ((void)0)
+#define dev_err(...) ((void)0)
+#define PCI_COMMAND 0x04
+#define PCI_COMMAND_MASTER 0x4
 #define EXPORT_SYMBOL_GPL(x)
 struct mutex { pthread_mutex_t value; };
 typedef struct mutex spinlock_t;
@@ -54,10 +70,10 @@ static void INIT_LIST_HEAD(struct list_head *l) { l->next=l->prev=l; }
 static bool list_empty(const struct list_head *l) { return l->next==l; }
 struct pci_dev;
 struct device { bool registered, pci; struct pci_dev *pdev; };
-struct pci_dev { unsigned vendor, device; bool present; struct device dev; };
+struct pci_dev { unsigned vendor, device; bool present, master, master_stuck, config_fail; struct device dev; };
 struct tb_nhi;
 struct tb_ring { spinlock_t lock; struct tb_nhi *nhi; bool is_tx, running; unsigned hop; struct list_head queue, in_flight; };
-struct tb_nhi { spinlock_t lock; struct device *dev; struct tb_ring *tx_rings[8], *rx_rings[8]; bool going_away, dma_resetting, dma_shutdown; unsigned hop_count; unsigned char *iobase; };
+struct tb_nhi { spinlock_t lock; struct device *dev; struct tb_ring *tx_rings[8], *rx_rings[8]; bool going_away, dma_resetting, dma_shutdown; unsigned dma_retained; bool dma_revoked, dma_abandoned; unsigned hop_count; unsigned char *iobase; };
 struct tb_ctl { struct tb_nhi *nhi; };
 struct tb;
 struct tb_cm_ops { int (*dma_paths_busy)(struct tb *, int, int); };
@@ -66,6 +82,10 @@ static bool dev_is_pci(struct device *d) { return d->pci; }
 static struct pci_dev *to_pci_dev(struct device *d) { return d->pdev; }
 static bool device_is_registered(struct device *d) { return d->registered; }
 static bool pci_device_is_present(struct pci_dev *p) { return p->present; }
+static void pci_clear_master(struct pci_dev *p) { if (!p->master_stuck) p->master=false; }
+static int pci_read_config_word(struct pci_dev *p, int where, uint16_t *value) {
+    assert(where==PCI_COMMAND); if (p->config_fail) return -EIO; *value=p->master?PCI_COMMAND_MASTER:0; return 0;
+}
 static int pm_refs, pm_error, writes, reads, starts, stops;
 static bool broken_readback, broken_control;
 static unsigned char bar[0x40000];

@@ -102,6 +102,7 @@ int main(int argc,char **argv) {
     else if (!strcmp(argv[1], "group_inventory")) test_group_inventory();
     else if (!strcmp(argv[1], "group_reset")) test_group_reset();
     else if (!strcmp(argv[1], "core_notifier")) test_core_notifier();
+    else if (!strcmp(argv[1], "teardown_revoke")) test_teardown_revoke();
     else return 2;
     printf("PASS %s\n",argv[1]);return 0;
 }
