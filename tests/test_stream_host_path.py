@@ -3,7 +3,9 @@
 
 Covers what no other offline test reaches: the open/start error paths (the
 sticky ENOMEM seen on cluster1), the frame bookkeeping allocation, the NAPI
-RX spin of 0011 running without the device mutex, and IRQ affinity restore.
+RX spin of 0011 running without the device mutex, IRQ affinity restore, and
+the stream going away under open RAM-ring files (service removal, rmdir,
+shutdown, reconnect) through the actual file operations.
 Only the listed structures and function bodies come from the patched
 stream.c; rings, DMA, the CM tunnel inventory and IRQs are models.
 """
@@ -17,14 +19,25 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent
 CASES = ('open_failure_is_not_sticky', 'frame_arrays_use_kvcalloc', 'spin_without_device_mutex',
-         'spin_is_bounded_and_rearms', 'irq_affinity_is_restored')
-STRUCTS = ('tbstream_frame', 'tbstream_ring', 'tbstream_dev', 'tbstream')
+         'spin_is_bounded_and_rearms', 'irq_affinity_is_restored', 'detach_stops_open_ram_rings',
+         'reconnect_refuses_stale_endpoint', 'blocked_reader_fails_cleanly', 'rmdir_with_open_file',
+         'detach_without_open_files', 'stop_is_idempotent', 'shutdown_detaches')
+STRUCTS = ('tbstream_frame', 'tbstream_ring', 'tbstream_dev', 'tbstream_group', 'tbstream')
 FUNCTIONS = ('tbstream_ring_free', 'tbstream_ring_available', 'tbstream_rx_start_poll',
              'tbstream_dev_napi_rx_locked', 'tbstream_dev_napi_rx', 'tbstream_dev_napi_spin',
              'tbstream_dev_irq_pin', 'tbstream_dev_irq_affinity', 'tbstream_dev_irq_affinity_restore',
              'tbstream_dev_xdomain', 'tbstream_dev_rx_callback', 'tbstream_dev_alloc_rx_buffers',
              'tbstream_dev_tx_callback', 'tbstream_dev_alloc_tx_buffers', 'tbstream_dev_start',
-             'tbstream_dev_tx_drained', 'tbstream_dev_poll_ring', 'tbstream_dev_stop')
+             'tbstream_dev_tx_drained', 'tbstream_dev_poll_ring', 'tbstream_dev_stop',
+             'tbstream_valid', 'tbstream_dev_valid', 'tbstream_dev_removed', 'tbstream_dev_closed',
+             'tbstream_dev_detached', 'to_tbstream_dev', 'tbstream_dev_completed_rx',
+             'tbstream_dev_consume_rx', 'tbstream_dev_alloc_tx', 'tbstream_dev_send_data',
+             'tbstream_dev_send_close', 'tbstream_dev_lock', 'tbstream_dev_fops_read_iter',
+             'tbstream_dev_fops_write_iter', 'tbstream_dev_fops_poll', 'tbstream_dev_fops_open',
+             'tbstream_dev_fops_release', 'tbstream_dev_from_group', 'tbstream_dev_alloc_in_hopid',
+             'tbstream_dev_alloc_out_hopid', 'tbstream_dev_attach_stream', 'tbstream_dev_detach_stream',
+             'to_tbstream_group', 'tbstream_dev_drop_item', 'tbstream_group_attach_stream',
+             'tbstream_group_detach_stream', 'tbstream_shutdown')
 
 
 def extract(text, kind, name):
@@ -66,6 +79,13 @@ class StreamHostPathTests(unittest.TestCase):
                                 capture_output=True, text=True)
         if result.returncode:
             raise RuntimeError(result.stdout + result.stderr)
+
+    def test_shutdown_is_registered(self):
+        text = (Path(os.environ['USB4_SOURCE_TREE']) / 'drivers/thunderbolt/stream.c').read_text()
+        driver = re.search(r'^static struct tb_service_driver tbstream_driver = \{\n.*?^\};\n',
+                           text, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(driver)
+        self.assertRegex(driver.group(0), r'\n\t\.shutdown = tbstream_shutdown,\n')
 
     def run_case(self, case):
         result = subprocess.run([str(self.binary), case], capture_output=True, text=True, timeout=30,

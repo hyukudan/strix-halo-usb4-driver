@@ -1,0 +1,490 @@
+diff --git a/drivers/thunderbolt/domain.c b/drivers/thunderbolt/domain.c
+--- a/drivers/thunderbolt/domain.c
++++ b/drivers/thunderbolt/domain.c
+@@ -559,6 +559,33 @@ err_ctl_stop:
+ 	return ret;
+ }
+ 
++struct tb_xdomain_unregister_work {
++	struct work_struct work;
++	struct tb *tb;
++};
++
++static void tb_domain_unregister_xdomains_work(struct work_struct *work)
++{
++	struct tb_xdomain_unregister_work *w = container_of(work, typeof(*w), work);
++
++	tb_domain_unregister_unplugged_xdomains(w->tb);
++}
++
++/*
++ * The hotplug handler unregisters unplugged XDomains from the domain's
++ * ordered workqueue as well. Running there too means the two never
++ * unregister the same XDomain twice.
++ */
++static void tb_domain_unregister_xdomains_sync(struct tb *tb)
++{
++	struct tb_xdomain_unregister_work w = { .tb = tb };
++
++	INIT_WORK_ONSTACK(&w.work, tb_domain_unregister_xdomains_work);
++	queue_work(tb->wq, &w.work);
++	flush_work(&w.work);
++	destroy_work_on_stack(&w.work);
++}
++
+ /**
+  * tb_domain_remove() - Removes and releases a domain
+  * @tb: Domain to remove
+@@ -572,6 +599,17 @@ void tb_domain_remove(struct tb *tb)
+ 	spin_lock_irq(&tb->nhi->lock);
+ 	tb->nhi->dma_shutdown = true;
+ 	spin_unlock_irq(&tb->nhi->lock);
++	if (tb->cm_ops->remove_xdomains) {
++		/*
++		 * Unbind the service drivers while the routers and the DMA
++		 * paths still exist: they stop their rings before the CM
++		 * deactivates the paths, and no service outlives the domain.
++		 */
++		tb->cm_ops->remove_xdomains(tb);
++		mutex_unlock(&tb->lock);
++		tb_domain_unregister_xdomains_sync(tb);
++		mutex_lock(&tb->lock);
++	}
+ 	if (tb->cm_ops->stop)
+ 		tb->cm_ops->stop(tb);
+ 	/* Stop the domain control traffic */
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -39,7 +39,7 @@
+ 
+ static bool host_reset = true;
+ module_param(host_reset, bool, 0444);
+-MODULE_PARM_DESC(host_reset, "reset USB4 host router (default: true)");
++MODULE_PARM_DESC(host_reset, "reset USB4 host router at probe; v1 host interfaces: only the quirked AMD ones, interface reset (default: true)");
+ 
+ static int ring_interrupt_index(const struct tb_ring *ring)
+ {
+@@ -1217,21 +1217,42 @@ void nhi_shutdown(struct tb_nhi *nhi)
+ 		nhi->ops->shutdown(nhi);
+ }
+ 
++/*
++ * v1 host interfaces have no host router reset (HRR). The quirked ones get
++ * a host interface reset instead: ring registers and E2E state back to
++ * their defaults, not the router or its hop tables. Nothing has started
++ * yet at probe, so no ring of another user is lost here.
++ */
++static void nhi_reset_interface(struct tb_nhi *nhi)
++{
++	if (!(nhi->quirks & QUIRK_RESET_INTERFACE_ON_PROBE))
++		return;
++
++	iowrite32(REG_HOST_INTERFACE_RESET_RST,
++		  nhi->iobase + REG_HOST_INTERFACE_RESET);
++	/* Flush the posted write, then wait tHIReset (10 ms) */
++	ioread32(nhi->iobase + REG_CAPS);
++	usleep_range(10000, 20000);
++	dev_info(nhi->dev, "host interface reset\n");
++}
++
+ static void nhi_reset(struct tb_nhi *nhi)
+ {
+ 	ktime_t timeout;
+ 	u32 val;
+ 
+-	val = ioread32(nhi->iobase + REG_CAPS);
+-	/* Reset only v2 and later routers */
+-	if (FIELD_GET(REG_CAPS_VERSION_MASK, val) < REG_CAPS_VERSION_2)
+-		return;
+-
+ 	if (!host_reset) {
+ 		dev_dbg(nhi->dev, "skipping host router reset\n");
+ 		return;
+ 	}
+ 
++	val = ioread32(nhi->iobase + REG_CAPS);
++	/* HRR exists only on v2 and later routers */
++	if (FIELD_GET(REG_CAPS_VERSION_MASK, val) < REG_CAPS_VERSION_2) {
++		nhi_reset_interface(nhi);
++		return;
++	}
++
+ 	iowrite32(REG_RESET_HRR, nhi->iobase + REG_RESET);
+ 	msleep(100);
+ 
+@@ -1347,7 +1368,8 @@ int nhi_probe(struct tb_nhi *nhi)
+ 		 * activated. Do a proper shutdown.
+ 		 */
+ 		tb_domain_put(tb);
+-		wait_for_completion(&nhi->domain_released);
++		/* Bounded, as on removal: a failed probe must not hang */
++		tb_domain_wait_released(tb, nhi);
+ 		nhi_shutdown(nhi);
+ 		return dev_err_probe(dev, res, "failed to add domain\n");
+ 	}
+diff --git a/drivers/thunderbolt/nhi.h b/drivers/thunderbolt/nhi.h
+--- a/drivers/thunderbolt/nhi.h
++++ b/drivers/thunderbolt/nhi.h
+@@ -136,6 +136,7 @@ struct tb_nhi_ops {
+ /* Host interface quirks */
+ #define QUIRK_AUTO_CLEAR_INT	BIT(0)
+ #define QUIRK_E2E		BIT(1)
++#define QUIRK_RESET_INTERFACE_ON_PROBE	BIT(2)
+ 
+ /*
+  * Minimal number of vectors when we use MSI-X. Two for control channel
+diff --git a/drivers/thunderbolt/nhi_regs.h b/drivers/thunderbolt/nhi_regs.h
+--- a/drivers/thunderbolt/nhi_regs.h
++++ b/drivers/thunderbolt/nhi_regs.h
+@@ -115,6 +115,9 @@ struct ring_desc {
+ #define REG_CAPS_VERSION_MASK		GENMASK(23, 16)
+ #define REG_CAPS_VERSION_2		0x40
+ 
++#define REG_HOST_INTERFACE_RESET	0x39858
++#define REG_HOST_INTERFACE_RESET_RST	BIT(0)
++
+ #define REG_DMA_MISC			0x39864
+ #define REG_DMA_MISC_INT_AUTO_CLEAR     BIT(2)
+ #define REG_DMA_MISC_DISABLE_AUTO_CLEAR	BIT(17)
+diff --git a/drivers/thunderbolt/pci.c b/drivers/thunderbolt/pci.c
+--- a/drivers/thunderbolt/pci.c
++++ b/drivers/thunderbolt/pci.c
+@@ -62,6 +62,30 @@ static void nhi_pci_check_quirks(struct tb_nhi_pci *nhi_pci)
+ 			nhi->quirks |= QUIRK_E2E;
+ 			break;
+ 		}
++	} else if (pdev->vendor == PCI_VENDOR_ID_AMD) {
++		switch (pdev->device) {
++		case PCI_DEVICE_ID_AMD_1AH_M60H_NHI0:
++		case PCI_DEVICE_ID_AMD_1AH_M60H_NHI1:
++		case PCI_DEVICE_ID_AMD_1AH_M68H_NHI0:
++		case PCI_DEVICE_ID_AMD_1AH_M68H_NHI1:
++		case PCI_DEVICE_ID_AMD_1AH_M80H_NHI0:
++		case PCI_DEVICE_ID_AMD_1AH_M80H_NHI1:
++		case PCI_DEVICE_ID_AMD_1AH_M80H_NHI2:
++		case PCI_DEVICE_ID_AMD_1AH_M24H_NHI0:
++		case PCI_DEVICE_ID_AMD_1AH_M24H_NHI1:
++		case PCI_DEVICE_ID_AMD_1AH_M70H_NHI0:
++		case PCI_DEVICE_ID_AMD_1AH_M70H_NHI1:
++			/*
++			 * These hosts may hang the Tx side of the host
++			 * interface when DMA paths are torn down (upstream
++			 * resets it after every teardown, which also resets
++			 * every other user's rings; not done here). Reset it
++			 * at probe, before anything runs, so that a rebind
++			 * can recover such a hang without a reboot.
++			 */
++			nhi->quirks |= QUIRK_RESET_INTERFACE_ON_PROBE;
++			break;
++		}
+ 	}
+ }
+ 
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -141,6 +141,9 @@ struct tbstream_ring {
+  * @users: Number of times @cdev has been opened
+  * @closed: CLOSE packet was received
+  * @removed: Userspace removed the ConfigFS group underneath.
++ * @detached: The stream went away while the device was open. Its rings
++ *	      were stopped then; the files opened before only fail until
++ *	      they are closed, even if a new stream is attached meanwhile.
+  * @wait: Waitqueue for open, read and write
+  * @lock: Lock protecting this structure
+  * @tx_ring: Transmit ring
+@@ -175,6 +178,7 @@ struct tbstream_dev {
+ 	int users;
+ 	bool closed;
+ 	bool removed;
++	bool detached;
+ 	wait_queue_head_t wait;
+ 	struct mutex lock;
+ 	struct tbstream_ring tx_ring;
+@@ -522,6 +526,11 @@ static inline bool tbstream_dev_closed(const struct tbstream_dev *sdev)
+ 	return sdev->closed;
+ }
+ 
++static inline bool tbstream_dev_detached(const struct tbstream_dev *sdev)
++{
++	return READ_ONCE(sdev->detached);
++}
++
+ static void
+ tbstream_dev_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 			 bool canceled)
+@@ -740,6 +749,9 @@ static int tbstream_dev_send_close(struct tbstream_dev *sdev)
+ {
+ 	struct tbstream_frame *sf;
+ 
++	if (!sdev->tx_ring.ring)
++		return -ENODEV;
++
+ 	if (sdev->busy_poll) {
+ 		/*
+ 		 * When busy polling it's the write(2) path that
+@@ -874,6 +886,9 @@ static void tbstream_dev_stop(struct tbstream_dev *sdev)
+ 		return;
+ 	}
+ #endif
++	/* Already stopped: the stream was detached, or resume failed. */
++	if (!sdev->tx_ring.ring)
++		return;
+ 
+ 	/* A reader may be spinning on the RX ring without sdev->lock. */
+ 	guard(mutex)(&sdev->rx_lock);
+@@ -945,6 +960,8 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 	if (READ_ONCE(sdev->gpu_direct))
+ 		return -EOPNOTSUPP;
+ #endif
++	if (tbstream_dev_detached(sdev))
++		return -ENODEV;
+ 	ret = tbstream_dev_valid(sdev);
+ 	if (ret)
+ 		return ret;
+@@ -954,6 +971,12 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 		return ret;
+ 
+ 	for (;;) {
++		/* The rings of this file are gone, whatever is attached now */
++		if (tbstream_dev_detached(sdev)) {
++			mutex_unlock(&sdev->lock);
++			return -ENODEV;
++		}
++
+ 		/* When busy polling, advance any completions manually */
+ 		tbstream_dev_poll_ring(sdev, &sdev->rx_ring);
+ 		tbstream_dev_napi_rx(sdev);
+@@ -986,6 +1009,7 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 					tbstream_ring_available(&sdev->rx_ring) ||
+ 					READ_ONCE(sdev->rx_poll_pending) ||
+ 					tbstream_dev_valid(sdev) != 0 ||
++					tbstream_dev_detached(sdev) ||
+ 					tbstream_dev_closed(sdev) ||
+ 					tbstream_dev_removed(sdev));
+ 			if (ret)
+@@ -1063,6 +1087,8 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ 	if (READ_ONCE(sdev->gpu_direct))
+ 		return -EOPNOTSUPP;
+ #endif
++	if (tbstream_dev_detached(sdev))
++		return -ENODEV;
+ 	ret = tbstream_dev_valid(sdev);
+ 	if (ret)
+ 		return ret;
+@@ -1072,6 +1098,11 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ 		return ret;
+ 
+ 	for (;;) {
++		if (tbstream_dev_detached(sdev)) {
++			mutex_unlock(&sdev->lock);
++			return -ENODEV;
++		}
++
+ 		tbstream_dev_poll_ring(sdev, &sdev->tx_ring);
+ 
+ 		ret = tbstream_dev_valid(sdev);
+@@ -1101,6 +1132,7 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ 			ret = wait_event_interruptible(sdev->wait,
+ 					tbstream_ring_available(&sdev->tx_ring) ||
+ 					tbstream_dev_valid(sdev) != 0 ||
++					tbstream_dev_detached(sdev) ||
+ 					tbstream_dev_closed(sdev) ||
+ 					tbstream_dev_removed(sdev));
+ 			if (ret)
+@@ -1156,6 +1188,8 @@ tbstream_dev_fops_poll(struct file *file, struct poll_table_struct *wait)
+ 
+ 	poll_wait(file, &sdev->wait, wait);
+ 	guard(mutex)(&sdev->lock);
++	if (tbstream_dev_detached(sdev))
++		return EPOLLHUP | EPOLLERR;
+ 	if (sdev->rx_ring.ring)
+ 		tbstream_dev_napi_rx(sdev);
+ 	if (tbstream_dev_valid(sdev) != 0) {
+@@ -1220,6 +1254,15 @@ static int tbstream_dev_fops_open(struct inode *inode, struct file *file)
+ 		goto err_unlock;
+ 	}
+ #endif
++	/*
++	 * Files opened before the stream went away own no rings any more.
++	 * Never let a new open share their count: it would skip the start.
++	 */
++	if (sdev->detached) {
++		ret = -EBUSY;
++		goto err_unlock;
++	}
++
+ 	/* Only on first open we allocate rings and enable paths */
+ 	if (!sdev->users++) {
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+@@ -1258,13 +1301,18 @@ static int tbstream_dev_fops_release(struct inode *inode, struct file *file)
+ 			goto unlocked;
+ 		}
+ #endif
+-		/*
+-		 * Send CLOSE tunneled packet to notify the other end
+-		 * that we are closing the file. We do this twice if the
+-		 * first one fails.
+-		 */
+-		tbstream_dev_send_close(sdev);
+-		tbstream_dev_stop(sdev);
++		if (sdev->detached) {
++			/* Stopped when the stream went away: nothing to send */
++			WRITE_ONCE(sdev->detached, false);
++		} else {
++			/*
++			 * Send CLOSE tunneled packet to notify the other
++			 * end that we are closing the file. We do this
++			 * twice if the first one fails.
++			 */
++			tbstream_dev_send_close(sdev);
++			tbstream_dev_stop(sdev);
++		}
+ 	}
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+ unlocked:
+@@ -1901,8 +1949,23 @@ static void tbstream_dev_detach_stream(struct tbstream_dev *sdev)
+ 		if (!stream)
+ 			return;
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+-		tbstream_gpu_disconnect(sdev);
++		if (sdev->gpu_context)
++			tbstream_gpu_disconnect(sdev);
++		else
+ #endif
++		if (sdev->users) {
++			/*
++			 * The rings of open files must not outlive the
++			 * stream: the domain and the NHI with its MMIO can
++			 * go away next. Stop them while the paths are still
++			 * known; an unplugged XDomain skips the CM part. A
++			 * peer that is still there gets a CLOSE first.
++			 */
++			if (tbstream_valid(stream))
++				tbstream_dev_send_close(sdev);
++			tbstream_dev_stop(sdev);
++			WRITE_ONCE(sdev->detached, true);
++		}
+ 		sdev->stream = NULL;
+ 		xd = tb_service_parent(stream->svc);
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+@@ -2030,6 +2093,11 @@ tbstream_dev_drop_item(struct config_group *group, struct config_item *item)
+ #endif
+ 		WRITE_ONCE(sdev->removed, true);
+ 	}
++	/*
++	 * Off the group list, service removal no longer finds this device:
++	 * stop open RAM rings now instead of when the last file closes.
++	 */
++	tbstream_dev_detach_stream(sdev);
+ 	wake_up_interruptible_poll(&sdev->wait, EPOLLHUP | EPOLLERR);
+ 	config_item_put(item);
+ }
+@@ -2252,7 +2320,7 @@ static int __maybe_unused tbstream_resume(struct device *dev)
+ 			continue;
+ 		}
+ #endif
+-		if (sdev->users) {
++		if (sdev->users && !sdev->detached) {
+ 			int ret;
+ 
+ 			ret = tbstream_dev_start(sdev);
+@@ -2273,6 +2341,15 @@ static const struct dev_pm_ops tbstream_pm_ops = {
+ 	SET_SYSTEM_SLEEP_PM_OPS(tbstream_suspend, tbstream_resume)
+ };
+ 
++/*
++ * Reboot and power off do not remove the service, and the NHI stops its
++ * DMA right after: stop the stream devices first, as removal would.
++ */
++static void tbstream_shutdown(struct tb_service *svc)
++{
++	tbstream_group_detach_stream(tb_service_get_drvdata(svc));
++}
++
+ static const struct tb_service_id tbstream_ids[] = {
+ 	{ TB_SERVICE("stream", 1) },
+ 	{ }
+@@ -2287,6 +2364,7 @@ static struct tb_service_driver tbstream_driver = {
+ 	},
+ 	.probe = tbstream_probe,
+ 	.remove = tbstream_remove,
++	.shutdown = tbstream_shutdown,
+ 	.id_table = tbstream_ids,
+ };
+ 
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -2940,6 +2940,41 @@ static void tb_handle_event(struct tb *tb, enum tb_cfg_pkg_type type,
+ 	tb_queue_hotplug(tb, route, pkg->port, pkg->unplug);
+ }
+ 
++static void tb_remove_switch_xdomains(struct tb_switch *sw)
++{
++	struct tb_port *port;
++
++	tb_switch_for_each_port(sw, port) {
++		if (tb_port_has_remote(port)) {
++			tb_remove_switch_xdomains(port->remote->sw);
++		} else if (port->xdomain) {
++			/* As tb_switch_remove() would, one step earlier */
++			port->xdomain->is_unplugged = true;
++			tb_xdomain_remove(port->xdomain);
++			port->xdomain = NULL;
++		}
++	}
++}
++
++/*
++ * Domain removal, before tb_stop(). tb_switch_remove() only marks the
++ * XDomains it finds unplugged, and nothing unregisters them afterwards:
++ * they and their services stay registered after the domain, and even the
++ * module, are gone (a later device_shutdown() calls through their stale
++ * bus). Removing them here, while their routers exist, lets the domain
++ * unregister them without tb->lock, as the hotplug path does, so service
++ * drivers stop their rings before tb_stop() deactivates the DMA paths.
++ */
++static void tb_remove_xdomains(struct tb *tb)
++{
++	struct tb_cm *tcm = tb_priv(tb);
++
++	/* No new XDomain from now on */
++	tcm->hotplug_active = false;
++	if (tb->root_switch)
++		tb_remove_switch_xdomains(tb->root_switch);
++}
++
+ static void tb_stop(struct tb *tb)
+ {
+ 	struct tb_cm *tcm = tb_priv(tb);
+@@ -3315,6 +3350,7 @@ static int tb_runtime_resume(struct tb *tb)
+ 
+ static const struct tb_cm_ops tb_cm_ops = {
+ 	.start = tb_start,
++	.remove_xdomains = tb_remove_xdomains,
+ 	.stop = tb_stop,
+ 	.deinit = tb_deinit,
+ 	.suspend_noirq = tb_suspend_noirq,
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -472,6 +472,9 @@ struct tb_path {
+  * @driver_ready: Called right after control channel is started. Used by
+  *		  ICM to send driver ready message to the firmware.
+  * @start: Starts the domain
++ * @remove_xdomains: Stops hotplug and removes every XDomain (marked
++ *		     unplugged, still registered) while the routers exist,
++ *		     before @stop. Called with @tb->lock taken. Optional.
+  * @stop: Stops the domain
+  * @deinit: Perform any cleanup after the domain is stopped but before
+  *	     it is unregistered. Called without @tb->lock taken. Optional.
+@@ -507,6 +510,7 @@ struct tb_path {
+ struct tb_cm_ops {
+ 	int (*driver_ready)(struct tb *tb);
+ 	int (*start)(struct tb *tb, bool reset);
++	void (*remove_xdomains)(struct tb *tb);
+ 	void (*stop)(struct tb *tb);
+ 	void (*deinit)(struct tb *tb);
+ 	int (*suspend_noirq)(struct tb *tb);

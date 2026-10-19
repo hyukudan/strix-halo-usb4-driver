@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -17,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -40,11 +42,15 @@ typedef int wait_queue_head_t;
 #define WRITE_ONCE(x, v) __atomic_store_n(&(x), (v), __ATOMIC_SEQ_CST)
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
 #define min(a, b) ((a) < (b) ? (a) : (b))
+#define ERR_PTR(e) ((void *)(intptr_t)(e))
+#define PTR_ERR(p) ((int)(intptr_t)(p))
+#define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
 
 static atomic_int warnings, infos;
 #define pr_warn_ratelimited(...) (atomic_fetch_add(&warnings, 1), (void)0)
 #define pr_info_ratelimited(...) (atomic_fetch_add(&infos, 1), (void)0)
 #define pr_warn(...) (atomic_fetch_add(&warnings, 1), (void)0)
+#define WARN_ON(x) ({ bool __w = (x); if (__w) atomic_fetch_add(&warnings, 1); __w; })
 
 struct list_head { struct list_head *next, *prev; };
 static void INIT_LIST_HEAD(struct list_head *l) { l->next = l->prev = l; }
@@ -209,7 +215,7 @@ struct tb_ring {
     void *poll_data;
 };
 static int ring_fail_after = -1;
-static atomic_int live_rings, poll_calls, poll_completes;
+static atomic_int live_rings, poll_calls, poll_completes, ring_stops, tx_frames;
 static struct tb_ring *ring_alloc(struct tb_nhi *nhi, bool tx, int size)
 {
     struct tb_ring **slots = tx ? nhi->tx : nhi->rx;
@@ -253,7 +259,8 @@ static void tb_ring_stop(struct tb_ring *r)
 {
     struct list_head all;
 
-    assert(r->running);
+    assert(r->running); /* a second stop of the same ring is a bug */
+    atomic_fetch_add(&ring_stops, 1);
     pthread_mutex_lock(&r->lock);
     r->running = false;
     INIT_LIST_HEAD(&all);
@@ -286,7 +293,12 @@ static int ring_enqueue(struct tb_ring *r, struct ring_frame *f)
     return 0;
 }
 static int tb_ring_rx(struct tb_ring *r, struct ring_frame *f) { assert(!r->is_tx); return ring_enqueue(r, f); }
-static int tb_ring_tx(struct tb_ring *r, struct ring_frame *f) { assert(r->is_tx); return ring_enqueue(r, f); }
+static int tb_ring_tx(struct tb_ring *r, struct ring_frame *f)
+{
+    assert(r->is_tx);
+    atomic_fetch_add(&tx_frames, 1);
+    return ring_enqueue(r, f);
+}
 /* Test gate: park a polling reader inside tb_ring_poll(). */
 static atomic_bool hold_poll, poll_parked;
 static struct ring_frame *tb_ring_poll(struct tb_ring *r)
@@ -328,8 +340,8 @@ static void complete_rx(struct tb_ring *r, u32 size)
  * hops and XDomain HopIDs; tb_tunnel_alloc_dma() cannot reserve them twice
  * and tb_approve_xdomain_paths() then returns -ENOMEM without logging. */
 struct tb { struct tb_nhi *nhi; };
-struct tb_xdomain { struct tb *tb; };
-struct tb_service { struct tb_xdomain *xd; };
+struct tb_xdomain { struct tb *tb; bool is_unplugged; int hopids; };
+struct tb_service { struct tb_xdomain *xd; void *drvdata; };
 static struct tb_xdomain *tb_service_parent(struct tb_service *svc) { return svc->xd; }
 struct cm_tunnel { struct tb_xdomain *xd; int out_hopid, tx_hop, in_hopid, rx_hop; bool used; };
 static struct cm_tunnel tunnels[8];
@@ -358,6 +370,9 @@ static int tb_xdomain_enable_paths(struct tb_xdomain *xd, int out_hopid, int tx_
 }
 static int tb_xdomain_disable_paths(struct tb_xdomain *xd, int out_hopid, int tx_hop, int in_hopid, int rx_hop)
 {
+    /* Like the CM: an unplugged XDomain's tunnels were torn down already. */
+    if (xd->is_unplugged)
+        return 0;
     for (int i = 0; i < 8; ++i)
         if (tunnels[i].used && tunnels[i].xd == xd && tunnels[i].out_hopid == out_hopid &&
             tunnels[i].tx_hop == tx_hop && tunnels[i].in_hopid == in_hopid && tunnels[i].rx_hop == rx_hop)
@@ -366,10 +381,81 @@ static int tb_xdomain_disable_paths(struct tb_xdomain *xd, int out_hopid, int tx
 }
 
 /* Remaining types used by the extracted structures. */
-struct config_group { int unused; };
+struct config_item { const char *ci_name; };
+struct config_group { struct config_item cg_item; };
 struct miscdevice { const char *name; };
 struct kref { int refcount; };
 struct tbstream_gpu_context;
+
+/* File side: what read/write/poll/open/release of the stream device use. */
+#define ERESTARTSYS 512
+#define EPOLLERR 16U
+#define EPOLLHUP 32U
+#define IOCB_NOWAIT 1
+typedef unsigned int __poll_t;
+struct inode;
+struct poll_table_struct;
+struct file { int f_flags; void *private_data; };
+struct kiocb { struct file *ki_filp; int ki_flags; };
+struct iov_iter { unsigned char *buf; size_t count; };
+static size_t iov_iter_count(const struct iov_iter *i) { return i->count; }
+static size_t copy_page_to_iter(struct page *p, size_t off, size_t size, struct iov_iter *i)
+{
+    memcpy(i->buf, p->data + off, size); i->buf += size; i->count -= size;
+    return size;
+}
+static size_t copy_page_from_iter(struct page *p, size_t off, size_t size, struct iov_iter *i)
+{
+    memcpy(p->data + off, i->buf, size); i->buf += size; i->count -= size;
+    return size;
+}
+static void poll_wait(struct file *f, wait_queue_head_t *w, struct poll_table_struct *pt) { (void)f; (void)w; (void)pt; }
+static void cond_resched(void) { sched_yield(); }
+static void wake_up_interruptible(wait_queue_head_t *w) { (void)w; atomic_fetch_add(&wakeups, 1); }
+/* Sleeps by polling the condition, which other test threads change. */
+#define wait_event_interruptible(wq, cond) ({     int __ret = 0;     (void)(wq);     while (!(cond)) {         if (signal_pending(current)) { __ret = -ERESTARTSYS; break; }         sched_yield();     }     __ret; })
+#define scoped_guard(name, arg)     for (class_##name##_t __scope __attribute__((cleanup(class_##name##_destructor))) =          class_##name##_constructor(arg), *__scope_done = NULL; !__scope_done;          __scope_done = (void *)1)
+
+/* Lists and configfs, as used by the device and group items. */
+#define list_entry(p, t, m) container_of(p, t, m)
+#define list_for_each_entry(pos, head, member)     for (pos = list_entry((head)->next, __typeof__(*pos), member);          &pos->member != (head); pos = list_entry(pos->member.next, __typeof__(*pos), member))
+#define list_for_each_entry_reverse(pos, head, member)     for (pos = list_entry((head)->prev, __typeof__(*pos), member);          &pos->member != (head); pos = list_entry(pos->member.prev, __typeof__(*pos), member))
+static void list_del(struct list_head *n) { list_del_init(n); }
+#define to_config_group(item) container_of(item, struct config_group, cg_item)
+static const char *config_item_name(struct config_item *item) { return item->ci_name; }
+static atomic_int item_puts, group_puts;
+static void config_item_put(struct config_item *item) { (void)item; atomic_fetch_add(&item_puts, 1); }
+static void config_group_put(struct config_group *group) { (void)group; atomic_fetch_add(&group_puts, 1); }
+
+/* Reference counts are counted, objects are owned by the test. */
+struct tbstream;
+struct tbstream_dev;
+struct tbstream_group;
+static atomic_int stream_refs, dev_refs;
+static struct tbstream *tbstream_get(struct tbstream *s) { if (s) atomic_fetch_add(&stream_refs, 1); return s; }
+static void tbstream_put(struct tbstream *s) { if (s) assert(atomic_fetch_sub(&stream_refs, 1) > 0); }
+static struct tbstream_dev *tbstream_dev_get(struct tbstream_dev *s) { atomic_fetch_add(&dev_refs, 1); return s; }
+static void tbstream_dev_put(struct tbstream_dev *s) { (void)s; assert(atomic_fetch_sub(&dev_refs, 1) > 0); }
+static struct tbstream_group *found_group;
+static struct tbstream_group *tbstream_group_find(struct tbstream *s) { (void)s; return found_group; }
+
+/* XDomain HopIDs and the service property directory. */
+static int tb_xdomain_alloc_in_hopid(struct tb_xdomain *xd, int hopid) { xd->hopids++; return hopid; }
+static int tb_xdomain_alloc_out_hopid(struct tb_xdomain *xd, int hopid) { xd->hopids++; return hopid; }
+static void tb_xdomain_release_in_hopid(struct tb_xdomain *xd, int hopid) { (void)hopid; assert(--xd->hopids >= 0); }
+static void tb_xdomain_release_out_hopid(struct tb_xdomain *xd, int hopid) { (void)hopid; assert(--xd->hopids >= 0); }
+static int published_in = -1, published_out = -1;
+static void service_get_hopids(struct tb_service *svc, const char *name, int *in, int *out)
+{
+    (void)svc; (void)name; (void)in; (void)out;
+}
+static int service_update_properties(struct tb_service *svc, const char *name, int in, int out)
+{
+    (void)svc; (void)name; published_in = in; published_out = out;
+    return 0;
+}
+static void tb_service_properties_changed(struct tb_service *svc) { (void)svc; }
+static void *tb_service_get_drvdata(struct tb_service *svc) { return svc->drvdata; }
 
 /* Module parameters of stream.c (declared by module_param there). */
 static bool rx_napi;

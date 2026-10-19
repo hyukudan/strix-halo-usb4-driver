@@ -237,6 +237,8 @@ static void irq_affinity_is_restored(void)
     assert_nothing_held();
 }
 
+#include "stream_detach_cases.h"
+
 int main(int argc, char **argv)
 {
     struct { const char *name; void (*run)(void); } cases[] = {
@@ -245,6 +247,13 @@ int main(int argc, char **argv)
         { "spin_without_device_mutex", spin_without_device_mutex },
         { "spin_is_bounded_and_rearms", spin_is_bounded_and_rearms },
         { "irq_affinity_is_restored", irq_affinity_is_restored },
+        { "detach_stops_open_ram_rings", detach_stops_open_ram_rings },
+        { "reconnect_refuses_stale_endpoint", reconnect_refuses_stale_endpoint },
+        { "blocked_reader_fails_cleanly", blocked_reader_fails_cleanly },
+        { "rmdir_with_open_file", rmdir_with_open_file },
+        { "detach_without_open_files", detach_without_open_files },
+        { "stop_is_idempotent", stop_is_idempotent },
+        { "shutdown_detaches", shutdown_detaches },
     };
 
     assert(argc == 2);
