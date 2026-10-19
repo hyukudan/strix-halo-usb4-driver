@@ -136,6 +136,13 @@ static void test_teardown_revoke(void)
     tb_dma_retire_domain_clients(&f.tb);
     assert(reads == before + 1 && !f.pci.master);
     assert(core_events[1] == TB_DMA_DOMAIN_ABANDONED && !f.nhi.dma_revoked && f.nhi.dma_abandoned);
+    /* A function answering with no hop count is not this NHI any more. */
+    teardown_case(&f, 1, 0);
+    caps = 0x200000;
+    before = reads;
+    tb_dma_retire_domain_clients(&f.tb);
+    assert(reads == before + 1 && !f.pci.master);
+    assert(core_events[1] == TB_DMA_DOMAIN_ABANDONED && !f.nhi.dma_revoked && f.nhi.dma_abandoned);
     caps = 0x200008;
     /* Relaxed Ordering lets earlier posted writes pass that read. */
     teardown_case(&f, 1, 0);
