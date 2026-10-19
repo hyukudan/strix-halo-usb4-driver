@@ -1,0 +1,106 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -41,7 +41,8 @@
+  * the stream is opened. Typically the read side is opened first to make
+  * sure all the data will be received.
+  *
+- * End-to-end flow control is mandatory on both sides.
++ * End-to-end flow control is mandatory on both sides. It can only be
++ * turned off (the e2e setting, on both ends) to measure its cost.
+  *
+  * Data is sent to the other side as tunneled DATA packets. All the data
+  * is owned by the user and passed as-is from the writer to the reader.
+@@ -148,6 +149,8 @@ struct tbstream_ring {
+  * @route: Route of that connection's XDomain
+  * @cfg_open_timeout_ms: How long open() waits for the peer's stream service
+  *			 (-1 follows the open_timeout_ms module parameter)
++ * @cfg_e2e: End-to-end flow control of the rings (-1 follows the e2e module
++ *	     parameter). Both ends of a stream must use the same setting.
+  * @wait: Waitqueue for open, read and write
+  * @lock: Lock protecting this structure
+  * @tx_ring: Transmit ring
+@@ -186,6 +189,7 @@ struct tbstream_dev {
+ 	unsigned int domain_index;
+ 	u64 route;
+ 	int cfg_open_timeout_ms;
++	int cfg_e2e;
+ 	wait_queue_head_t wait;
+ 	struct mutex lock;
+ 	struct tbstream_ring tx_ring;
+@@ -331,6 +335,18 @@ module_param(spin_us, uint, 0644);
+ MODULE_PARM_DESC(spin_us,
+ 		 "With rx_napi, keep polling the RX ring this many microseconds before re-arming its interrupt (default: 0)");
+ 
++/*
++ * Without end-to-end flow control the receiving host interface drops the
++ * frames that find no posted RX descriptor, and the stream protocol has no
++ * retransmission: only for measurements that verify their data. A TX ring
++ * with E2E against an RX ring without it never gets credits, so both ends
++ * must agree.
++ */
++static bool e2e = true;
++module_param(e2e, bool, 0644);
++MODULE_PARM_DESC(e2e,
++		 "End-to-end flow control on the rings of a stream; applies when it is opened, must match the peer (default: true)");
++
+ /* Hard IRQ context, nhi->lock and ring->lock held: the ring is masked. */
+ static void tbstream_rx_start_poll(void *data)
+ {
+@@ -789,13 +805,15 @@ static int tbstream_dev_send_close(struc
+ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ {
+ 	struct tb_xdomain *xd = tbstream_dev_xdomain(sdev);
+-	unsigned int flags = RING_FLAG_FRAME | RING_FLAG_E2E;
++	unsigned int flags = RING_FLAG_FRAME;
+ 	u16 sof_mask, eof_mask;
+ 	struct tb_ring *ring;
+ 	int ret, e2e_tx_hop;
+ 
+ 	if (sdev->busy_poll)
+ 		flags |= RING_FLAG_NO_INTERRUPT;
++	if (sdev->cfg_e2e < 0 ? READ_ONCE(e2e) : sdev->cfg_e2e)
++		flags |= RING_FLAG_E2E;
+ 
+ 	sdev->rx_napi = (sdev->cfg_rx_napi < 0 ? READ_ONCE(rx_napi) : sdev->cfg_rx_napi) &&
+ 			!sdev->busy_poll;
+@@ -1572,6 +1590,23 @@ static ssize_t tbstream_dev_open_timeout
+ }
+ CONFIGFS_ATTR(tbstream_dev_, open_timeout_ms);
+ 
++static ssize_t tbstream_dev_e2e_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return sysfs_emit(buf, "%d\n", sdev->cfg_e2e);
++}
++
++/* -1 follows the e2e module parameter, 0 disables, 1 enables. */
++static ssize_t tbstream_dev_e2e_store(struct config_item *item,
++				      const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return tbstream_dev_int_store(sdev, &sdev->cfg_e2e, buf, count, -1, 1);
++}
++CONFIGFS_ATTR(tbstream_dev_, e2e);
++
+ static ssize_t tbstream_dev_index_show(struct config_item *item, char *buf)
+ {
+ 	struct config_group *group = to_config_group(item);
+@@ -1911,6 +1946,7 @@ CONFIGFS_ATTR_WO(tbstream_dev_, gpu_reco
+ 
+ static struct configfs_attribute *tbstream_dev_attrs[] = {
+ 	&tbstream_dev_attr_busy_poll,
++	&tbstream_dev_attr_e2e,
+ 	&tbstream_dev_attr_irq_cpu,
+ 	&tbstream_dev_attr_open_timeout_ms,
+ 	&tbstream_dev_attr_rx_napi,
+@@ -2110,6 +2146,7 @@ tbstream_dev_make_group(struct config_gr
+ 	sdev->cfg_rx_napi = -1;
+ 	sdev->cfg_spin_us = -1;
+ 	sdev->cfg_open_timeout_ms = -1;
++	sdev->cfg_e2e = -1;
+ 	sdev->domain_index = sg->domain_index;
+ 	sdev->route = sg->route;
+ 	sdev->irq_cpu = -1;

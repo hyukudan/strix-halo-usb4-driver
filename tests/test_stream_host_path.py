@@ -19,7 +19,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent
 CASES = ('open_failure_is_not_sticky', 'frame_arrays_use_kvcalloc', 'spin_without_device_mutex',
-         'spin_is_bounded_and_rearms', 'irq_affinity_is_restored', 'detach_stops_open_ram_rings',
+         'spin_is_bounded_and_rearms', 'e2e_setting_controls_both_rings', 'irq_affinity_is_restored', 'detach_stops_open_ram_rings',
          'reconnect_refuses_stale_endpoint', 'blocked_reader_fails_cleanly', 'rmdir_with_open_file',
          'detach_without_open_files', 'stop_is_idempotent', 'shutdown_detaches',
          'open_fails_fast_without_domain', 'open_fails_fast_without_xdomain', 'open_nonblock_eagain',
@@ -103,6 +103,17 @@ class StreamHostPathTests(unittest.TestCase):
         self.assertIn('&tbstream_dev_attr_open_timeout_ms,', attrs.group(0))
         store = extract(text, 'function', 'tbstream_dev_open_timeout_ms_store')
         self.assertIn('-1,\n\t\t\t\t      TBSTREAM_DEV_MAX_OPEN_TIMEOUT_MS);', store)
+
+    def test_e2e_defaults(self):
+        text = (Path(os.environ['USB4_SOURCE_TREE']) / 'drivers/thunderbolt/stream.c').read_text()
+        self.assertIn('static bool e2e = true;\n', text)
+        self.assertIn('module_param(e2e, bool, 0644);', text)
+        self.assertIn('\tsdev->cfg_e2e = -1;\n', text)
+        attrs = re.search(r'^static struct configfs_attribute \*tbstream_dev_attrs\[\] = \{\n.*?^\};\n',
+                          text, re.MULTILINE | re.DOTALL)
+        self.assertIn('&tbstream_dev_attr_e2e,', attrs.group(0))
+        store = extract(text, 'function', 'tbstream_dev_e2e_store')
+        self.assertIn('&sdev->cfg_e2e, buf, count, -1, 1);', store)
 
     def run_case(self, case):
         result = subprocess.run([str(self.binary), case], capture_output=True, text=True, timeout=30,

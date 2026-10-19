@@ -209,6 +209,7 @@ struct tb_ring {
     struct tb_nhi *nhi;
     pthread_mutex_t lock;
     int hop, size, irq;
+    unsigned int flags;
     bool is_tx, running, masked;
     struct list_head posted, done;
     void (*start_poll)(void *);
@@ -240,16 +241,19 @@ static struct tb_ring *ring_alloc(struct tb_nhi *nhi, bool tx, int size)
 }
 static struct tb_ring *tb_ring_alloc_tx(struct tb_nhi *nhi, int hop, int size, unsigned int flags)
 {
-    (void)hop; (void)flags;
-    return ring_alloc(nhi, true, size);
+    struct tb_ring *r;
+    (void)hop;
+    r = ring_alloc(nhi, true, size);
+    if (r) r->flags = flags;
+    return r;
 }
 static struct tb_ring *tb_ring_alloc_rx(struct tb_nhi *nhi, int hop, int size, unsigned int flags,
                                         int e2e, u16 sof, u16 eof, void (*start_poll)(void *), void *data)
 {
     struct tb_ring *r;
-    (void)hop; (void)flags; (void)e2e; (void)sof; (void)eof;
+    (void)hop; (void)e2e; (void)sof; (void)eof;
     r = ring_alloc(nhi, false, size);
-    if (r) { r->start_poll = start_poll; r->poll_data = data; }
+    if (r) { r->start_poll = start_poll; r->poll_data = data; r->flags = flags; }
     return r;
 }
 static void tb_ring_start(struct tb_ring *r) { assert(!r->running); r->running = true; }
@@ -461,6 +465,7 @@ static void *tb_service_get_drvdata(struct tb_service *svc) { return svc->drvdat
 static bool rx_napi;
 static unsigned int spin_us;
 static unsigned int open_timeout_ms = 30000;
+static bool e2e = true;
 
 /* Bounded open (0019): time in jiffies of 1 ms, the timed wait, and the
  * core's answer about the endpoint's domain and XDomain. */

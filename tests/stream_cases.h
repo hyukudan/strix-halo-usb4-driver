@@ -21,7 +21,7 @@ static void host_init(struct host *h, unsigned int ring_size)
         s->misc.name = i ? "tbstream3" : "tbstream1";
         s->in_hopid = 8 + 2 * i; s->out_hopid = 9 + 2 * i;
         s->ring_size = ring_size; s->throttling = 8192;
-        s->cfg_rx_napi = -1; s->cfg_spin_us = -1; s->irq_cpu = -1;
+        s->cfg_rx_napi = -1; s->cfg_spin_us = -1; s->irq_cpu = -1; s->cfg_e2e = -1;
         mutex_init(&s->lock); mutex_init(&s->rx_lock);
     }
 }
@@ -198,6 +198,31 @@ static void spin_is_bounded_and_rearms(void)
     assert_nothing_held();
 }
 
+/* E2E is on unless turned off: the e2e parameter, overridden per stream by
+ * cfg_e2e, decides the flag of both rings at open. */
+static void e2e_setting_controls_both_rings(void)
+{
+    static const struct { bool param; int cfg; bool on; } cases[] = {
+        { true, -1, true }, { true, 0, false }, { false, -1, false }, { false, 1, true }, { true, 1, true },
+    };
+    struct host h;
+    struct tbstream_dev *s;
+
+    host_init(&h, 64);
+    s = &h.dev[0];
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        e2e = cases[i].param;
+        s->cfg_e2e = cases[i].cfg;
+        assert(start(s) == 0);
+        assert(!!(s->tx_ring.ring->flags & RING_FLAG_E2E) == cases[i].on);
+        assert(!!(s->rx_ring.ring->flags & RING_FLAG_E2E) == cases[i].on);
+        assert(s->tx_ring.ring->flags & RING_FLAG_FRAME && s->rx_ring.ring->flags & RING_FLAG_FRAME);
+        stop(s);
+    }
+    e2e = true;
+    assert_nothing_held();
+}
+
 /* irq_cpu pins the stream's vectors; the previous affinity comes back when
  * the stream stops (or its open fails), because the next ring reuses them. */
 static void irq_affinity_is_restored(void)
@@ -247,6 +272,7 @@ int main(int argc, char **argv)
         { "frame_arrays_use_kvcalloc", frame_arrays_use_kvcalloc },
         { "spin_without_device_mutex", spin_without_device_mutex },
         { "spin_is_bounded_and_rearms", spin_is_bounded_and_rearms },
+        { "e2e_setting_controls_both_rings", e2e_setting_controls_both_rings },
         { "irq_affinity_is_restored", irq_affinity_is_restored },
         { "detach_stops_open_ram_rings", detach_stops_open_ram_rings },
         { "reconnect_refuses_stale_endpoint", reconnect_refuses_stale_endpoint },
