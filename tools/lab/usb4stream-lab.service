@@ -1,0 +1,13 @@
+[Unit]
+Description=Prepare two USB4STREAM channels per BOSGAME USB4 port
+After=systemd-modules-load.service
+ConditionKernelVersion=7.3.0-rc5-strix-gpu-bosgame-20261014
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/setup-usb4stream-lab
+RemainAfterExit=yes
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target
