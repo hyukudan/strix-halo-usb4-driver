@@ -28,7 +28,8 @@ CASES = ('open_failure_is_not_sticky', 'frame_arrays_use_kvcalloc', 'spin_withou
          'stream_deref_under_lock',
          'resume_failure_fails_open_files',
          'early_rx_completion_is_kept',
-         'damaged_rx_frame_fails_stream')
+         'damaged_rx_frame_fails_stream',
+         'close_waits_for_tx_slot')
 STRUCTS = ('tbstream_frame', 'tbstream_ring', 'tbstream_dev', 'tbstream_group', 'tbstream')
 FUNCTIONS = ('tbstream_ring_free', 'tbstream_ring_available', 'tbstream_rx_start_poll',
              'tbstream_dev_napi_rx_locked', 'tbstream_dev_napi_rx', 'tbstream_dev_napi_spin',
@@ -71,7 +72,7 @@ class StreamHostPathTests(unittest.TestCase):
         text = source.read_text()
         enum = re.search(r'^enum tbstream_frame_pdf \{\n.*?^\};\n', text, re.MULTILINE | re.DOTALL).group(0)
         parts = ['#include "stream_harness.h"\n', enum,
-                 re.search(r'^#define TBSTREAM_DEV_MAX_OPEN_TIMEOUT_MS\t\d+\n', text, re.MULTILINE).group(0)]
+                 ''.join(re.findall(r'^#define TBSTREAM_DEV_[A-Z_]+\t+\d+\n', text, re.MULTILINE))]
         parts += [extract(text, 'struct', name) for name in STRUCTS]
         parts += [extract(text, 'function', name) for name in FUNCTIONS]
         parts.append('#include "stream_cases.h"\n')

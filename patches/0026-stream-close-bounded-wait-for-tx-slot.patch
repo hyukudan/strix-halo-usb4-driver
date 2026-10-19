@@ -1,0 +1,67 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -788,9 +788,18 @@ tbstream_dev_poll_ring(struct tbstream_dev *sdev, struct tbstream_ring *ring)
+ 		frame->callback(ring->ring, frame, false);
+ }
+ 
++#define TBSTREAM_DEV_CLOSE_WAIT_MS	500
++
++/*
++ * CLOSE tells the peer's reader that the stream ended (EOF). It needs a TX
++ * slot like data does: wait for one, at most TBSTREAM_DEV_CLOSE_WAIT_MS,
++ * then give up and report it. Called with sdev->lock held; TX completions
++ * do not take it.
++ */
+ static int tbstream_dev_send_close(struct tbstream_dev *sdev)
+ {
+ 	struct tbstream_frame *sf;
++	int ret;
+ 
+ 	if (!sdev->tx_ring.ring)
+ 		return -ENODEV;
+@@ -802,7 +811,7 @@ static int tbstream_dev_send_close(struct tbstream_dev *sdev)
+ 		 * ring is full at this point. Advance the ring here so
+ 		 * that there is room for the CLOSE packet to be sent.
+ 		 */
+-		ktime_t timeout = ktime_add_ms(ktime_get(), 500);
++		ktime_t timeout = ktime_add_ms(ktime_get(), TBSTREAM_DEV_CLOSE_WAIT_MS);
+ 
+ 		do {
+ 			if (tbstream_ring_available(&sdev->tx_ring))
+@@ -810,12 +819,22 @@ static int tbstream_dev_send_close(struct tbstream_dev *sdev)
+ 			tbstream_dev_poll_ring(sdev, &sdev->tx_ring);
+ 			fsleep(15);
+ 		} while (ktime_before(ktime_get(), timeout));
++	} else {
++		/* The TX completion of a DATA frame wakes sdev->wait */
++		wait_event_timeout(sdev->wait,
++				   tbstream_ring_available(&sdev->tx_ring),
++				   msecs_to_jiffies(TBSTREAM_DEV_CLOSE_WAIT_MS));
+ 	}
+ 
+ 	sf = tbstream_dev_alloc_tx(sdev, TBSTREAM_CLOSE, NULL, SZ_256);
+ 	if (IS_ERR(sf))
+-		return PTR_ERR(sf);
+-	return tb_ring_tx(sdev->tx_ring.ring, &sf->frame);
++		ret = PTR_ERR(sf);
++	else
++		ret = tb_ring_tx(sdev->tx_ring.ring, &sf->frame);
++	if (ret)
++		pr_warn_ratelimited("%s: CLOSE not sent (%d): the peer sees no EOF\n",
++				    sdev->misc.name, ret);
++	return ret;
+ }
+ 
+ static int tbstream_dev_start(struct tbstream_dev *sdev)
+@@ -1404,8 +1423,8 @@ static int tbstream_dev_fops_release(struct inode *inode, struct file *file)
+ 		} else {
+ 			/*
+ 			 * Send CLOSE tunneled packet to notify the other
+-			 * end that we are closing the file. We do this
+-			 * twice if the first one fails.
++			 * end that we are closing the file, waiting a
++			 * bounded time for a TX slot.
+ 			 */
+ 			tbstream_dev_send_close(sdev);
+ 			tbstream_dev_stop(sdev);
