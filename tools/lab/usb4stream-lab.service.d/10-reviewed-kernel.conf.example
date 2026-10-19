@@ -11,5 +11,7 @@
 ConditionKernelVersion=
 ConditionKernelVersion=7.3.0-rc5-strix-gpu-bosgame-*
 #
-# Stricter alternative: one reviewed build only (replace the line above).
-#ConditionKernelVersion=7.3.0-rc5-strix-gpu-bosgame-20261019det
+# Reviewed-build policy (recommended for an everyday kernel): generate the
+# drop-in for the exact release that passed review instead of editing this file:
+#   tools/lab/reviewed-kernel-dropin "$(make -s O=../build-usb4 kernelrelease)" \
+#       --output /etc/systemd/system/usb4stream-lab.service.d/10-reviewed-kernel.conf

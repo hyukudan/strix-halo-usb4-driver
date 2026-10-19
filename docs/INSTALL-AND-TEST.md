@@ -245,15 +245,16 @@ install -m 0755 tools/lab/setup-usb4stream-lab /usr/local/sbin/setup-usb4stream-
 install -m 0644 tools/lab/usb4stream-lab.service /etc/systemd/system/usb4stream-lab.service
 install -m 0644 tools/lab/usb4stream-describe-refresh.service /etc/systemd/system/
 install -m 0644 tools/lab/90-usb4stream-describe.rules /etc/udev/rules.d/   # optional
-# optional: restrict the profile to reviewed builds
-# install -D -m 0644 tools/lab/usb4stream-lab.service.d/10-reviewed-kernel.conf.example \
-#     /etc/systemd/system/usb4stream-lab.service.d/10-reviewed-kernel.conf
+# reviewed-build policy: the lab profile starts only on the exact release that
+# passed review (the unit alone accepts any 7.3.0-rc5-strix-gpu-bosgame-* build)
+tools/lab/reviewed-kernel-dropin "$(make -s -C ../linux-pinned O=../build-usb4 kernelrelease)" \
+    --output /etc/systemd/system/usb4stream-lab.service.d/10-reviewed-kernel.conf
 systemctl daemon-reload
 udevadm control --reload
 systemctl enable usb4stream-lab.service
 systemctl is-enabled usb4stream-lab.service    # must print "enabled"
 systemctl restart usb4stream-lab.service       # stop stream users first
-systemctl show -p ConditionResult usb4stream-lab.service   # "yes" on a lab kernel
+systemctl show -p ConditionResult usb4stream-lab.service   # "yes" on the reviewed kernel
 usb4stream-describe --summary
 python3 tools/usb4_diagnose.py --require-budget > /dev/null
 ```
