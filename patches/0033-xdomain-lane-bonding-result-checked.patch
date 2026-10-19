@@ -1,0 +1,61 @@
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -24,6 +24,8 @@
+ #define XDOMAIN_DEFAULT_TIMEOUT			1000	/* ms */
+ #define XDOMAIN_BONDING_TIMEOUT			10000	/* ms */
+ #define XDOMAIN_RETRIES				10
++/* Each attempt may wait XDOMAIN_BONDING_TIMEOUT for the link width */
++#define XDOMAIN_BONDING_RETRIES			2
+ #define XDOMAIN_DEFAULT_MAX_HOPID		15
+ 
+ enum {
+@@ -1472,6 +1474,26 @@ static int tb_xdomain_link_state_change(struct tb_xdomain *xd,
+ 	return 0;
+ }
+ 
++/*
++ * Lower UUID side: bond the lanes. A failure is retried a bounded number of
++ * times (lane 1 may come up late), then reported; enumeration continues
++ * unbonded either way. Returns -EAGAIN to run the state again.
++ */
++static int tb_xdomain_bond_lanes_uuid_low(struct tb_xdomain *xd)
++{
++	int ret;
++
++	ret = tb_xdomain_lane_bonding_enable(xd);
++	if (!ret)
++		return 0;
++	/* No second lane adapter: nothing a retry can change */
++	if (ret != -ENODEV && xd->state_retries-- > 0) {
++		dev_info(&xd->dev, "lane bonding failed (%d), retrying\n", ret);
++		return -EAGAIN;
++	}
++	return ret == -EAGAIN ? -ETIMEDOUT : ret;
++}
++
+ static int tb_xdomain_bond_lanes_uuid_high(struct tb_xdomain *xd)
+ {
+ 	unsigned int width, width_mask;
+@@ -1690,7 +1712,7 @@ static void tb_xdomain_queue_bonding(struct tb_xdomain *xd)
+ static void tb_xdomain_queue_bonding_uuid_low(struct tb_xdomain *xd)
+ {
+ 	xd->state = XDOMAIN_STATE_BONDING_UUID_LOW;
+-	xd->state_retries = XDOMAIN_RETRIES;
++	xd->state_retries = XDOMAIN_BONDING_RETRIES;
+ 	queue_delayed_work(xd->tb->wq, &xd->state_work,
+ 			   msecs_to_jiffies(XDOMAIN_DEFAULT_TIMEOUT));
+ }
+@@ -1809,7 +1831,11 @@ static void tb_xdomain_state_work(struct work_struct *work)
+ 		break;
+ 
+ 	case XDOMAIN_STATE_BONDING_UUID_LOW:
+-		tb_xdomain_lane_bonding_enable(xd);
++		ret = tb_xdomain_bond_lanes_uuid_low(xd);
++		if (ret == -EAGAIN)
++			goto retry_state;
++		if (ret)
++			tb_xdomain_bonding_failed(xd, ret);
+ 		tb_xdomain_queue_properties(xd);
+ 		break;
+ 
