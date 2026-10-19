@@ -81,6 +81,9 @@ static bool mod_delayed_work(struct workqueue_struct *wq, struct delayed_work *w
     queue_delayed_work(wq, w, delay);
     return was;
 }
+static bool delayed_work_pending(struct delayed_work *w) { return w->pending; }
+static unsigned cancels;
+static bool cancel_delayed_work_sync(struct delayed_work *w) { bool was = w->pending; w->pending = false; ++cancels; return was; }
 /* Runs the work once if it is queued; returns whether it ran. */
 static bool run_delayed(struct delayed_work *w)
 {
@@ -106,11 +109,12 @@ struct list_head { struct list_head *next, *prev; };
 static void INIT_LIST_HEAD(struct list_head *l) { l->next=l->prev=l; }
 static bool list_empty(const struct list_head *l) { return l->next==l; }
 struct pci_dev;
-struct device { bool registered, pci; struct pci_dev *pdev; };
+struct device { bool registered, pci; struct pci_dev *pdev; void *drvdata; };
+static void *dev_get_drvdata(const struct device *d) { return d->drvdata; }
 struct pci_dev { unsigned vendor, device; bool present, master, master_stuck, config_fail, relaxed, devctl_fail; struct device dev; };
 struct tb_nhi;
 struct tb_ring { spinlock_t lock; struct tb_nhi *nhi; bool is_tx, running; unsigned hop; struct list_head queue, in_flight; };
-struct tb_nhi { spinlock_t lock; struct device *dev; struct tb_ring *tx_rings[8], *rx_rings[8]; bool going_away, dma_resetting, dma_shutdown; unsigned dma_retained; bool dma_revoked, dma_abandoned; unsigned hop_count; unsigned char *iobase; };
+struct tb_nhi { spinlock_t lock; struct device *dev; struct tb_ring *tx_rings[8], *rx_rings[8]; bool going_away, dma_resetting, dma_shutdown; unsigned dma_retained; bool dma_revoked, dma_abandoned, teardown_reset_pending, teardown_reset_parked; unsigned hop_count; unsigned char *iobase; };
 struct tb_ctl { struct tb_nhi *nhi; };
 struct tb;
 struct tb_cm_ops { int (*dma_paths_busy)(struct tb *, int, int); };

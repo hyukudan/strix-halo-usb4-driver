@@ -25,3 +25,4 @@
 0026-stream-close-bounded-wait-for-tx-slot.patch
 0027-stream-partial-io-accounting.patch
 0028-stream-close-does-not-flush-rx.patch
+0029-amd-teardown-reset-pending-until-idle.patch

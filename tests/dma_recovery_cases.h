@@ -113,6 +113,10 @@ int main(int argc,char **argv) {
     else if (!strcmp(argv[1], "teardown_reset_gated")) test_teardown_reset_gated();
     else if (!strcmp(argv[1], "teardown_reset_failure")) test_teardown_reset_failure();
     else if (!strcmp(argv[1], "teardown_reset_budget_restarts")) test_teardown_reset_budget_restarts();
+    else if (!strcmp(argv[1], "teardown_reset_pending_until_owner_leaves")) test_teardown_reset_pending_until_owner_leaves();
+    else if (!strcmp(argv[1], "teardown_reset_rechecks_before_reset")) test_teardown_reset_rechecks_before_reset();
+    else if (!strcmp(argv[1], "teardown_reset_pending_at_removal")) test_teardown_reset_pending_at_removal();
+    else if (!strcmp(argv[1], "teardown_reset_pending_across_suspend")) test_teardown_reset_pending_across_suspend();
     else return 2;
     printf("PASS %s\n",argv[1]);return 0;
 }

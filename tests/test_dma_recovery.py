@@ -12,7 +12,9 @@ SOURCE = Path(os.environ.get('USB4_SOURCE_TREE', ROOT / 'audited-overlay'))
 CASES = ('admission', 'reset_success', 'unsupported', 'reset_failure', 'control_failure', 'inventory_veto', 'inventory_query', 'group_inventory', 'group_reset', 'core_notifier', 'teardown_revoke',
          'teardown_reset_idle', 'teardown_reset_other_stream', 'teardown_reset_waits_for_owner',
          'teardown_reset_lock_busy', 'teardown_reset_tunnel_veto', 'teardown_reset_gated',
-         'teardown_reset_failure', 'teardown_reset_budget_restarts')
+         'teardown_reset_failure', 'teardown_reset_budget_restarts',
+         'teardown_reset_pending_until_owner_leaves', 'teardown_reset_rechecks_before_reset',
+         'teardown_reset_pending_at_removal', 'teardown_reset_pending_across_suspend')
 
 class DmaRecoveryTests(unittest.TestCase):
     @classmethod
