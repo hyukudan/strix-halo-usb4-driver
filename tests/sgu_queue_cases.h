@@ -341,6 +341,7 @@ static void test_max_queue_reuse(void) {
 #include "sgu_detached_cases.h"
 
 #include "sgu_group_cases.h"
+#include "sgu_teardown_cases.h"
 
 int main(int argc,char **argv) {
     assert(argc==2);
@@ -356,6 +357,9 @@ int main(int argc,char **argv) {
         {"domain_retirement_keeps_unproved_dma",test_domain_retirement_keeps_unproved_dma},
         {"domain_retirement_foreign_domain",test_domain_retirement_foreign_domain},
         {"domain_retirement_concurrent_poll",test_domain_retirement_concurrent_poll},
+        {"domain_revoked_releases_retained",test_domain_revoked_releases_retained},
+        {"domain_abandoned_leaks_safely",test_domain_abandoned_leaks_safely},
+        {"orphan_reaping_after_rmdir",test_orphan_reaping_after_rmdir},
         {"watchdog_mutex_independence",test_watchdog_mutex_independence},
         {"fence_precedes_event",test_fence_precedes_event},
         {"stop_before_publication",test_stop_before_publication},
