@@ -7,7 +7,9 @@ static void reset_model(void)
     last_info[0] = last_warn[0] = 0;
     bonding_calls = switch_resets = port_resets = 0;
     memset(bonding_results, 0, sizeof(bonding_results));
-    switch_reset_ret = port_read_ret = sb_read_ret = port_reset_ret = paths_busy = 0;
+    switch_reset_ret = port_read_ret = sb_read_ret = port_reset_ret = tunnels = 0;
+    gen_reads = port_reads = sb_reads = 0;
+    exclusive = false;
     link_gen = 2;
     cs0 = 0xc << 16;    /* supports Gen2 and Gen3 */
     cs1 = 0xc;          /* targets Gen3 */
@@ -89,6 +91,7 @@ static void link_fixture(struct tb *tb, struct tb_nhi *nhi, struct tb_port *port
     assert(!pthread_mutex_init(&tb->lock.m, NULL));
     tb->cm_ops = &cm_ops;
     tb->nhi = nhi;
+    link_tb = tb;
     *port = (struct tb_port){ .cap_usb4 = 0x30, .cap_phy = 0x10 };
     *xd = (struct tb_xdomain){ .tb = tb, .port = port };
 }
@@ -102,10 +105,11 @@ static void gen3_retrain_policy(void)
     struct tb_port port;
     struct tb_xdomain xd;
 
-    /* Off by default: nothing read, nothing reset. */
+    /* Off by default: no register or sideband access at all. */
     reset_model();
     link_fixture(&tb, &nhi, &port, &xd);
     assert(!tb_xdomain_maybe_retrain_gen3(&xd) && !port_resets && !infos && !warns);
+    assert(!gen_reads && !port_reads && !sb_reads);
 
     /* On, everything advertises Gen3: one reset, the handshake restarts. */
     gen3_retrain = 2;
@@ -134,17 +138,27 @@ static void gen3_retrain_policy(void)
     assert(!tb_xdomain_maybe_retrain_gen3(&xd) && !port_resets);
     cs1 = 0xc;
 
-    /* Never with traffic: a DMA tunnel, a data ring, or the lock taken. */
-    paths_busy = 1;
-    assert(!tb_xdomain_maybe_retrain_gen3(&xd) && !port_resets && strstr(last_info, "in use, not retraining"));
-    paths_busy = 0;
-    rings_idle = false;
+    /* Never with traffic: any tunnel (or a CM that cannot tell), a data
+     * ring, or the domain lock taken. */
+    tunnels = 1;
+    assert(!tb_xdomain_maybe_retrain_gen3(&xd) && !port_resets && strstr(last_info, "tunnels in the domain"));
+    tunnels = -ENODEV;
     assert(!tb_xdomain_maybe_retrain_gen3(&xd) && !port_resets);
+    tunnels = 0;
+    tb.cm_ops = &(const struct tb_cm_ops){ 0 };
+    assert(!tb_xdomain_maybe_retrain_gen3(&xd) && !port_resets);
+    tb.cm_ops = &cm_ops;
+    rings_idle = false; /* a ring allocated by another user before the admission */
+    assert(!tb_xdomain_maybe_retrain_gen3(&xd) && !port_resets && strstr(last_info, "rings in use (-16)"));
+    assert(!exclusive);
     rings_idle = true;
+    /* Domain lock busy: not even the port or the sideband mailbox is read. */
+    gen_reads = port_reads = sb_reads = 0;
     assert(!pthread_mutex_lock(&tb.lock.m));
     assert(!tb_xdomain_maybe_retrain_gen3(&xd) && !port_resets && strstr(last_info, "domain lock busy"));
+    assert(!gen_reads && !port_reads && !sb_reads);
     mutex_unlock(&tb.lock);
-    assert(!port.gen3_retrains && mutex_is_free(&tb.lock));
+    assert(!port.gen3_retrains && mutex_is_free(&tb.lock) && !exclusive);
 
     /* Bounded: two resets, then one warning, then silence. */
     assert(tb_xdomain_maybe_retrain_gen3(&xd) == -ECONNRESET);
@@ -163,6 +177,7 @@ static void gen3_retrain_policy(void)
     port_reset_ret = -EIO;
     assert(!tb_xdomain_maybe_retrain_gen3(&xd) && port_resets == 3);
     assert(strstr(last_warn, "port reset for a Gen3 retrain failed (-5)") && mutex_is_free(&tb.lock));
+    assert(!exclusive); /* data rings are allowed again after the reset */
 
     /* The parameter is capped. */
     reset_model();

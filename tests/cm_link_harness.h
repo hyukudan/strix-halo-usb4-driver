@@ -41,6 +41,7 @@ static bool mutex_is_free(struct mutex *m)
     pthread_mutex_unlock(&m->m);
     return true;
 }
+#define lockdep_assert_held(m) assert(!mutex_is_free(m))
 
 /* Log lines */
 static int infos, warns;
@@ -53,7 +54,7 @@ struct device { int unused; };
 struct tb_port { int cap_usb4, cap_phy; unsigned int gen3_retrains; };
 struct tb_nhi { int unused; };
 struct tb;
-struct tb_cm_ops { int (*dma_paths_busy)(struct tb *tb, int transmit_ring, int receive_ring); };
+struct tb_cm_ops { int (*tunnels_active)(struct tb *tb); };
 struct tb_switch { bool usb4; unsigned int version; };
 struct tb {
     struct mutex lock;
@@ -78,15 +79,25 @@ static bool tb_switch_is_usb4(const struct tb_switch *sw) { return sw->usb4; }
 static unsigned int usb4_switch_version(const struct tb_switch *sw) { return sw->version; }
 static int tb_switch_reset(struct tb_switch *sw) { (void)sw; ++switch_resets; return switch_reset_ret; }
 
-/* E3: the local port as the registers report it */
+/* E3: the local port as the registers report it. The domain lock of the
+ * fixture (link_tb) serializes the sideband mailbox, the tunnel inventory
+ * and the reset; the mocks check it is held. */
 static unsigned int gen3_retrain;
-static int link_gen = 2, port_read_ret, sb_read_ret, port_reset_ret, port_resets, paths_busy;
+static int link_gen = 2, port_read_ret, sb_read_ret, port_reset_ret, port_resets, tunnels;
+static int gen_reads, port_reads, sb_reads;
 static u32 cs0 = 0xc << 16, cs1 = 0xc, link_conf = 0xf300;
-static bool rings_idle = true;
+static bool rings_idle = true, exclusive;
+static struct tb *link_tb;
 static struct tb_port *tb_xdomain_downstream_port(struct tb_xdomain *xd) { return xd->port; }
-static int tb_port_get_link_generation(struct tb_port *port) { (void)port; return link_gen; }
+static int tb_port_get_link_generation(struct tb_port *port)
+{
+    (void)port;
+    ++gen_reads;
+    return link_gen;
+}
 static int tb_port_read(struct tb_port *port, void *buf, enum tb_cfg_space space, u32 offset, u32 length)
 {
+    ++port_reads;
     assert(space == TB_CFG_PORT && length == 1);
     if (port_read_ret)
         return port_read_ret;
@@ -101,19 +112,43 @@ static int tb_port_read(struct tb_port *port, void *buf, enum tb_cfg_space space
 static int usb4_port_sb_read(struct tb_port *port, enum usb4_sb_target target, u8 index, u8 reg, void *buf, u8 size)
 {
     (void)port;
+    ++sb_reads;
+    assert(!mutex_is_free(&link_tb->lock)); /* the shared mailbox, as debugfs */
     assert(target == USB4_SB_TARGET_ROUTER && !index && reg == USB4_SB_LINK_CONF && size == 3);
     if (sb_read_ret)
         return sb_read_ret;
     memcpy(buf, &link_conf, 3);
     return 0;
 }
-static int usb4_port_reset(struct tb_port *port) { (void)port; ++port_resets; return port_reset_ret; }
-static bool tb_nhi_data_rings_idle(struct tb_nhi *nhi) { (void)nhi; return rings_idle; }
-static int cm_dma_paths_busy(struct tb *tb, int t, int r)
+/* Ring allocation/start, as nhi.c gates it: refused while the NHI is held
+ * exclusive (dma_resetting). Another user trying it during the reset. */
+static bool ring_alloc_allowed(void) { return !exclusive; }
+static int usb4_port_reset(struct tb_port *port)
 {
-    (void)tb;
-    assert(t == -1 && r == -1);
-    assert(!mutex_is_free(&tb->lock)); /* queried under the domain lock */
-    return paths_busy;
+    (void)port;
+    ++port_resets;
+    assert(!mutex_is_free(&link_tb->lock));
+    assert(!ring_alloc_allowed()); /* no ring can appear until the reset is done */
+    return port_reset_ret;
 }
-static const struct tb_cm_ops cm_ops = { .dma_paths_busy = cm_dma_paths_busy };
+static int tb_nhi_dma_exclusive_begin(struct tb_nhi *nhi)
+{
+    (void)nhi;
+    assert(!exclusive);
+    if (!rings_idle)
+        return -EBUSY;
+    exclusive = true;
+    return 0;
+}
+static void tb_nhi_dma_exclusive_end(struct tb_nhi *nhi)
+{
+    (void)nhi;
+    assert(exclusive);
+    exclusive = false;
+}
+static int cm_tunnels_active(struct tb *tb)
+{
+    assert(!mutex_is_free(&tb->lock)); /* the CM inventory, under the domain lock */
+    return tunnels;
+}
+static const struct tb_cm_ops cm_ops = { .tunnels_active = cm_tunnels_active };

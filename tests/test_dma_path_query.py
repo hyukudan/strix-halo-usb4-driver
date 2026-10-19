@@ -7,7 +7,7 @@ import tempfile
 import unittest
 ROOT=Path(__file__).resolve().parent
 SOURCE=Path(os.environ['USB4_SOURCE_TREE'])
-CASES=('filters','list')
+CASES=('filters','list','any_tunnel')
 class PathQueryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
