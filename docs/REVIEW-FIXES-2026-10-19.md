@@ -67,8 +67,11 @@ reaped any more either.
 
 **Trade-off.** Freeing memory that a controller might still write corrupts
 whatever reuses it; leaking it costs memory until reboot. The series keeps the
-leak. A reboot or unbind now always completes; at worst it logs that a domain
-or GPU memory was abandoned.
+leak. A reboot or unbind no longer waits forever for a retained domain; at
+worst it logs that a domain or GPU memory was abandoned. This bounds the wait
+for the domain only. Earlier steps (locks, CM stop, cancellations,
+`flush_workqueue()`) are not bounded, and 0013 alone still left the failed-probe
+wait unbounded (fixed in 0017).
 
 **rmdir.** Removing the configfs item first tries to reap a quarantined
 context (no open FD). If it stays quarantined, the kernel logs it and
@@ -124,12 +127,22 @@ fixed here; what the code shows:
   its software HopIDs are freed, but nothing resets a router hop that did not
   drain. The stream's HopIDs are fixed by configfs, so every retry programs the
   same stuck hop entries and fails the same way.
-- Only a host router reset clears that state: reloading `thunderbolt` with
-  `host_reset=Y` (HRR at probe) or a reboot. The explicit DMA interface reset
-  (`gpu_recover reset`, `SGU_IOC_RESET[_GROUP]`) resets the NHI DMA engine, not
-  the router hop tables, so it is not expected to help. 0001 removed the
-  automatic AMD teardown reset (review H-0b), which is the class of hang its
-  quirk described.
+- **Correction (0017).** An earlier version of this section said that
+  reloading `thunderbolt` with `host_reset=Y` performs a host router reset
+  (HRR) at probe. It does not on these machines. `nhi_reset()` writes HRR only
+  when the NHI version in `REG_CAPS[23:16]` is at least `0x40`, and these AMD
+  NHIs report `REG_CAPS = 3` (version 0, three hops). `host_reset=Y` is the
+  default anyway, and the probe skipped every reset. Since 0017, `host_reset=Y`
+  makes the quirked AMD v1 NHIs (including Strix Halo `0x158d`/`0x158e`) get a
+  **host interface reset** at probe instead. That resets ring registers and
+  E2E state, not the router or its hop tables. In this tree the only reset that
+  is certain to clear router hop state is a **reboot** (cold boot or power
+  cycle). A PCI ACPI reset did not recover the NHI1 of cluster1 on 2026-10-19
+  (see [DETACH-FIXES-2026-10-19.md](DETACH-FIXES-2026-10-19.md)).
+- The explicit DMA interface reset (`gpu_recover reset`,
+  `SGU_IOC_RESET[_GROUP]`) resets the NHI DMA engine, not the router hop
+  tables, so it is not expected to help either. 0001 removed the automatic AMD
+  teardown reset (review H-0b), which is the class of hang its quirk described.
 - To confirm on the node: whether the timed-out config reads target route 0
   (the host router) and which hop index fails, with
   `echo 'file path.c +p; file ctl.c +p' > /sys/kernel/debug/dynamic_debug/control`.
@@ -218,7 +231,7 @@ Run on both nodes, one at a time, with the current kernel kept as the default
 boot entry. Prefer a build with `CONFIG_KASAN=y`, `CONFIG_PROVE_LOCKING=y` and
 `CONFIG_FAIL_PAGE_ALLOC=y` for the first pass; then the production config.
 
-1. **Build and boot (not default).** Apply `patches/series` (0001–0016) plus
+1. **Build and boot (not default).** Apply `patches/series` (0001–0016, and 0017 from [DETACH-FIXES-2026-10-19.md](DETACH-FIXES-2026-10-19.md)) plus
    `patches/kernel-backports/`, build with a distinct `LOCALVERSION`, boot it
    once via a one-time boot entry. Check `dmesg` is free of warnings, KASAN and
    lockdep reports after the links come up (Gen3 × 2).
@@ -256,6 +269,7 @@ boot entry. Prefer a build with `CONFIG_KASAN=y`, `CONFIG_PROVE_LOCKING=y` and
    engine runner does not yet). Run the duplex test with it, then once with
    the RX sequence deliberately off by one: EVENT must report
    `SGU_EVENT_FAILED` with frame error 128 and `dmesg` the mismatch.
-8. **NHI0 of cluster1.** Before any of the above, recover it (reload
-   `thunderbolt` with `host_reset=Y`, or reboot) and capture the dynamic-debug
-   output described in 0014 if `-110` returns.
+8. **NHI0 of cluster1.** Before any of the above, recover it with a reboot.
+   Reloading with `host_reset=Y` does not run HRR on these v1 NHIs (see the
+   correction under 0014). If `-110` returns, capture the dynamic-debug
+   output described in 0014.
