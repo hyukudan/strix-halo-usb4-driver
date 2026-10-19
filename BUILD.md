@@ -105,13 +105,14 @@ make O=../build-usb4 -j8 drivers/thunderbolt/thunderbolt.ko \
     drivers/net/thunderbolt/thunderbolt_net.ko
 ```
 
-The CI workflow builds and links every USB4 consumer (`thunderbolt.ko`,
-`thunderbolt_stream.ko`, `thunderbolt_net.ko`, through `modules_prepare` and
-modpost) with GPU mode enabled and disabled, fails on any warning that `W=1`
-reports in this series' files, and compiles the engine's HIP target when the
-runner has ROCm. It is not a full `vmlinux` build of the target configuration
-or a hardware qualification; `tools/validate_native.py --execute` is the full
-offline build.
+The CI workflow builds `vmlinux` and all modules of a `defconfig` plus the
+fragment, so modpost links every USB4 consumer (`thunderbolt.ko`,
+`thunderbolt_stream.ko`, `thunderbolt_net.ko`) with GPU mode enabled and
+disabled, and fails on any diagnostic that `W=1` reports in this series' files.
+On every push and PR it also builds the engine's HIP target in a ROCm container
+at the engine commit pinned in `provenance/software-validation.json`. It is not
+the target's boot configuration or a hardware qualification;
+`tools/validate_native.py --execute` is the full offline build.
 
 GPU mode remains explicitly experimental. Controller completion alone does not
 establish GPU visibility or remote application acknowledgment. Do not unload or

@@ -353,7 +353,7 @@ Before these fixes the series could not be built:
 | Live session recovery (`--recover-every 4`) | ✅ 3 recoveries with fresh epochs, all windows verified |
 | Controller group reset (`--controller-reset`) | ✅ 3 real controller resets per side during a duplex session, all windows verified |
 | Cooperative USB4NET reset (`--include-network`) | ✅ 3 resets with USB4NET up on the same controller; ~11 of 146 pings lost during resets, interface restored automatically |
-| GitHub Actions | `unit` (offline and tools tests) and `kernel-modules` (full `vmlinux modules` link with modpost, GPU on and off, diagnostics in this series' files fatal); the manual `hip-integration` job builds the engine's HIP target in a ROCm container. Earlier `kernel-objects` runs compiled selected objects only ([first green run](https://github.com/hyukudan/strix-halo-usb4-driver/actions/runs/39063359195)) |
+| GitHub Actions | `unit` (offline and tools tests) and `kernel-modules` (full `vmlinux modules` link with modpost, GPU on and off, diagnostics in this series' files fatal); `hip-integration` builds the engine's HIP target in a ROCm container on every push and PR, at the engine commit pinned in `provenance/software-validation.json` (it fails until that commit is published). None of the three jobs has run on GitHub with these changes yet. Earlier `kernel-objects` runs compiled selected objects only ([first green run](https://github.com/hyukudan/strix-halo-usb4-driver/actions/runs/39063359195)) |
 | Installed as default kernel, long-running and model-level qualification | ❌ pending |
 
 Receipts of the GPU campaigns are kept on the machines, outside Git
