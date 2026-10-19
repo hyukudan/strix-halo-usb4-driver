@@ -130,7 +130,18 @@ static void mutex_init(struct mutex *m) { assert(!pthread_mutex_init(&m->m,NULL)
 static void mutex_lock(struct mutex *m) { assert(!pthread_mutex_lock(&m->m)); }
 static int mutex_lock_interruptible(struct mutex *m) { mutex_lock(m); return 0; }
 static void mutex_unlock(struct mutex *m) { assert(!pthread_mutex_unlock(&m->m)); }
-static bool mutex_trylock(struct mutex *m) { return !pthread_mutex_trylock(&m->m); }
+/* Fault injection: the trylock of trylock_fail fails once, after
+ * trylock_fail_skip successful ones (a holder appearing in between). */
+static struct mutex *trylock_fail;
+static int trylock_fail_skip;
+static bool mutex_trylock(struct mutex *m)
+{
+    if (m == trylock_fail && trylock_fail_skip-- == 0) {
+        trylock_fail = NULL;
+        return false;
+    }
+    return !pthread_mutex_trylock(&m->m);
+}
 typedef struct mutex spinlock_t;
 #define spin_lock_init mutex_init
 #define spin_lock_irqsave(l,f) do { (f)=0; mutex_lock(l); } while (0)
