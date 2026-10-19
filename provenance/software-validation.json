@@ -28,7 +28,7 @@
     "include/linux/thunderbolt.h": "b9bcd4d0d296fe08b2a447eee528d22f32016624b0cdba9ba92eac5f39b06629",
     "include/uapi/linux/strix_gpu_stream.h": "c0cb80b93f9b4471e7304f840e3b0da44593040df57d11d17d74da695cb6f5bf"
   },
-  "engine_commit": "56d4dae87cbb37c15258b347c55b68ab2b10620d",
+  "engine_commit": "dee0e762936c74a90245ca963eeca6d9552daf57",
   "engine_files_sha256": {
     "include/strix/linux_direct_gpu_stream_uapi.h": "c0cb80b93f9b4471e7304f840e3b0da44593040df57d11d17d74da695cb6f5bf",
     "src/linux_gpu_queue.cpp": "d930225f70bd49d9399a3fa483b0f2579ea0750cb9b59936e0147be03aed6517",
