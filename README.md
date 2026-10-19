@@ -133,6 +133,19 @@ After moving a cable, re-check the pairing from `/run/usb4stream-layout.json`
 and the endpoint UUIDs instead of assuming it. The one port that once trained
 at Gen2 did so regardless of which cable was plugged into it.
 
+The layout file is written by the lab service
+([`tools/lab/`](tools/lab/), see [docs/INSTALL-AND-TEST.md](docs/INSTALL-AND-TEST.md#5-lab-streams-and-the-layout-file)).
+Since version 2 every `<service>/<stream>` entry keeps its `device` and
+`configfs` keys and adds the local controller (PCI address, domain, USB4
+port), the per-direction link speed and lanes, the remote host (name, UUID,
+route), the hop IDs and whether the stream is openable; a `topology` section
+groups the streams by cable. `usb4stream-describe` regenerates the same report
+read-only at any time, and `--merge` combines the reports of both hosts into
+the cable pairing (straight or crossed) and the `tbstreamN` pairs. Domain
+numbers, and therefore the `D-R.S` service names, are assigned at probe time:
+if one controller fails to probe, the other one becomes domain 0 and the
+`tbstreamN` pairing changes. Rely on the topology, not on fixed indexes.
+
 Each controller exposes three ring pairs. Ring 0 carries the control channel,
 so each cable has **two data ring pairs**: four USB4STREAM devices per machine
 (`/dev/tbstream0..3`).
@@ -495,7 +508,9 @@ Module parameters:
 both data ring pairs remain available to USB4STREAM. With it loaded, one stream
 per controller is lost.
 
-Diagnostics: `python3 tools/usb4_diagnose.py --logs` on both hosts.
+Diagnostics: `python3 tools/usb4_diagnose.py --logs` on both hosts;
+`python3 tools/lab/usb4stream_describe.py --logs --summary` for the cable
+topology.
 
 ## Deployment and safety
 
@@ -540,6 +555,7 @@ Diagnostics: `python3 tools/usb4_diagnose.py --logs` on both hosts.
 | `provenance/` | Source manifests, pinned hashes, reference patches |
 | `config/usb4-gpu.fragment` | Kconfig options needed by the driver |
 | `tools/` | `prepare_overlay.py`, `validate_native.py`, `usb4_diagnose.py`, `pingpong.c` (latency benchmark) |
+| `tools/lab/` | Lab stream setup (`setup-usb4stream-lab`, `usb4stream-lab.service`) and the read-only topology report `usb4stream_describe.py` (`usb4stream-describe`) |
 | `tests/` | Offline regression tests |
 | `docs/` | Design and audit reports per patch level |
 
