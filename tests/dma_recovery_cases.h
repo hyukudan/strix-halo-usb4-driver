@@ -117,6 +117,8 @@ int main(int argc,char **argv) {
     else if (!strcmp(argv[1], "teardown_reset_rechecks_before_reset")) test_teardown_reset_rechecks_before_reset();
     else if (!strcmp(argv[1], "teardown_reset_pending_at_removal")) test_teardown_reset_pending_at_removal();
     else if (!strcmp(argv[1], "teardown_reset_pending_across_suspend")) test_teardown_reset_pending_across_suspend();
+    else if (!strcmp(argv[1], "teardown_reset_request_during_reset")) test_teardown_reset_request_during_reset();
+    else if (!strcmp(argv[1], "teardown_reset_ring_freed_during_attempt")) test_teardown_reset_ring_freed_during_attempt();
     else return 2;
     printf("PASS %s\n",argv[1]);return 0;
 }
