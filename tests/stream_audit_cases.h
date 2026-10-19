@@ -285,3 +285,93 @@ static void close_waits_for_tx_slot(void)
 }
 
 struct zero_io { struct endpoint *e; int write; atomic_bool done; ssize_t ret; };
+static void *zero_io_thread(void *data)
+{
+    struct zero_io *z = data;
+    unsigned char b[1];
+
+    z->ret = z->write ? file_write(z->e, b, 0) : file_read(z->e, b, 0);
+    atomic_store(&z->done, true);
+    return NULL;
+}
+
+/* Runs a blocking zero-length read/write; it must return 0 at once even
+ * with nothing to read or no TX slot. Before, it slept for data. */
+static void zero_length_returns_at_once(struct endpoint *e, int write)
+{
+    struct zero_io z = { .e = e, .write = write };
+    pthread_t thread;
+
+    assert(!pthread_create(&thread, NULL, zero_io_thread, &z));
+    for (int i = 0; i < 200 && !atomic_load(&z.done); ++i)
+        usleep(1000);
+    if (!atomic_load(&z.done)) {
+        fprintf(stderr, "zero-length %s blocked\n", write ? "write" : "read");
+        abort();
+    }
+    assert(!pthread_join(thread, NULL) && z.ret == 0);
+}
+
+/* A8: read/write returned an error after already moving bytes (the caller
+ * then lost them), a partial copy was not accounted, and a zero-length read
+ * or write could block. */
+static void partial_io_is_accounted(void)
+{
+    struct endpoint e;
+    static unsigned char buf[2 * TB_MAX_FRAME_SIZE];
+    int frames;
+
+    endpoint_init(&e, 1);
+    assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+    zero_length_returns_at_once(&e, 0);
+    e.file.f_flags = O_NONBLOCK;
+
+    /* Read: the buffer faults 10 bytes into the second frame. The 74 bytes
+     * delivered are reported; the rest of that frame comes next time. */
+    complete_rx(e.dev.rx_ring.ring, 64);
+    complete_rx(e.dev.rx_ring.ring, 64);
+    iov_budget = 64 + 10;
+    assert(file_read(&e, buf, sizeof(buf)) == 74);
+    iov_budget = -1;
+    assert(file_read(&e, buf, sizeof(buf)) == 54);
+    /* A fault before any byte is an error, and the frame stays. */
+    complete_rx(e.dev.rx_ring.ring, 64);
+    iov_budget = 0;
+    assert(file_read(&e, buf, sizeof(buf)) == -EFAULT);
+    iov_budget = -1;
+    assert(file_read(&e, buf, sizeof(buf)) == 64);
+
+    /* Write: the source faults inside the second frame; only the first is
+     * sent and reported, the iterator gives the rest back. */
+    frames = atomic_load(&tx_frames);
+    iov_budget = TB_MAX_FRAME_SIZE + 10;
+    assert(file_write(&e, buf, 2 * TB_MAX_FRAME_SIZE) == TB_MAX_FRAME_SIZE);
+    iov_budget = -1;
+    assert(atomic_load(&tx_frames) == frames + 1);
+    /* The iterator moved exactly as far as reported. */
+    {
+        struct kiocb k = { &e.file, 0 };
+        struct iov_iter it = { buf, 2 * TB_MAX_FRAME_SIZE };
+
+        iov_budget = TB_MAX_FRAME_SIZE + 10;
+        assert(tbstream_dev_fops_write_iter(&k, &it) == TB_MAX_FRAME_SIZE);
+        iov_budget = -1;
+        assert(it.count == TB_MAX_FRAME_SIZE && it.buf == buf + TB_MAX_FRAME_SIZE);
+    }
+    /* The ring refuses the second frame: the first is still reported. */
+    tx_fail_after = 1;
+    assert(file_write(&e, buf, 2 * TB_MAX_FRAME_SIZE) == TB_MAX_FRAME_SIZE);
+    assert(tx_fail_after == -1);
+    /* ... and a refusal before any byte is the error itself. */
+    tx_fail_after = 0;
+    assert(file_write(&e, buf, 64) == -ESHUTDOWN);
+
+    /* Zero-length write with the TX ring full. */
+    while (tbstream_ring_available(&e.dev.tx_ring))
+        assert(file_write(&e, buf, 64) == 64);
+    e.file.f_flags = 0;
+    zero_length_returns_at_once(&e, 1);
+    assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+    assert_nothing_held();
+    unplug_and_remove(&e, 0);
+}

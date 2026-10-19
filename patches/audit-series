@@ -23,3 +23,4 @@
 0024-dma-revoke-proves-relaxed-ordering-off.patch
 0025-stream-damaged-rx-frame-fails-read.patch
 0026-stream-close-bounded-wait-for-tx-slot.patch
+0027-stream-partial-io-accounting.patch
