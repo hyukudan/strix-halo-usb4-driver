@@ -19,3 +19,4 @@
 0020-nhi-shutdown-releases-ring-interrupts.patch
 0021-stream-device-state-under-lock.patch
 0022-stream-resume-failure-fails-open-files.patch
+0023-stream-rx-counters-before-posting.patch
