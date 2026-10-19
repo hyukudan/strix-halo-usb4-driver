@@ -272,6 +272,7 @@ int main(int argc, char **argv)
         { "partial_io_is_accounted", partial_io_is_accounted },
         { "close_does_not_flush_rx", close_does_not_flush_rx },
         { "spin_us_parameter_is_bounded", spin_us_parameter_is_bounded },
+        { "damaged_close_is_not_eof", damaged_close_is_not_eof },
     };
 
     assert(argc == 2);

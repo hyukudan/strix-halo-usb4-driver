@@ -382,9 +382,9 @@ static bool complete_tx(struct tb_ring *r)
     return f;
 }
 
-/* With RING_DESC_CRC_ERROR / RING_DESC_BUFFER_OVERRUN, as the descriptor
- * reports a damaged frame. */
-static void complete_rx_flags(struct tb_ring *r, u32 size, u32 flags)
+/* A received frame with its PDF (eof: 2 DATA, 3 CLOSE) and descriptor flags
+ * (RING_DESC_CRC_ERROR / RING_DESC_BUFFER_OVERRUN for a damaged frame). */
+static void complete_rx_frame(struct tb_ring *r, u32 size, u32 eof, u32 flags)
 {
     struct ring_frame *f;
 
@@ -392,9 +392,14 @@ static void complete_rx_flags(struct tb_ring *r, u32 size, u32 flags)
     assert(!list_empty(&r->posted));
     f = container_of(r->posted.next, struct ring_frame, list);
     list_del_init(&f->list);
-    f->size = size; f->eof = 2; f->sof = 1; f->flags = flags;
+    f->size = size; f->eof = eof; f->sof = 1; f->flags = flags;
     list_add_tail(&f->list, &r->done);
     pthread_mutex_unlock(&r->lock);
+}
+
+static void complete_rx_flags(struct tb_ring *r, u32 size, u32 flags)
+{
+    complete_rx_frame(r, size, 2, flags);
 }
 
 static void complete_rx(struct tb_ring *r, u32 size)

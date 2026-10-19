@@ -444,3 +444,44 @@ static void spin_us_parameter_is_bounded(void)
     assert_nothing_held();
     unplug_and_remove(&e, 0);
 }
+
+/* Review of A6: read() took a CLOSE as EOF before checking its descriptor,
+ * so a CLOSE with a CRC error or an overrun ended the stream "normally".
+ * The damage is checked first: data before it, then EIO, never EOF. */
+static void damaged_close_is_not_eof(void)
+{
+    unsigned flags[] = { RING_DESC_CRC_ERROR, RING_DESC_BUFFER_OVERRUN };
+
+    for (int i = 0; i < 2; ++i) {
+        struct endpoint e;
+        unsigned char buf[256];
+
+        endpoint_init(&e, 1);
+        assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+        e.file.f_flags = O_NONBLOCK;
+        complete_rx(e.dev.rx_ring.ring, 64);
+        complete_rx_frame(e.dev.rx_ring.ring, 64, TBSTREAM_CLOSE, flags[i]);
+        assert(file_read(&e, buf, sizeof(buf)) == 64);
+        assert(file_read(&e, buf, sizeof(buf)) == -EIO);
+        assert(!e.dev.closed && e.dev.rx_failed);
+        assert(file_read(&e, buf, sizeof(buf)) == -EIO);
+        assert(tbstream_dev_fops_poll(&e.file, NULL) & EPOLLERR);
+        assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+        assert_nothing_held();
+        unplug_and_remove(&e, 0);
+    }
+    /* An intact CLOSE is still the end of the stream. */
+    {
+        struct endpoint e;
+        unsigned char buf[64];
+
+        endpoint_init(&e, 1);
+        assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+        e.file.f_flags = O_NONBLOCK;
+        complete_rx_frame(e.dev.rx_ring.ring, 64, TBSTREAM_CLOSE, 0);
+        assert(file_read(&e, buf, sizeof(buf)) == 0 && e.dev.closed && !e.dev.rx_failed);
+        assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+        assert_nothing_held();
+        unplug_and_remove(&e, 0);
+    }
+}
