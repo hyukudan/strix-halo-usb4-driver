@@ -21,7 +21,7 @@ host memory, plus a DMA-BUF extension that moves data between the two iGPUs
 without staging through TCP.
 
 The series applies to Linux `72d3fcf802c45d00b300f25b848a93c3a2bd7c7e`
-(**7.3-rc5**). All thirty-five patches in [`patches/series`](patches/series) are the
+(**7.3-rc5**). All thirty-nine patches in [`patches/series`](patches/series) are the
 driver; `overlay/` is an immutable capture of the original source and is *not*
 the current driver on its own.
 
@@ -61,14 +61,17 @@ the current driver on its own.
 > otherwise waits for the peer interruptibly until `open_timeout_ms` (30 s by
 > default), then `ETIMEDOUT`.
 >
-> **0020–0035 (2026-10-19), offline-tested and compile-tested only:** fixes for
+> **0020–0039 (2026-10-19/20), offline-tested and compile-tested only:** fixes for
 > the kernel findings of the external audit. They cover interrupt lifetime at
 > NHI shutdown; stream state checked under the device mutex; resume failure;
 > early RX; the DMA revoke proof; CRC/overrun; CLOSE with a full ring; partial
 > I/O; close latency; the `spin_us` bound; non-blocking GPU submit; and a
 > pending AMD teardown reset that runs once the NHI is free. 0033–0035 check
 > lane bonding and the host router reset, and add an opt-in, bounded Gen3
-> retrain. 0032 adds missing kernel-doc lines:
+> retrain. 0036–0039 close the windows a review of them found: `dma_lock` in
+> non-blocking submit, a damaged CLOSE, pending-reset generations, contention
+> and suspend, and Gen3 retrain locking and exclusion. 0032 adds missing
+> kernel-doc lines:
 > [docs/AUDIT-FIXES-2026-10-19.md](docs/AUDIT-FIXES-2026-10-19.md).
 
 ## Contents
@@ -329,6 +332,10 @@ with `gpu_direct`. Benchmark source:
 | `0033-xdomain-lane-bonding-result-checked` | XDomain lane bonding (lower-UUID side) checks its result, retries at most twice, then reports speed and width and continues unbonded. |
 | `0034-host-router-reset-result-checked` | `tb_start()` checks the host router reset. On failure it logs the error and discovers the boot firmware configuration instead of assuming a clean router. |
 | `0035-opt-in-gen3-retrain` | `thunderbolt.gen3_retrain=N` (default off, at most 3) retrains a new XDomain link below Gen3 with a port reset. It needs the lane adapter to support and target Gen3, and the local port to advertise Gen3 Support in LINK_CONF; it logs why when the port or retimers are the limit. It never runs with a DMA tunnel or data ring. |
+| `0036-gpu-nonblock-submit-does-not-sleep-on-dma-lock` | `O_NONBLOCK` SUBMIT/RX_REPOST also only try the DMA submission lock (held by the watchdog while it stops the rings). `EAGAIN` publishes no fence and keeps the operation and the fence sequence. |
+| `0037-stream-damaged-close-is-an-error` | A CLOSE frame with a CRC error or overrun gives `EIO` instead of end of file. |
+| `0038-teardown-reset-pending-survives-requests-contention-suspend` | The pending teardown reset has request generations, so a finishing reset never clears a newer request. A busy domain lock with no consumer is retried every 2 s instead of parking. Nothing queues it during suspend; resume re-arms it. |
+| `0039-gen3-retrain-serialized-and-exclusive` | The Gen3 retrain takes the domain lock before any sideband access, keeps the NHI free of data rings (the DMA reset admission) until the port reset is done, and is vetoed by any tunnel (new CM op `tunnels_active`). |
 
 Design rule throughout: a timeout, process exit, failed MMIO read or missing
 PCI device is **never** treated as proof that DMA has stopped. Memory the
@@ -360,12 +367,12 @@ Before these fixes the series could not be built:
 
 | Check | Result |
 |---|---|
-| Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 35 patches (0012–0035: checked offline in WSL and on cluster1, 2026-10-19) |
+| Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 39 patches (0012–0039: checked offline in WSL and on cluster1, 2026-10-20) |
 | `prepare_overlay.py` vs applying the series to the kernel | ✅ byte-identical (22 files) |
-| Offline unit tests (`unittest discover`) | ✅ 165 run, OK (1 bundle-only skip) with 0001–0035; every patch 0020–0035 also passes on its own |
-| Modules with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` (0001–0017, 0001–0018 and 0001–0019: full `vmlinux modules` builds with modpost on cluster1, 2026-10-19; 0001–0032 and 0001–0035: `vmlinux modules` with GPU on, then all modules relinked with GPU off, modpost both times, no kernel-doc warnings left) |
+| Offline unit tests (`unittest discover`) | ✅ 171 run, OK (1 bundle-only skip) with 0001–0039; every patch 0020–0039 also passes on its own |
+| Modules with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` (0001–0017, 0001–0018 and 0001–0019: full `vmlinux modules` builds with modpost on cluster1, 2026-10-19; 0001–0032, 0001–0035 and 0001–0039: `vmlinux modules` with GPU on, then all modules relinked with GPU off, modpost both times, no kernel-doc warnings left) |
 | Link negotiation Gen3 × 2 on both cables | ✅ sysfs and lane registers; kept across every module reload and controller reset |
-| Complete 0001–0010 series loaded on hardware (0011 measured separately; 0012–0035 not yet) | ✅ both machines, modules built against the running kernel (exact vermagic and CRCs) |
+| Complete 0001–0010 series loaded on hardware (0011 measured separately; 0012–0039 not yet) | ✅ both machines, modules built against the running kernel (exact vermagic and CRCs) |
 | Host-memory bandwidth, integrity, latency (series) | ✅ 41.0–41.5 Gb/s with 4 streams, zero bad chunks; latency as above |
 | Stream open/close stress (series) | ✅ 80 cycles across all 4 streams and both directions (40 with `rx_napi`), zero failures, zero kernel warnings |
 | GPU-to-GPU, one-way (`strix-gpu-queue-visibility`, depth 8) | ✅ 4 windows, 32 operations, 131 104 bytes verified on the GPU |
@@ -574,7 +581,7 @@ topology.
 
 | Path | Content |
 |---|---|
-| `patches/series` | The thirty-five-patch series, in order |
+| `patches/series` | The thirty-nine-patch series, in order |
 | `patches/audit-series` | Patches applied on top of the captured overlay (0002–0019) |
 | `patches/kernel-backports/` | Unmodified upstream fixes applied after the series |
 | `overlay/` | Immutable original source capture (equals pristine + 0001) |
