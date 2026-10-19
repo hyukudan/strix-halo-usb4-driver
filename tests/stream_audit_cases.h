@@ -79,3 +79,51 @@ static void second_dev(struct endpoint *e, struct tbstream_dev *s, struct file *
     tbstream_dev_attach_stream(s, &e->sg);
     *f = (struct file){ 0, &s->misc };
 }
+
+/* A3: resume could not restart the rings of an open file. Before, the
+ * error returned at once: the file kept users != 0 with NULL rings (busy_poll
+ * read reached tb_ring_poll(NULL), other modes waited forever, a new open
+ * shared the count and skipped start) and the devices after it in the group
+ * were never resumed. Now the file fails like a detached one and the others
+ * resume. */
+static void resume_failure_fails_open_files(void)
+{
+    struct endpoint e;
+    struct tbstream_dev other;
+    struct file other_file, again;
+    unsigned char buf[64] = { 3 };
+    int stops;
+
+    endpoint_init(&e, 2);   /* busy_poll on the first device */
+    second_dev(&e, &other, &other_file);
+    assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+    assert(tbstream_dev_fops_open(NULL, &other_file) == 0);
+    assert(tbstream_suspend(&e.svc[0].dev) == 0);
+    assert(!e.dev.tx_ring.ring && !other.tx_ring.ring);
+    ring_fail_after = 0;    /* the first device's TX ring allocation fails */
+    assert(tbstream_resume(&e.svc[0].dev) == -ENOMEM);
+    assert(ring_fail_after == -1);
+    /* The failed device: a terminal state, users woken. */
+    assert(e.dev.detached && !e.dev.tx_ring.ring);
+    assert_stale_file(&e);
+    again = (struct file){ O_NONBLOCK, &e.dev.misc };
+    assert(tbstream_dev_fops_open(NULL, &again) == -EBUSY && e.dev.users == 1);
+    /* The device after it was resumed anyway. */
+    assert(other.tx_ring.ring && other.rx_ring.ring && tunnel_count() == 1);
+    {
+        struct kiocb k = { &other_file, 0 };
+        struct iov_iter it = { buf, sizeof(buf) };
+
+        assert(tbstream_dev_fops_write_iter(&k, &it) == sizeof(buf));
+    }
+    /* Closing the failed file stops nothing; then it opens afresh. */
+    stops = atomic_load(&ring_stops);
+    assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+    assert(atomic_load(&ring_stops) == stops && !e.dev.detached);
+    assert(tbstream_dev_fops_open(NULL, &e.file) == 0 && e.dev.tx_ring.ring);
+    assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+    assert(tbstream_dev_fops_release(NULL, &other_file) == 0);
+    assert_nothing_held();
+    unplug_and_remove(&e, 0);
+    assert(!atomic_load(&stream_refs) && !atomic_load(&dev_refs));
+}

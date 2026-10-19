@@ -19,3 +19,4 @@
 0019-stream-open-bounded-wait-for-peer.patch
 0020-nhi-shutdown-releases-ring-interrupts.patch
 0021-stream-device-state-under-lock.patch
+0022-stream-resume-failure-fails-open-files.patch

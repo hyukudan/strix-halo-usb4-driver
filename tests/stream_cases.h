@@ -265,6 +265,7 @@ int main(int argc, char **argv)
         { "open_wait_is_interruptible", open_wait_is_interruptible },
         { "open_timeout_settings", open_timeout_settings },
         { "stream_deref_under_lock", stream_deref_under_lock },
+        { "resume_failure_fails_open_files", resume_failure_fails_open_files },
     };
 
     assert(argc == 2);
