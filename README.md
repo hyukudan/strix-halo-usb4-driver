@@ -21,7 +21,7 @@ host memory, plus a DMA-BUF extension that moves data between the two iGPUs
 without staging through TCP.
 
 The series applies to Linux `72d3fcf802c45d00b300f25b848a93c3a2bd7c7e`
-(**7.3-rc5**). All eighteen patches in [`patches/series`](patches/series) are the
+(**7.3-rc5**). All nineteen patches in [`patches/series`](patches/series) are the
 driver; `overlay/` is an immutable capture of the original source and is *not*
 the current driver on its own.
 
@@ -54,6 +54,12 @@ the current driver on its own.
 > the upstream-documented TX hang, but only when no other ring (stream,
 > USB4NET, GPU) uses that NHI. Attempts are bounded and the result is logged
 > in `dmesg` (`thunderbolt.teardown_reset`, default on).
+>
+> **0019 (2026-10-19), offline-tested and compile-tested only:** `open()` of a
+> stream no longer sleeps forever. It returns `ENODEV`/`ENXIO` at once when the
+> endpoint's domain or XDomain does not exist, `EAGAIN` with `O_NONBLOCK`, and
+> otherwise waits for the peer interruptibly until `open_timeout_ms` (30 s by
+> default), then `ETIMEDOUT`.
 
 ## Contents
 
@@ -283,6 +289,7 @@ with `gpu_direct`. Benchmark source:
 | `0016-gpu-kernel-validated-terminal-frame` | Opt-in `SGU_PREPARE_TERMINAL_HEADER`: TX sends a kernel-built terminal header, RX receives it in kernel memory and validates length, epoch, sequence, size and slot; a mismatch fails the operation with `SGU_FRAME_ERROR_TERMINAL` instead of silently shifting data. Advertised by `SGU_CAP_TERMINAL_HEADER`; the ABI layout and `abi_minor` are unchanged. |
 | `0017-stream-detach-ram-rings-and-domain-xdomain-teardown` | Open RAM-ring streams stop when their service is removed, on configfs `rmdir` and on shutdown (new `.shutdown`); stale files get `ENODEV`, and a reconnect refuses new opens until they are closed. Domain removal unregisters XDomains and services before `tb_stop()` (they used to outlive the domain and the module, a stale-bus oops at reboot), so service drivers stop their rings before the DMA paths go down. Bounded wait on a failed probe; host interface reset at probe on the quirked AMD v1 NHIs. |
 | `0018-amd-teardown-interface-reset-when-idle` | After a DMA path teardown on the AMD v1 NHIs, reset the host interface (recovers the upstream-documented TX hang that also stops the control channel), but only when no ring besides control and no DMA tunnel remain on that NHI. Never waits for the domain lock, up to 10 attempts over ~5 s, then a `dmesg` warning with the ring counts; success and failure are logged too. Not run during domain removal or suspend. `thunderbolt.teardown_reset` (default on). |
+| `0019-stream-open-bounded-wait-for-peer` | `open()` with no stream attached: `ENODEV` at once if the endpoint's domain does not exist, `ENXIO` if its XDomain does not (or is unplugging), `EAGAIN` for `O_NONBLOCK`. Otherwise it waits interruptibly for the peer's stream service, re-checking the XDomain every second, up to `open_timeout_ms` (module parameter, 30 s; per-endpoint configfs override), then `ETIMEDOUT`. New core helper `tb_xdomain_presence()`. A two-node run had sat 27 min in `open()` on a domain that no longer existed. |
 
 Design rule throughout: a timeout, process exit, failed MMIO read or missing
 PCI device is **never** treated as proof that DMA has stopped. Memory the
@@ -314,12 +321,12 @@ Before these fixes the series could not be built:
 
 | Check | Result |
 |---|---|
-| Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 18 patches (0012–0018: checked offline in WSL, 2026-10-19) |
+| Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 19 patches (0012–0019: checked offline in WSL, 2026-10-19) |
 | `prepare_overlay.py` vs applying the series to the kernel | ✅ byte-identical (22 files) |
-| Offline unit tests (`unittest discover`) | ✅ 124 run, OK (1 bundle-only skip) with 0012–0018 |
-| Modules with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` (0001–0017 and 0001–0018: full `vmlinux modules` builds with modpost on cluster1, 2026-10-19) |
+| Offline unit tests (`unittest discover`) | ✅ 134 run, OK (1 bundle-only skip) with 0012–0019 |
+| Modules with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` (0001–0017, 0001–0018 and 0001–0019: full `vmlinux modules` builds with modpost on cluster1, 2026-10-19) |
 | Link negotiation Gen3 × 2 on both cables | ✅ sysfs and lane registers; kept across every module reload and controller reset |
-| Complete 0001–0010 series loaded on hardware (0011 measured separately; 0012–0018 not yet) | ✅ both machines, modules built against the running kernel (exact vermagic and CRCs) |
+| Complete 0001–0010 series loaded on hardware (0011 measured separately; 0012–0019 not yet) | ✅ both machines, modules built against the running kernel (exact vermagic and CRCs) |
 | Host-memory bandwidth, integrity, latency (series) | ✅ 41.0–41.5 Gb/s with 4 streams, zero bad chunks; latency as above |
 | Stream open/close stress (series) | ✅ 80 cycles across all 4 streams and both directions (40 with `rx_napi`), zero failures, zero kernel warnings |
 | GPU-to-GPU, one-way (`strix-gpu-queue-visibility`, depth 8) | ✅ 4 windows, 32 operations, 131 104 bytes verified on the GPU |
@@ -469,6 +476,7 @@ Streams are created in configfs under
 | `rx_napi` | -1 | 0011: per-stream override of the module parameter (-1/0/1); ignored on `gpu_direct` streams |
 | `spin_us` | -1 | 0011: per-stream RX polling time, 0..1000 µs. Since 0015 the spin does not hold the device mutex: a writer or `poll()` on the same stream is not delayed by it |
 | `irq_cpu` | -1 | 0011: CPU for the stream's TX/RX ring interrupts; restored on close since 0015. irqbalance can move them again: ban these IRQs in irqbalance if the placement must hold |
+| `open_timeout_ms` | -1 | 0019: how long a blocking `open()` waits for the peer's stream service while its XDomain is connected, 0..600000 ms; -1 follows the module parameter, 0 does not wait |
 | `gpu_quarantine` (RO) / `gpu_recover` (WO) | — | quarantined GPU context; write `reap` or `reset` (CAP_SYS_ADMIN, no open FD) |
 
 Module parameters:
@@ -479,6 +487,8 @@ Module parameters:
 | `thunderbolt_stream.rx_napi` | off | 0010: reader-side RX reaping; applies to streams opened afterwards |
 | `thunderbolt_stream.spin_us` | 0 | 0010: polling time before re-arming the RX interrupt; 25 is the measured sweet spot (10 is too short for 4 KiB round trips) |
 | `thunderbolt_stream.gpu_dma_timeout_ms` / `gpu_standby_timeout_ms` | 30000 / 300000 | GPU DMA deadlines |
+| `thunderbolt_stream.open_timeout_ms` | 30000 | 0019: default wait of a blocking `open()` for the peer (at most 600000); without the domain or XDomain `open()` fails at once |
+| `thunderbolt.teardown_reset` | on | 0018: reset an idle AMD v1 host interface after a DMA path teardown |
 | `thunderbolt_stream.gpu_reap_orphans` | — | 0013, write-only: `1` reaps quarantined GPU contexts whose configfs stream was removed (`rmdir`); `EBUSY` if some still lack a stop proof |
 
 `thunderbolt_net` is blocked in the lab kernel through modprobe policy so that
@@ -522,8 +532,8 @@ Diagnostics: `python3 tools/usb4_diagnose.py --logs` on both hosts.
 
 | Path | Content |
 |---|---|
-| `patches/series` | The eighteen-patch series, in order |
-| `patches/audit-series` | Patches applied on top of the captured overlay (0002–0018) |
+| `patches/series` | The nineteen-patch series, in order |
+| `patches/audit-series` | Patches applied on top of the captured overlay (0002–0019) |
 | `patches/kernel-backports/` | Unmodified upstream fixes applied after the series |
 | `overlay/` | Immutable original source capture (equals pristine + 0001) |
 | `base/` | Hash-pinned upstream files that the capture did not include |
@@ -547,7 +557,7 @@ Reports describe the state at their own patch level:
 8. [Review fixes](docs/REVIEW-FIXES-2026-10-19.md), patches 0012–0016, with the
    hardware validation steps still pending.
 9. [Stream detach and domain teardown](docs/DETACH-FIXES-2026-10-19.md), patches
-   0017–0018: the RAM-ring detach bug, the reboot vmcore, the NHI wedge
+   0017–0019: the RAM-ring detach bug, the reboot vmcore, the NHI wedge
    analysis, the idle-only teardown reset and the hardware checks still pending.
 
 The matching engine is `hyukudan/strix-halo-engine-lab`; its multi-slot entry
