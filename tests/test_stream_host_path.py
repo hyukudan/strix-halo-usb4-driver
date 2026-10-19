@@ -25,7 +25,8 @@ CASES = ('open_failure_is_not_sticky', 'frame_arrays_use_kvcalloc', 'spin_withou
          'open_fails_fast_without_domain', 'open_fails_fast_without_xdomain', 'open_nonblock_eagain',
          'open_wait_is_bounded', 'open_waits_for_peer', 'open_wait_ends_when_xdomain_goes',
          'open_wait_is_interruptible', 'open_timeout_settings',
-         'stream_deref_under_lock')
+         'stream_deref_under_lock',
+         'resume_failure_fails_open_files')
 STRUCTS = ('tbstream_frame', 'tbstream_ring', 'tbstream_dev', 'tbstream_group', 'tbstream')
 FUNCTIONS = ('tbstream_ring_free', 'tbstream_ring_available', 'tbstream_rx_start_poll',
              'tbstream_dev_napi_rx_locked', 'tbstream_dev_napi_rx', 'tbstream_dev_napi_spin',
@@ -43,7 +44,8 @@ FUNCTIONS = ('tbstream_ring_free', 'tbstream_ring_available', 'tbstream_rx_start
              'tbstream_dev_fops_release', 'tbstream_dev_from_group', 'tbstream_dev_alloc_in_hopid',
              'tbstream_dev_alloc_out_hopid', 'tbstream_dev_attach_stream', 'tbstream_dev_detach_stream',
              'to_tbstream_group', 'tbstream_dev_drop_item', 'tbstream_group_attach_stream',
-             'tbstream_group_detach_stream', 'tbstream_shutdown')
+             'tbstream_group_detach_stream', 'tbstream_suspend', 'tbstream_resume',
+             'tbstream_shutdown')
 
 
 def extract(text, kind, name):

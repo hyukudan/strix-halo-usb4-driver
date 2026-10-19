@@ -1,0 +1,95 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -141,9 +141,10 @@ struct tbstream_ring {
+  * @users: Number of times @cdev has been opened
+  * @closed: CLOSE packet was received
+  * @removed: Userspace removed the ConfigFS group underneath.
+- * @detached: The stream went away while the device was open. Its rings
+- *	      were stopped then; the files opened before only fail until
+- *	      they are closed, even if a new stream is attached meanwhile.
++ * @detached: The open files lost their rings: the stream went away (the
++ *	      rings were stopped then) or a resume could not restart them.
++ *	      Those files only fail until they are closed, even if a new
++ *	      stream is attached meanwhile.
+  * @domain_index: Domain of the connection named by the parent group
+  * @route: Route of that connection's XDomain
+  * @cfg_open_timeout_ms: How long open() waits for the peer's stream service
+@@ -2373,6 +2374,8 @@ static int __maybe_unused tbstream_suspend(struct device *dev)
+ 	if (!sg)
+ 		return 0;
+ 
++	/* rmdir unlinks devices from the list under sg->lock */
++	mutex_lock(&sg->lock);
+ 	list_for_each_entry_reverse(sdev, &sg->dev_list, list) {
+ 		tbstream_dev_get(sdev);
+ 		/* Stop the stream (if it was open); DMA mode never resumes implicitly. */
+@@ -2387,6 +2390,7 @@ static int __maybe_unused tbstream_suspend(struct device *dev)
+ 		}
+ 		tbstream_dev_put(sdev);
+ 	}
++	mutex_unlock(&sg->lock);
+ 
+ 	config_group_put(&sg->group);
+ 	return 0;
+@@ -2398,34 +2402,47 @@ static int __maybe_unused tbstream_resume(struct device *dev)
+ 	struct tbstream *stream = tb_service_get_drvdata(svc);
+ 	struct tbstream_group *sg;
+ 	struct tbstream_dev *sdev;
++	int ret, first_error = 0;
+ 
+ 	sg = tbstream_group_find(stream);
+ 	if (!sg)
+ 		return 0;
+ 
++	mutex_lock(&sg->lock);
+ 	list_for_each_entry(sdev, &sg->dev_list, list) {
+ 		tbstream_dev_get(sdev);
++		mutex_lock(&sdev->lock);
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+-		if (sdev->gpu_direct || sdev->gpu_context) {
+-			tbstream_dev_put(sdev);
+-			continue;
+-		}
++		/* DMA mode never resumes implicitly */
++		if (sdev->gpu_direct || sdev->gpu_context)
++			ret = 0;
++		else
+ #endif
+-		if (sdev->users && !sdev->detached) {
+-			int ret;
+-
++		if (sdev->users && !sdev->detached)
+ 			ret = tbstream_dev_start(sdev);
+-			if (ret) {
+-				tbstream_dev_put(sdev);
+-				config_group_put(&sg->group);
+-				return ret;
+-			}
++		else
++			ret = 0;
++		if (ret) {
++			/*
++			 * The open files have no rings now. Fail them as a
++			 * detach does (I/O -ENODEV, poll HUP, new opens -EBUSY
++			 * until they are closed; the next open starts afresh)
++			 * and still resume the other devices.
++			 */
++			WRITE_ONCE(sdev->detached, true);
++			wake_up_interruptible_poll(&sdev->wait, EPOLLHUP | EPOLLERR);
++			pr_warn_ratelimited("%s: resume failed: %d, open files fail until closed\n",
++					    sdev->misc.name, ret);
++			if (!first_error)
++				first_error = ret;
+ 		}
++		mutex_unlock(&sdev->lock);
+ 		tbstream_dev_put(sdev);
+ 	}
++	mutex_unlock(&sg->lock);
+ 
+ 	config_group_put(&sg->group);
+-	return 0;
++	return first_error;
+ }
+ 
+ static const struct dev_pm_ops tbstream_pm_ops = {
