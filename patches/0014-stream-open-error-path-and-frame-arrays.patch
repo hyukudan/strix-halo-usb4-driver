@@ -1,0 +1,102 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -276,7 +276,8 @@ static void tbstream_ring_free(struct tbstream_ring *ring)
+ 	else
+ 		dir = DMA_FROM_DEVICE;
+ 
+-	for (i = 0; i < tb_ring_size(ring->ring); i++) {
++	/* An open that failed early may not have allocated the array. */
++	for (i = 0; ring->frames && i < tb_ring_size(ring->ring); i++) {
+ 		struct tbstream_frame *sf = &ring->frames[i];
+ 
+ 		if (sf->frame.buffer_phy)
+@@ -290,7 +291,8 @@ static void tbstream_ring_free(struct tbstream_ring *ring)
+ 
+ 	ring->prod = 0;
+ 	ring->cons = 0;
+-	kfree(ring->frames);
++	kvfree(ring->frames);
++	ring->frames = NULL;
+ }
+ 
+ static inline bool tbstream_ring_available(const struct tbstream_ring *ring)
+@@ -499,7 +501,13 @@ static int tbstream_dev_alloc_rx_buffers(struct tbstream_dev *sdev)
+ 	size_t ring_size = tb_ring_size(sdev->rx_ring.ring);
+ 	int i;
+ 
+-	sdev->rx_ring.frames = kzalloc_objs(struct tbstream_frame, ring_size);
++	/*
++	 * Bookkeeping only (the DMA buffers are separate pages): up to
++	 * 4096 entries must not need a high-order contiguous allocation,
++	 * which fails under page cache pressure.
++	 */
++	sdev->rx_ring.frames = kvcalloc(ring_size, sizeof(struct tbstream_frame),
++					GFP_KERNEL);
+ 	if (!sdev->rx_ring.frames)
+ 		return -ENOMEM;
+ 
+@@ -553,7 +561,8 @@ static int tbstream_dev_alloc_tx_buffers(struct tbstream_dev *sdev)
+ 	size_t ring_size = tb_ring_size(sdev->tx_ring.ring);
+ 	int i;
+ 
+-	sdev->tx_ring.frames = kzalloc_objs(struct tbstream_frame, ring_size);
++	sdev->tx_ring.frames = kvcalloc(ring_size, sizeof(struct tbstream_frame),
++					GFP_KERNEL);
+ 	if (!sdev->tx_ring.frames)
+ 		return -ENOMEM;
+ 
+@@ -684,13 +693,15 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 	sdev->rx_spin_us = sdev->cfg_spin_us < 0 ? READ_ONCE(spin_us) : sdev->cfg_spin_us;
+ 	sdev->rx_poll_pending = false;
+ 	ring = tb_ring_alloc_tx(xd->tb->nhi, -1, sdev->ring_size, flags);
+-	if (!ring)
+-		return -ENOMEM;
++	if (!ring) {
++		ret = -ENOMEM;
++		goto err_report;
++	}
+ 	sdev->tx_ring.ring = ring;
+ 
+ 	ret = tbstream_dev_alloc_tx_buffers(sdev);
+ 	if (ret)
+-		goto err_free_tx;
++		goto err_free_tx_buffers;
+ 
+ 	e2e_tx_hop = ring->hop;
+ 	sof_mask = BIT(TBSTREAM_FRAME_START);
+@@ -726,15 +737,32 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 	return 0;
+ 
+ err_stop:
++	if (sdev->rx_napi)
++		tb_ring_poll_complete(sdev->rx_ring.ring);
+ 	tb_ring_stop(sdev->rx_ring.ring);
+ 	tb_ring_stop(sdev->tx_ring.ring);
++	/*
++	 * The DMA tunnel is up at this point. Leaving it behind keeps its
++	 * NHI ring hops and HopIDs reserved in the connection manager, so
++	 * every later open would fail to build its own tunnel (-ENOMEM,
++	 * with no log) until the module is reloaded.
++	 */
++	tb_xdomain_disable_paths(xd, sdev->out_hopid,
++				 sdev->tx_ring.ring->hop,
++				 sdev->in_hopid,
++				 sdev->rx_ring.ring->hop);
++	/* Posted RX buffers were canceled by the stop: unmap and free them. */
++	tbstream_ring_free(&sdev->rx_ring);
+ err_free_rx:
+ 	tb_ring_free(sdev->rx_ring.ring);
++	sdev->rx_ring.ring = NULL;
+ err_free_tx_buffers:
++	/* Also releases a partially populated array. */
+ 	tbstream_ring_free(&sdev->tx_ring);
+-err_free_tx:
+ 	tb_ring_free(sdev->tx_ring.ring);
+-
++	sdev->tx_ring.ring = NULL;
++err_report:
++	pr_warn_ratelimited("%s: open failed: %d\n", sdev->misc.name, ret);
+ 	return ret;
+ }
+ 

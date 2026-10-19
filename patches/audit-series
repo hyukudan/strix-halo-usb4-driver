@@ -10,3 +10,4 @@
 0011-stream-per-stream-napi-and-irq-steering.patch
 0012-cm-unlink-tunnels-on-stop.patch
 0013-bounded-domain-release-and-dma-revocation.patch
+0014-stream-open-error-path-and-frame-arrays.patch
