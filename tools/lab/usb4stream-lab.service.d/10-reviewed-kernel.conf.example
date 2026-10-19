@@ -1,0 +1,15 @@
+# Optional drop-in: /etc/systemd/system/usb4stream-lab.service.d/10-reviewed-kernel.conf
+#
+# Restricts the lab profile to the kernel builds that passed review. The empty
+# assignment clears the unit's ConditionKernelVersion; each following line adds
+# one allowed release (all must match, so use one glob or one exact release).
+# After editing: systemctl daemon-reload; systemctl show -p ConditionResult
+# usb4stream-lab.service after the next boot shows whether it applied.
+#
+# Policy deployed on the lab nodes (2026-10-19): any lab build.
+[Unit]
+ConditionKernelVersion=
+ConditionKernelVersion=7.3.0-rc5-strix-gpu-bosgame-*
+#
+# Stricter alternative: one reviewed build only (replace the line above).
+#ConditionKernelVersion=7.3.0-rc5-strix-gpu-bosgame-20261019det
