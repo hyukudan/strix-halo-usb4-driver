@@ -1,4 +1,4 @@
-# 0017–0018: streams and services that outlive their connection, and AMD teardown recovery (2026-10-19)
+# 0017–0019: streams and services that outlive their connection, AMD teardown recovery, bounded open (2026-10-19)
 
 State: implemented, offline-tested (unit tests under ASan/UBSan) and
 compile-tested against the pinned 7.3-rc5 with the nodes' running
@@ -270,6 +270,15 @@ nodes for each item.
    Then bind: `host interface reset`, Gen3 × 2, and the streams reopen
    (after their old files are closed). The other NHI keeps its traffic
    throughout.
+10. **open() without a connection (0019).**
+    - With one NHI unbound, or its domain gone, `open()` of its endpoints
+      returns `ENODEV` immediately.
+    - With the cable unplugged, it returns `ENXIO` immediately.
+    - With the peer connected but its `thunderbolt_stream` not loaded: a
+      blocking open returns `ETIMEDOUT` after 30 s (or `open_timeout_ms`),
+      `O_NONBLOCK` returns `EAGAIN`, and Ctrl-C ends the wait at once. Loading
+      the peer's module during the wait makes the open succeed.
+    - Nothing stays in `tbstream_dev_fops_open` (check `wchan`).
 
 ## 7. 0018: automatic recovery after a DMA teardown, only on an idle NHI
 
@@ -346,3 +355,55 @@ the actual `dma_recovery.c`):
 scheduled and cancelled. Its removal-order case now also checks that the
 work is cancelled before the DMA owners are retired. Each part was removed
 one at a time (mutation check); every removal makes at least one test fail.
+
+## 8. 0019: open() never waits for a connection that cannot appear
+
+**Incident (2026-10-19 15:21).** A two-node run sat 27 minutes in
+`tbstream_dev_fops_open` (`wchan`) on `/dev/tbstream1` and `/dev/tbstream3`.
+Their configfs endpoints belonged to domain 1, which no longer existed (NHI1
+of cluster1 wedged, and the second cable of cluster2 had no peer). An open
+with no stream attached slept until a stream appeared or a signal arrived.
+
+**Fix.**
+
+- **Core: `tb_xdomain_presence(domain, route)`** (exported). It looks up
+  `domainN` and the XDomain `N-route` on the bus by name, so it needs no
+  domain reference. It returns:
+  - `-ENODEV` without the domain;
+  - `-ENXIO` without the XDomain, when the XDomain is unplugged, or when the
+    name belongs to a router;
+  - 0 otherwise.
+
+  Each stream group keeps the domain and route parsed from its name.
+- **`open()` with no valid stream:**
+  - `-ENODEV` or `-ENXIO` at once, blocking or not;
+  - with the XDomain present: `-EAGAIN` for `O_NONBLOCK`;
+  - otherwise an interruptible wait for the stream service, re-checking the
+    XDomain at least once a second, so an unplug or a domain removal ends it
+    within about 1 s. The wait ends with `-ETIMEDOUT` after the timeout,
+    `-ERESTARTSYS` on a signal, and `-ENXIO` on rmdir.
+  - Timeout: `thunderbolt_stream.open_timeout_ms` (default 30000, capped at
+    600000), overridable per endpoint with configfs `open_timeout_ms`
+    (-1 follows the parameter, 0 does not wait).
+- **Behaviour change for users:**
+  - `O_NONBLOCK` without a stream used to return `ENXIO` and now returns
+    `EAGAIN` if the XDomain is there.
+  - Opening before the cable or the XDomain exists now fails with `ENXIO`
+    instead of waiting. Clients retry, with backoff or by polling with
+    `O_NONBLOCK`.
+
+**Tests.**
+
+- `tests/stream_open_cases.h` (actual open path):
+  - no domain and no XDomain, blocking and non-blocking;
+  - `EAGAIN`;
+  - the bounded wait;
+  - the peer appearing during the wait;
+  - the XDomain, the domain or the item (rmdir) going away during the wait;
+  - a signal;
+  - the timeout settings and the cap.
+- `tests/xdomain_presence_cases.h`: the actual `tb_xdomain_presence()` against
+  a bus model (missing domain, missing XDomain, a router with the same name,
+  unplugging, hexadecimal routes, references balanced).
+- Each safeguard was reverted once (mutation check); every reversion fails at
+  least one test.
