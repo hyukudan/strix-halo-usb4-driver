@@ -69,7 +69,7 @@ jobs:
           scripts/config --enable CONFIGFS_FS --module USB4 --module USB4_CONFIGFS --module USB4_STREAM --enable USB4_GPU_STREAM --module USB4_NET --enable DMA_SHARED_BUFFER
           make olddefconfig
           grep -q '^CONFIG_USB4_GPU_STREAM=y' .config
-          make -j2 W=1 drivers/thunderbolt/nhi.o drivers/thunderbolt/pci.o drivers/thunderbolt/domain.o drivers/thunderbolt/xdomain.o drivers/thunderbolt/tunnel.o drivers/thunderbolt/stream.o drivers/net/thunderbolt/main.o
+          make -j2 W=1 drivers/thunderbolt/nhi.o drivers/thunderbolt/pci.o drivers/thunderbolt/domain.o drivers/thunderbolt/xdomain.o drivers/thunderbolt/tunnel.o drivers/thunderbolt/tb.o drivers/thunderbolt/stream.o drivers/net/thunderbolt/main.o
           scripts/config --disable USB4_GPU_STREAM
           make olddefconfig
           make -j2 W=1 drivers/thunderbolt/stream.o
