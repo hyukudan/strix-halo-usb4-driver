@@ -1,19 +1,38 @@
 {
+  "schema": "usb4-software-validation-v2",
+  "kernel": "72d3fcf802c45d00b300f25b848a93c3a2bd7c7e",
+  "patch_count": 19,
+  "last_patch": "0019-stream-open-bounded-wait-for-peer.patch",
+  "series_sha256": "133c1bd39e3e21388fbd4739b2f68dfe4da4b274f79f9ba3268be08c18e58ffd",
   "materialized_files": {
-    "drivers/thunderbolt/dma_recovery.c": "b4019cf1e22016649678dfa0712c6f5b991450373fadb8963c22594d00246f01",
-    "drivers/thunderbolt/xdomain_notify.h": "96ddb040e6c9d964bc875554cb42325943436f2215748d0b4fb0019db767586b",
-    "drivers/thunderbolt/gpu_group_reset.h": "bae2601de79eb7e8e3d0533877522ae5ac64e4f2fba0e8c5f39a8af6c909af59",
-    "drivers/thunderbolt/gpu_stream.h": "c2ed9cc8f246ad4f106f54e2480b787c5ab2b3fba3ee7af5f8f99fa4e90fd0ed",
-    "drivers/thunderbolt/dma_path_query.h": "ad1abdda0e82657662941775c38e6cf43c076277d1395b27177436c95ae3b89a",
-    "drivers/thunderbolt/gpu_stream_logic.h": "375dace1bd5d0374a04d22af6e51769d6dd90b691ab7f7c8cf2896c3af9ae134",
-    "drivers/thunderbolt/gpu_stream.c": "61f5f6f5e65e41da48698dff8190bf4344d9816ffe35f08f2d95d4bc3ea4dd82",
     "drivers/net/thunderbolt/dma_recovery.h": "1fb352bbee0ba4802b03ba0a24317f6849cacb8fb8810866e030c62cdca1bcb0",
-    "include/linux/thunderbolt.h": "80594aa28ba34e5125da22ede65936feb1071a84dab58c972df1fd0734f588a9",
-    "include/uapi/linux/strix_gpu_stream.h": "9e90140bb44a0c4b58b03f6d334f67e31c56f1f3f76633c9f52528e2253dda28"
+    "drivers/net/thunderbolt/main.c": "2aa4736f1c65d2466113cdc72f9d375adbd1b321d1de09cc4c7fa4e07b86976d",
+    "drivers/thunderbolt/Kconfig": "5cee07cc447b2faabaeaca9fa0265fdee13cf51808a6a3ae086c2649c3a1cc1b",
+    "drivers/thunderbolt/dma_path_query.h": "288f052b9282194604c23fc6d58efc7095e8860b70a60055af94cec02a0d689d",
+    "drivers/thunderbolt/dma_recovery.c": "1367ba86ddfd1dab5da39a9e7f4d6597ae6ff07c3521f51fea1e52f922a32f63",
+    "drivers/thunderbolt/domain.c": "38e3f67ef0d7a768d96b25130f4830acd92979434995103bb29b2c1d40cd2c02",
+    "drivers/thunderbolt/gpu_group_reset.h": "4c43b4d72a6464b53924b678b40166ffd5dce85f4c7339a1bde5d42b775ba384",
+    "drivers/thunderbolt/gpu_stream.c": "357d3b05ab91f58abcc91e172cfe76b1dab9fd85062e247d32497f91f4d0db2b",
+    "drivers/thunderbolt/gpu_stream.h": "c2ed9cc8f246ad4f106f54e2480b787c5ab2b3fba3ee7af5f8f99fa4e90fd0ed",
+    "drivers/thunderbolt/gpu_stream_logic.h": "e4731512930e9d53fc966961afa8aa400be8d4464369053229909d0ac9dc0299",
+    "drivers/thunderbolt/nhi.c": "fa6bbbc80a0f610a3023f2e11a63a5e5cdea67b8cf84b12df32ede57ecaa3b2d",
+    "drivers/thunderbolt/nhi.h": "2c5973de7f052ed0c5cabefb3e798727ded740aafc85a1ae75bda441ca44bcdb",
+    "drivers/thunderbolt/nhi_regs.h": "2f6245ed382d68a3dd464c84c66fb0d149b7a9189aedd783ef43589d8a5072d6",
+    "drivers/thunderbolt/pci.c": "4f0fc4376523c1923fd5e01bd4d87ad708191cb266781fe3b40b2340fc3dfa44",
+    "drivers/thunderbolt/stream.c": "6635e7956c26f2dbb17a6284af0c8b03e49271521691f3a885cd5a86c6c5f7c8",
+    "drivers/thunderbolt/tb.c": "3bf7db3927c99ff7d75d892eb2d837f925b4337f5b343bfd14bb10870bb6c44c",
+    "drivers/thunderbolt/tb.h": "48e4378d7849667c170cb19ab67096a6f09717677131e7198be089ef6d1cbe92",
+    "drivers/thunderbolt/tunnel.c": "0a831db8ba17a89aaff1ae49f7750837abddd695c6895e2d5a7ef905e16fac41",
+    "drivers/thunderbolt/xdomain.c": "6a99d495d41b8b7d55ae4580ae9750b9ee7480aba0cc1b2b6812b2d8bf454a3a",
+    "drivers/thunderbolt/xdomain_notify.h": "96ddb040e6c9d964bc875554cb42325943436f2215748d0b4fb0019db767586b",
+    "include/linux/thunderbolt.h": "b9bcd4d0d296fe08b2a447eee528d22f32016624b0cdba9ba92eac5f39b06629",
+    "include/uapi/linux/strix_gpu_stream.h": "c0cb80b93f9b4471e7304f840e3b0da44593040df57d11d17d74da695cb6f5bf"
   },
+  "engine_commit": "56d4dae87cbb37c15258b347c55b68ab2b10620d",
   "engine_files_sha256": {
-    "include/strix/linux_direct_gpu_stream_uapi.h": "9e90140bb44a0c4b58b03f6d334f67e31c56f1f3f76633c9f52528e2253dda28",
-    "src/linux_gpu_queue.cpp": "4f20935f0dd2869bf387771929db866bae453aad1ed776c9fdc16be73327741f",
-    "src/gpu_queue_session.cpp": "d7b329370bf217d1f47b19e411d6ff7a7acbb3f8c995885ad80620d17508614b"
-  }
+    "include/strix/linux_direct_gpu_stream_uapi.h": "c0cb80b93f9b4471e7304f840e3b0da44593040df57d11d17d74da695cb6f5bf",
+    "src/linux_gpu_queue.cpp": "d930225f70bd49d9399a3fa483b0f2579ea0750cb9b59936e0147be03aed6517",
+    "src/gpu_queue_session.cpp": "a98d81836dc0a54fdc9532d1dc0404b74e49be4096a6b97060fcbca4a3afa759"
+  },
+  "engine_ref": "usb4/uapi-0016 (local branch, not pushed)"
 }

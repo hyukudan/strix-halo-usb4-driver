@@ -1,8 +1,12 @@
+CONFIG_CONFIGFS_FS=y
 CONFIG_USB4=m
 CONFIG_USB4_CONFIGFS=m
 CONFIG_USB4_STREAM=m
 CONFIG_USB4_GPU_STREAM=y
 CONFIG_USB4_NET=m
 CONFIG_DMA_SHARED_BUFFER=y
-CONFIG_LOCALVERSION="-strix-gpu-bosgame-20261014"
+# Placeholder: every build sets its own identity, for example
+#   scripts/config --file .config --set-str LOCALVERSION "-strix-gpu-bosgame-$(date +%Y%m%d)a"
+# then runs tools/check_kconfig.py on the final .config (it rejects this value).
+CONFIG_LOCALVERSION="-strix-gpu-bosgame-SET-A-UNIQUE-BUILD-ID"
 # CONFIG_LOCALVERSION_AUTO is not set
