@@ -90,7 +90,8 @@ static void xdomains_unregistered_before_stop(void)
     assert_before("unregister 2", "deactivate tunnels of 1");
     assert_before("stop", "ctl_stop");
     assert_before("ctl_stop", "flush_workqueue");
-    assert_before("flush_workqueue", "retire");
+    assert_before("flush_workqueue", "cancel_teardown_reset");
+    assert_before("cancel_teardown_reset", "retire");
     assert_before("retire", "deinit");
     assert_before("deinit", "domain_unregister");
     assert(!t.root.registered && !t.child.registered && !t.tb.dev.registered);

@@ -121,6 +121,21 @@ class DomainTeardownTests(unittest.TestCase):
         self.assertIsNotNone(ops)
         self.assertIn('\t.remove_xdomains = tb_remove_xdomains,\n', ops.group(0))
 
+    def test_teardown_reset_wiring(self):
+        """0018: where the teardown reset is scheduled and cancelled (its
+        behaviour is run in test_dma_recovery)."""
+        domain_c = (self.source / 'domain.c').read_text()
+        tb_c = (self.source / 'tb.c').read_text()
+        disconnect = extract(domain_c, 'tb_domain_disconnect_xdomain_paths')
+        self.assertRegex(disconnect, r'\tif \(!ret\)\n\t\ttb_domain_schedule_teardown_reset\(tb\);\n\treturn ret;')
+        hotplug = extract(tb_c, 'tb_handle_hotplug')
+        self.assertRegex(hotplug, r'__tb_disconnect_xdomain_paths\(tb, xd, -1, -1, -1, -1\);\n'
+                                  r'(\t+/\*[^\n]*\*/\n)?\t+tb_domain_schedule_teardown_reset\(tb\);')
+        self.assertIn('INIT_DELAYED_WORK(&tb->teardown_reset_work, tb_domain_teardown_reset_work);',
+                      extract(domain_c, 'tb_domain_alloc'))
+        for name in ('tb_domain_release', 'tb_domain_remove', 'tb_domain_suspend', 'tb_domain_freeze_noirq'):
+            self.assertIn('cancel_delayed_work_sync(&tb->teardown_reset_work);', extract(domain_c, name), name)
+
     def test_failed_probe_wait_is_bounded(self):
         nhi_c = (self.source / 'nhi.c').read_text()
         probe = extract(nhi_c, 'nhi_probe')

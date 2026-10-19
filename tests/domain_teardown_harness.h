@@ -110,6 +110,9 @@ struct tb_nhi { spinlock_t lock; bool dma_shutdown; };
 struct tb_ctl { bool running; };
 struct device { bool registered; };
 struct tb_cm { bool hotplug_active; };
+/* The teardown reset work: removal must cancel it before the NHI goes. */
+struct delayed_work { bool pending; };
+static void cancel_delayed_work_sync(struct delayed_work *w) { w->pending = false; log_event("cancel_teardown_reset"); }
 struct tb_cm_ops {
     void (*remove_xdomains)(struct tb *tb);
     void (*stop)(struct tb *tb);
@@ -124,6 +127,7 @@ struct tb {
     struct device dev;
     struct tb_switch *root_switch;
     struct tb_cm cm;
+    struct delayed_work teardown_reset_work;
 };
 static struct tb_cm *tb_priv(struct tb *tb) { return &tb->cm; }
 
