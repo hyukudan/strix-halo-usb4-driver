@@ -1,0 +1,51 @@
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -1191,8 +1191,24 @@ static int nhi_runtime_resume(struct device *dev)
+ 	return tb_domain_runtime_resume(tb);
+ }
+ 
++/*
++ * A ring nobody freed (an abandoned DMA owner keeps its rings and their DMA
++ * memory on purpose; anything else is an owner bug) must not outlive the
++ * NHI on the CPU side: its MSI-X handler and its completion work dereference
++ * ring->nhi, whose memory, MMIO and dma_wq go away with this device. Free
++ * the IRQ, which waits for a running handler, then wait for the work. The
++ * ring stays allocated and keeps its descriptors and buffers.
++ */
++static void nhi_ring_release_cpu(struct tb_nhi *nhi, struct tb_ring *ring)
++{
++	if (nhi->ops->release_ring_irq)
++		nhi->ops->release_ring_irq(ring);
++	cancel_work_sync(&ring->work);
++}
++
+ void nhi_shutdown(struct tb_nhi *nhi)
+ {
++	struct tb_ring *ring;
+ 	int i;
+ 
+ 	dev_dbg(nhi->dev, "shutdown\n");
+@@ -1213,6 +1229,22 @@ void nhi_shutdown(struct tb_nhi *nhi)
+ 	}
+ 	nhi_disable_interrupts(nhi);
+ 
++	/* Interrupts are masked: now close every CPU path into leftover rings */
++	for (i = 0; i < nhi->hop_count; i++) {
++		spin_lock_irq(&nhi->lock);
++		ring = nhi->tx_rings[i];
++		nhi->tx_rings[i] = NULL;
++		spin_unlock_irq(&nhi->lock);
++		if (ring)
++			nhi_ring_release_cpu(nhi, ring);
++		spin_lock_irq(&nhi->lock);
++		ring = nhi->rx_rings[i];
++		nhi->rx_rings[i] = NULL;
++		spin_unlock_irq(&nhi->lock);
++		if (ring)
++			nhi_ring_release_cpu(nhi, ring);
++	}
++
+ 	if (nhi->ops->shutdown)
+ 		nhi->ops->shutdown(nhi);
+ }

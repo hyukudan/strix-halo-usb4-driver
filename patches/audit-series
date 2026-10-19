@@ -16,3 +16,4 @@
 0017-stream-detach-ram-rings-and-domain-xdomain-teardown.patch
 0018-amd-teardown-interface-reset-when-idle.patch
 0019-stream-open-bounded-wait-for-peer.patch
+0020-nhi-shutdown-releases-ring-interrupts.patch
