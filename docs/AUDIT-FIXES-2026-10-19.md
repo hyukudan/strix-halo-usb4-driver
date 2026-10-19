@@ -1,4 +1,4 @@
-# External audit fixes 0020–0035 (2026-10-19)
+# External audit fixes 0020–0039 (2026-10-19/20)
 
 State: implemented and tested **offline only** (unit tests with sanitizers,
 `W=1` object builds, and full `W=1 vmlinux modules` builds with modpost on
@@ -13,7 +13,7 @@ Line references in the verdicts are to that tree.
 
 ## Numbering
 
-The audit fixes are **0020–0035**, directly after 0019. The per-stream
+The audit fixes are **0020–0039**, directly after 0019 (0036–0039 answer the review of 0020–0035). The per-stream
 end-to-end setting on `perf/stream-throughput` (also numbered 0020 there) is a
 measurement-only option and moves to the end: it gets the next free number when
 that branch is rebased on this one. The other choice, putting these fixes after
@@ -30,16 +30,16 @@ rebase.
 | A3 | Confirmed | `stream.c:2386-2415` `tbstream_resume()` | 0022 |
 | A4 | Confirmed | `stream.c:605-645` `tbstream_dev_alloc_rx_buffers()` | 0023 |
 | A5 | Confirmed | `dma_recovery.c:447-462` `tb_dma_revoke_bus_master()` | 0024 |
-| A6 | Confirmed | `stream.c:546-565` `tbstream_dev_rx_callback()`, read at `:962` | 0025 |
+| A6 | Confirmed | `stream.c:546-565` `tbstream_dev_rx_callback()`, read at `:962` | 0025, 0037 |
 | A7 | Confirmed | `stream.c:759` `tbstream_dev_send_close()`, comment at `:1369` | 0026 |
 | A8 | Confirmed | `stream.c:962` read, `:1089` write | 0027 |
-| A9 | Confirmed for the device mutex | `gpu_stream.c:1807` | 0031 |
+| A9 | Confirmed: device mutex and `dma_lock` | `gpu_stream.c:1807`; `dma_lock` at `:567` and `:1541` of the reviewed tree | 0031, 0036 |
 | A10 | Confirmed | `stream.c:923-925` `tbstream_dev_stop()` | 0028 |
 | A11 | Confirmed | `stream.c:330` `module_param(spin_us)`, limit `:1484` | 0030 |
-| A12 | Confirmed, also in the field (addendum F) | `dma_recovery.c:318-352` `tb_domain_teardown_reset_work()` | 0029 |
+| A12 | Confirmed, also in the field (addendum F) | `dma_recovery.c:318-352` `tb_domain_teardown_reset_work()` | 0029, 0038 |
 | E1 | Confirmed | `xdomain.c:1811-1813` (`XDOMAIN_STATE_BONDING_UUID_LOW` in `tb_xdomain_state_work()`) | 0033 |
 | E2 | Confirmed | `tb.c:3114` (`tb_start()`; the resume path at `:3221` is non-USB4 only) | 0034 |
-| E3 | Confirmed (no recovery existed); opt-in policy added | `xdomain.c:1434` (`tb_xdomain_link_state_change()`), enumeration at `:1536` | 0035 |
+| E3 | Confirmed (no recovery existed); opt-in policy added | `xdomain.c:1434` (`tb_xdomain_link_state_change()`), enumeration at `:1536` | 0035, 0039 |
 
 **A1.** An abandoned GPU context keeps its rings, which is the point of the
 quarantine. `nhi_shutdown()` masks the interrupts but leaves those rings in
@@ -204,6 +204,32 @@ tbstream_dev` (members from 0010/0011/0015) and `struct tbnet`
 (`recovery_node`, 0009). It changes no code. It is a separate patch so the
 already published patches keep their content.
 
+## Review of 0020–0035 and fixes 0036–0039 (2026-10-20)
+
+A read-only review of the merged branch (`fix/audit-merged` 304033a) found
+four defects in these patches and gaps in their tests. All are confirmed
+and fixed:
+
+| Finding | Defect in the reviewed tree | Fix |
+|---|---|---|
+| A6 | `read_iter()` handled the CLOSE PDF before the CRC/overrun check (`stream.c:1150`): a damaged CLOSE became a normal EOF | **0037**: the damage check comes first; a damaged CLOSE gives `EIO`, the stream is not marked closed |
+| A9 | Non-blocking SUBMIT/RX_REPOST still slept on `ctx->dma_lock` (`gpu_stream.c:1541`, and `:567` in `sgu_publish_fence()`), which the watchdog holds while it stops the rings | **0036**: with `O_NONBLOCK` both places only try it. The publication takes it before the fence is initialised, so `EAGAIN` publishes nothing, changes no operation and keeps the fence sequence |
+| A12/F | (1) A request made while a reset was finishing (domain lock and PM reference already released) was cleared by that run. (2) Ten `-EAGAIN` with no ring parked it forever. (3) Suspend only cancelled the work: a late ring free or path teardown could queue it again | **0038**: a request generation, so a run clears only its own request. A busy lock with no consumer is retried every 2 s (logged once); only `-EBUSY` parks. A `suspended` mark under `nhi->lock` is set before the cancel and checked by every path that queues the work; `tb_domain_complete()` clears it and re-arms |
+| E3 | (1) LINK_CONF (shared sideband mailbox, serialized by the domain lock as in debugfs) was read before the lock was tried. (2) "No data ring" was checked and released at once, while ring allocation and start do not take the domain lock. (3) Only DMA tunnels were checked | **0039**: the lock is tried before any port or sideband access. The NHI is held with the DMA reset admission (`tb_nhi_dma_exclusive_begin()`: `dma_resetting`, so allocation and start refuse data rings) from the check until the reset is done. The new CM op `tunnels_active` reports any tunnel, and a CM without it vetoes |
+
+Interleavings the earlier tests could not see are now modelled:
+- **0038:**
+  - a hook runs inside the reset's final PM put, where another thread can make a request or free the last ring;
+  - the real `tb_nhi_ring_freed()` hook runs during suspend;
+  - the lock is held past the budget, then a consumer appears.
+- **0036:** a real second thread holds `dma_lock` as the watchdog does; an injected trylock failure covers the publication after SUBMIT's admission.
+- **0039:** the mocks require the domain lock for the sideband read, the tunnel query and the reset, and refuse a ring allocation during the reset.
+
+The review's test gaps are closed:
+- **A3:** `resume_failure_at_every_step` fails each step of `tbstream_dev_start()`, up to the RX frame array after the paths are enabled. It checks that nothing is left allocated or tunnelled.
+- **A5:** `teardown_revoke` covers a zero hop count.
+- **A6:** a damaged CLOSE is covered.
+
 ## Tests
 
 Each fix has offline tests that run the actual patched function in the
@@ -226,8 +252,13 @@ existing harnesses, under AddressSanitizer and UndefinedBehaviorSanitizer:
 | 0033 | `test_cm_link: bonding_retried_and_bounded`, state machine wiring |
 | 0034 | `test_cm_link: host_reset_result_checked`, `tb_start()` wiring |
 | 0035 | `test_cm_link: gen3_retrain_policy` (registers and sideband scripted, including the `f3`/`d3` LINK_CONF values), wiring |
+| 0036 | `test_gpu_queue: nonblock_contended_dma_lock` |
+| 0037 | `test_stream_host_path: damaged_close_is_not_eof` |
+| 0038 | `test_dma_recovery: teardown_reset_request_during_reset`, `teardown_reset_ring_freed_during_attempt`; `teardown_reset_lock_busy` and `teardown_reset_pending_across_suspend` extended |
+| 0039 | `test_cm_link: gen3_retrain_policy` extended; `test_dma_path_query: any_tunnel` |
+| (tests) | `resume_failure_at_every_step` (A3), `teardown_revoke` zero hop count (A5) |
 
-**Removal check.** Each safeguard was reverted on its own, 55 mutations in
+**Removal check.** Each safeguard was reverted on its own, 78 mutations in
 total, and every one fails at least one test:
 
 | Fix | Mutations |
@@ -241,17 +272,28 @@ total, and every one fails at least one test:
 | A7 | 2 |
 | A8 | 6 |
 | A10 | 1 |
-| A12 (F) | 9 |
+| A12 (F) | 9 (7 re-run against 0038, all caught) |
 | A11 | 2 |
 | A9 | 2 |
 | E1 | 5 |
 | E2 | 2 |
 | E3 | 10 |
+| 0036 (A9) | 3 |
+| 0037 (A6) | 1 |
+| 0038 (F) | 8 |
+| 0039 (E3) | 7 |
+| A3/A5 tests | 4 |
 
 Each patch commit also passes the whole suite on its own (`unittest discover`
 against the tree at that patch).
 
 ## What still needs hardware (audit section D)
+
+The review's minimum matrix adds the following:
+- F with paths and rings freed in both orders, a GPU or USB4NET last user, the domain lock busy past the budget, a new request as a reset ends, and suspend or removal with a reset pending.
+- CRC/overrun on a CLOSE frame.
+- Contention on both GPU mutexes.
+- `gen3_retrain=0/1` with concurrent consumers, comparing registers and sysfs on both ends.
 
 None of these fixes has run on the nodes. Before the series is installed:
 
