@@ -90,6 +90,12 @@ def main(argv=None):
                         help='LOCALVERSION already used (repeatable), e.g. the running kernel')
     parser.add_argument('--kernelrelease', help='output of make -s kernelrelease')
     parser.add_argument('--modules-root', type=Path, default=Path('/lib/modules'))
+    # Every LOCALVERSION starts with '-', which argparse would take for an
+    # option: accept "--forbid VALUE" by rewriting it to "--forbid=VALUE".
+    argv = list(sys.argv[1:] if argv is None else argv)
+    for i in range(len(argv) - 1, 0, -1):
+        if argv[i - 1] == '--forbid':
+            argv[i - 1:i + 1] = ['--forbid=' + argv[i]]
     args = parser.parse_args(argv)
     problems = check(args.config.read_text(), args.fragment.read_text(), not args.gpu_off,
                      args.forbid, args.kernelrelease, args.modules_root)

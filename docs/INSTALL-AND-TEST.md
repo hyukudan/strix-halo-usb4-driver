@@ -76,7 +76,7 @@ scripts/config --file ../build-usb4/.config \
     --set-str LOCALVERSION "-strix-gpu-bosgame-$(date +%Y%m%d)a"
 make O=../build-usb4 olddefconfig
 python3 "$driver/tools/check_kconfig.py" ../build-usb4/.config \
-    --forbid "$(uname -r | sed 's/^7\.3\.0-rc5//')" \
+    --forbid="$(uname -r | sed 's/^7\.3\.0-rc5//')" \
     --kernelrelease "$(make -s O=../build-usb4 kernelrelease)"
 make O=../build-usb4 -j"$(nproc)" W=1
 ```
