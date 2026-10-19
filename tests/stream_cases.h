@@ -238,6 +238,7 @@ static void irq_affinity_is_restored(void)
 }
 
 #include "stream_detach_cases.h"
+#include "stream_open_cases.h"
 
 int main(int argc, char **argv)
 {
@@ -254,6 +255,14 @@ int main(int argc, char **argv)
         { "detach_without_open_files", detach_without_open_files },
         { "stop_is_idempotent", stop_is_idempotent },
         { "shutdown_detaches", shutdown_detaches },
+        { "open_fails_fast_without_domain", open_fails_fast_without_domain },
+        { "open_fails_fast_without_xdomain", open_fails_fast_without_xdomain },
+        { "open_nonblock_eagain", open_nonblock_eagain },
+        { "open_wait_is_bounded", open_wait_is_bounded },
+        { "open_waits_for_peer", open_waits_for_peer },
+        { "open_wait_ends_when_xdomain_goes", open_wait_ends_when_xdomain_goes },
+        { "open_wait_is_interruptible", open_wait_is_interruptible },
+        { "open_timeout_settings", open_timeout_settings },
     };
 
     assert(argc == 2);

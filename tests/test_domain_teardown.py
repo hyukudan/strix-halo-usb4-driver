@@ -102,6 +102,9 @@ class DomainTeardownTests(unittest.TestCase):
         nhi_c = (cls.source / 'nhi.c').read_text()
         regs = (cls.source / 'nhi_regs.h').read_text()
         quirks = (cls.source / 'nhi.h').read_text()
+        xdomain_c = (cls.source / 'xdomain.c').read_text()
+        cls.presence = build(tmp, 'presence', '#include "xdomain_presence_cases.h"\n' +
+                             extract(xdomain_c, 'tb_xdomain_presence'))
         # The MMIO model and the cases come first; the functions follow.
         cls.nhi = build(tmp, 'nhi', ''.join(
             [NHI_PRELUDE] + [define(regs, name) for name in NHI_DEFINES] +
@@ -120,6 +123,13 @@ class DomainTeardownTests(unittest.TestCase):
                         (self.source / 'tb.c').read_text(), re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(ops)
         self.assertIn('\t.remove_xdomains = tb_remove_xdomains,\n', ops.group(0))
+
+    def test_xdomain_presence(self):
+        """0019: what open() asks before waiting for a peer."""
+        self.run_case(self.presence, 'presence')
+        header = (self.source.parent.parent / 'include/linux/thunderbolt.h').read_text()
+        self.assertIn('int tb_xdomain_presence(unsigned int domain, u64 route);', header)
+        self.assertIn('EXPORT_SYMBOL_GPL(tb_xdomain_presence);', (self.source / 'xdomain.c').read_text())
 
     def test_teardown_reset_wiring(self):
         """0018: where the teardown reset is scheduled and cancelled (its

@@ -21,7 +21,10 @@ ROOT = Path(__file__).resolve().parent
 CASES = ('open_failure_is_not_sticky', 'frame_arrays_use_kvcalloc', 'spin_without_device_mutex',
          'spin_is_bounded_and_rearms', 'irq_affinity_is_restored', 'detach_stops_open_ram_rings',
          'reconnect_refuses_stale_endpoint', 'blocked_reader_fails_cleanly', 'rmdir_with_open_file',
-         'detach_without_open_files', 'stop_is_idempotent', 'shutdown_detaches')
+         'detach_without_open_files', 'stop_is_idempotent', 'shutdown_detaches',
+         'open_fails_fast_without_domain', 'open_fails_fast_without_xdomain', 'open_nonblock_eagain',
+         'open_wait_is_bounded', 'open_waits_for_peer', 'open_wait_ends_when_xdomain_goes',
+         'open_wait_is_interruptible', 'open_timeout_settings')
 STRUCTS = ('tbstream_frame', 'tbstream_ring', 'tbstream_dev', 'tbstream_group', 'tbstream')
 FUNCTIONS = ('tbstream_ring_free', 'tbstream_ring_available', 'tbstream_rx_start_poll',
              'tbstream_dev_napi_rx_locked', 'tbstream_dev_napi_rx', 'tbstream_dev_napi_spin',
@@ -33,7 +36,8 @@ FUNCTIONS = ('tbstream_ring_free', 'tbstream_ring_available', 'tbstream_rx_start
              'tbstream_dev_detached', 'to_tbstream_dev', 'tbstream_dev_completed_rx',
              'tbstream_dev_consume_rx', 'tbstream_dev_alloc_tx', 'tbstream_dev_send_data',
              'tbstream_dev_send_close', 'tbstream_dev_lock', 'tbstream_dev_fops_read_iter',
-             'tbstream_dev_fops_write_iter', 'tbstream_dev_fops_poll', 'tbstream_dev_fops_open',
+             'tbstream_dev_fops_write_iter', 'tbstream_dev_fops_poll', 'tbstream_dev_open_timeout',
+             'tbstream_dev_wait_stream', 'tbstream_dev_fops_open',
              'tbstream_dev_fops_release', 'tbstream_dev_from_group', 'tbstream_dev_alloc_in_hopid',
              'tbstream_dev_alloc_out_hopid', 'tbstream_dev_attach_stream', 'tbstream_dev_detach_stream',
              'to_tbstream_group', 'tbstream_dev_drop_item', 'tbstream_group_attach_stream',
@@ -59,7 +63,8 @@ class StreamHostPathTests(unittest.TestCase):
         source = Path(os.environ['USB4_SOURCE_TREE']) / 'drivers/thunderbolt/stream.c'
         text = source.read_text()
         enum = re.search(r'^enum tbstream_frame_pdf \{\n.*?^\};\n', text, re.MULTILINE | re.DOTALL).group(0)
-        parts = ['#include "stream_harness.h"\n', enum]
+        parts = ['#include "stream_harness.h"\n', enum,
+                 re.search(r'^#define TBSTREAM_DEV_MAX_OPEN_TIMEOUT_MS\t\d+\n', text, re.MULTILINE).group(0)]
         parts += [extract(text, 'struct', name) for name in STRUCTS]
         parts += [extract(text, 'function', name) for name in FUNCTIONS]
         parts.append('#include "stream_cases.h"\n')
@@ -86,6 +91,18 @@ class StreamHostPathTests(unittest.TestCase):
                            text, re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(driver)
         self.assertRegex(driver.group(0), r'\n\t\.shutdown = tbstream_shutdown,\n')
+
+    def test_open_timeout_defaults(self):
+        text = (Path(os.environ['USB4_SOURCE_TREE']) / 'drivers/thunderbolt/stream.c').read_text()
+        self.assertIn('static unsigned int open_timeout_ms = 30000;\n', text)
+        self.assertIn('module_param(open_timeout_ms, uint, 0644);', text)
+        self.assertIn('#define TBSTREAM_DEV_MAX_OPEN_TIMEOUT_MS\t600000\n', text)
+        self.assertIn('\tsdev->cfg_open_timeout_ms = -1;\n', text)
+        attrs = re.search(r'^static struct configfs_attribute \*tbstream_dev_attrs\[\] = \{\n.*?^\};\n',
+                          text, re.MULTILINE | re.DOTALL)
+        self.assertIn('&tbstream_dev_attr_open_timeout_ms,', attrs.group(0))
+        store = extract(text, 'function', 'tbstream_dev_open_timeout_ms_store')
+        self.assertIn('-1,\n\t\t\t\t      TBSTREAM_DEV_MAX_OPEN_TIMEOUT_MS);', store)
 
     def run_case(self, case):
         result = subprocess.run([str(self.binary), case], capture_output=True, text=True, timeout=30,

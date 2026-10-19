@@ -460,4 +460,30 @@ static void *tb_service_get_drvdata(struct tb_service *svc) { return svc->drvdat
 /* Module parameters of stream.c (declared by module_param there). */
 static bool rx_napi;
 static unsigned int spin_us;
+static unsigned int open_timeout_ms = 30000;
+
+/* Bounded open (0019): time in jiffies of 1 ms, the timed wait, and the
+ * core's answer about the endpoint's domain and XDomain. */
+#define HZ 1000
+#define msecs_to_jiffies(ms) ((unsigned long)(ms))
+#define jiffies ((unsigned long)(ktime_get() / 1000000))
+#define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
+#define wait_event_interruptible_timeout(wq, cond, timeout) ({ \
+    long __left = (timeout); \
+    ktime_t __end = ktime_add_ms(ktime_get(), __left); \
+    (void)(wq); \
+    for (;;) { \
+        if (cond) { __left = __left > 0 ? __left : 1; break; } \
+        if (signal_pending(current)) { __left = -ERESTARTSYS; break; } \
+        if (!ktime_before(ktime_get(), __end)) { __left = (cond) ? 1 : 0; break; } \
+        sched_yield(); \
+    } \
+    __left; })
+static atomic_int presence_result = -ENXIO, presence_calls;
+static int tb_xdomain_presence(unsigned int domain, u64 route)
+{
+    assert(domain == 1 && route == 2); /* the endpoint group "1-2.0" */
+    atomic_fetch_add(&presence_calls, 1);
+    return atomic_load(&presence_result);
+}
 #endif
