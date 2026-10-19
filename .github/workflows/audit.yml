@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       engine_ref:
-        description: 'strix-halo-engine-lab ref for the HIP integration job (its UAPI header must equal the driver one)'
+        description: 'Override the engine commit for the HIP job (default: engine_commit in provenance/software-validation.json)'
         required: false
         default: ''
 permissions:
@@ -102,23 +102,33 @@ jobs:
           path: ${{ runner.temp }}/build-gpu-*.log
           if-no-files-found: ignore
 
-  # The native HIP consumer. Manual only: it needs a ROCm container (several GB)
-  # and an engine ref whose UAPI header is byte-identical to this series'.
+  # The native HIP consumer, on every push and pull request. The engine commit
+  # is the one the manifest pins (engine_commit), so the job checks exactly the
+  # integration that validate_native.py accepts; it fails while that commit is
+  # not published in strix-halo-engine-lab.
   hip-integration:
-    if: github.event_name == 'workflow_dispatch' && inputs.engine_ref != ''
     needs: unit
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container: rocm/dev-ubuntu-24.04:latest
     steps:
+      - run: apt-get update && apt-get install -y cmake ninja-build git python3
       - uses: actions/checkout@v4
         with:
           path: driver
           persist-credentials: false
+      - name: Engine commit pinned by the manifest
+        id: engine
+        run: |
+          pinned=$(python3 -c 'import json; print(json.load(open("driver/provenance/software-validation.json"))["engine_commit"])')
+          echo "ref=${OVERRIDE:-$pinned}" >> "$GITHUB_OUTPUT"
+          echo "engine commit: ${OVERRIDE:-$pinned} (manifest: $pinned)"
+        env:
+          OVERRIDE: ${{ inputs.engine_ref }}
       - uses: actions/checkout@v4
         with:
           repository: hyukudan/strix-halo-engine-lab
-          ref: ${{ inputs.engine_ref }}
+          ref: ${{ steps.engine.outputs.ref }}
           path: engine
           persist-credentials: false
       - uses: actions/checkout@v4
@@ -131,7 +141,6 @@ jobs:
             drivers/thunderbolt
             drivers/net/thunderbolt
           sparse-checkout-cone-mode: true
-      - run: apt-get update && apt-get install -y cmake ninja-build git python3
       - name: UAPI header equality (driver vs engine)
         run: |
           python3 driver/tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source" --kernel-source "$PWD/pinned-linux"

@@ -46,6 +46,10 @@ class CheckBuildLogTests(unittest.TestCase):
         self.assertIn('--disable USB4_GPU_STREAM', workflow)
         self.assertIn('tools/apply-series.sh', workflow)
         self.assertIn('strix-gpu-queue-visibility', workflow)
+        hip = workflow[workflow.index('  hip-integration:'):]
+        self.assertNotIn('if: github.event_name', hip.split('steps:')[0])   # runs on PRs too
+        self.assertIn('["engine_commit"]', hip)
+        self.assertIn('ref: ${{ steps.engine.outputs.ref }}', hip)
 
 
 if __name__ == '__main__':
