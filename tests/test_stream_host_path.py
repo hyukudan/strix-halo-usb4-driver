@@ -31,9 +31,10 @@ CASES = ('open_failure_is_not_sticky', 'frame_arrays_use_kvcalloc', 'spin_withou
          'damaged_rx_frame_fails_stream',
          'close_waits_for_tx_slot',
          'partial_io_is_accounted',
-         'close_does_not_flush_rx')
+         'close_does_not_flush_rx',
+         'spin_us_parameter_is_bounded')
 STRUCTS = ('tbstream_frame', 'tbstream_ring', 'tbstream_dev', 'tbstream_group', 'tbstream')
-FUNCTIONS = ('tbstream_ring_free', 'tbstream_ring_available', 'tbstream_rx_start_poll',
+FUNCTIONS = ('spin_us_set', 'tbstream_ring_free', 'tbstream_ring_available', 'tbstream_rx_start_poll',
              'tbstream_dev_napi_rx_locked', 'tbstream_dev_napi_rx', 'tbstream_dev_napi_spin',
              'tbstream_dev_irq_pin', 'tbstream_dev_irq_affinity', 'tbstream_dev_irq_affinity_restore',
              'tbstream_dev_xdomain', 'tbstream_dev_rx_callback', 'tbstream_dev_alloc_rx_buffers',

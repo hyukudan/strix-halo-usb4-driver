@@ -1,0 +1,58 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -330,10 +330,32 @@ module_param(rx_napi, bool, 0644);
+ MODULE_PARM_DESC(rx_napi,
+ 		 "Reap RX completions in the reader (start_poll, NAPI style) instead of ring work; applies when a stream is opened (default: false)");
+ 
++/* Bounds the RX busy-poll of a reader, which holds rx_lock meanwhile */
++#define TBSTREAM_DEV_MAX_SPIN_US	1000
++
+ static unsigned int spin_us;
+-module_param(spin_us, uint, 0644);
++
++/* Same limit as the per-stream configfs value */
++static int spin_us_set(const char *value, const struct kernel_param *kp)
++{
++	unsigned int us;
++	int ret;
++
++	ret = kstrtouint(value, 0, &us);
++	if (ret)
++		return ret;
++	if (us > TBSTREAM_DEV_MAX_SPIN_US)
++		return -EINVAL;
++	return param_set_uint(value, kp);
++}
++
++static const struct kernel_param_ops spin_us_ops = {
++	.set = spin_us_set,
++	.get = param_get_uint,
++};
++module_param_cb(spin_us, &spin_us_ops, &spin_us, 0644);
+ MODULE_PARM_DESC(spin_us,
+-		 "With rx_napi, keep polling the RX ring this many microseconds before re-arming its interrupt (default: 0)");
++		 "With rx_napi, keep polling the RX ring this many microseconds before re-arming its interrupt, at most 1000 (default: 0)");
+ 
+ /* Hard IRQ context, nhi->lock and ring->lock held: the ring is masked. */
+ static void tbstream_rx_start_poll(void *data)
+@@ -860,7 +882,9 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 
+ 	sdev->rx_napi = (sdev->cfg_rx_napi < 0 ? READ_ONCE(rx_napi) : sdev->cfg_rx_napi) &&
+ 			!sdev->busy_poll;
+-	sdev->rx_spin_us = sdev->cfg_spin_us < 0 ? READ_ONCE(spin_us) : sdev->cfg_spin_us;
++	sdev->rx_spin_us = sdev->cfg_spin_us < 0 ?
++			   min_t(unsigned int, READ_ONCE(spin_us), TBSTREAM_DEV_MAX_SPIN_US) :
++			   sdev->cfg_spin_us;
+ 	sdev->rx_poll_pending = false;
+ 	sdev->rx_failed = false;
+ 	ring = tb_ring_alloc_tx(xd->tb->nhi, -1, sdev->ring_size, flags);
+@@ -1562,8 +1586,6 @@ tbstream_dev_busy_poll_store(struct config_item *item, const char *buf,
+ }
+ CONFIGFS_ATTR(tbstream_dev_, busy_poll);
+ 
+-#define TBSTREAM_DEV_MAX_SPIN_US	1000
+-
+ static ssize_t tbstream_dev_int_store(struct tbstream_dev *sdev, int *field,
+ 				      const char *buf, size_t count, int min, int max)
+ {
