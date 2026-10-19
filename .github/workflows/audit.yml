@@ -4,12 +4,17 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      engine_ref:
+        description: 'Override the engine commit for the HIP job (default: engine_commit in provenance/software-validation.json)'
+        required: false
+        default: ''
 permissions:
   contents: read
 jobs:
   unit:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -26,14 +31,17 @@ jobs:
             drivers/net/thunderbolt
           sparse-checkout-cone-mode: true
       - run: python3 tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source" --kernel-source "$GITHUB_WORKSPACE/pinned-linux"
+      # Includes the tools tests (pingpong with ASan/UBSan, describe, manifest,
+      # Kconfig check, apply-series) and the shipped manifest vs the reconstruction.
       - run: python3 -m unittest discover -s tests -v
         env:
           USB4_SOURCE_TREE: ${{ runner.temp }}/usb4-source
           USB4_KERNEL_SOURCE: ${{ github.workspace }}/pinned-linux
-  kernel-objects:
+
+  kernel-modules:
     needs: unit
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,15 +53,12 @@ jobs:
           ref: 72d3fcf802c45d00b300f25b848a93c3a2bd7c7e
           path: kernel
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y flex bison libelf-dev libssl-dev
+      - run: sudo apt-get update && sudo apt-get install -y flex bison libelf-dev libssl-dev bc dwarves
       - name: Reconstruct and compare both reconstruction methods
         run: |
           python3 driver/tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source" --kernel-source "$PWD/kernel"
+          sh driver/tools/apply-series.sh kernel
           cd kernel
-          while IFS= read -r patch; do
-            git apply --check "../driver/patches/$patch"
-            git apply "../driver/patches/$patch"
-          done < ../driver/patches/series
           python3 - <<'PY'
           import os
           from pathlib import Path
@@ -62,14 +67,88 @@ jobs:
               if path.is_file():
                   assert path.read_bytes() == Path(path.relative_to(src)).read_bytes(), path
           PY
-      - name: Compile affected objects with GPU mode enabled and disabled
+      - name: Configure (fragment, unique identity, final Kconfig check)
         working-directory: kernel
         run: |
           make defconfig
-          scripts/config --enable CONFIGFS_FS --module USB4 --module USB4_CONFIGFS --module USB4_STREAM --enable USB4_GPU_STREAM --module USB4_NET --enable DMA_SHARED_BUFFER
+          scripts/kconfig/merge_config.sh -m .config ../driver/config/usb4-gpu.fragment
+          scripts/config --set-str LOCALVERSION -strix-gpu-bosgame-ci
           make olddefconfig
-          grep -q '^CONFIG_USB4_GPU_STREAM=y' .config
-          make -j2 W=1 drivers/thunderbolt/nhi.o drivers/thunderbolt/pci.o drivers/thunderbolt/domain.o drivers/thunderbolt/xdomain.o drivers/thunderbolt/tunnel.o drivers/thunderbolt/tb.o drivers/thunderbolt/stream.o drivers/net/thunderbolt/main.o
+          python3 ../driver/tools/check_kconfig.py .config
+      # Full vmlinux + modules: modpost resolves every symbol the three USB4
+      # modules use. W=1 warnings in unrelated upstream code are ignored; any
+      # diagnostic located in this series' files fails the job.
+      - name: Build and link everything with GPU mode enabled
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" W=1 vmlinux modules 2>&1 | tee "$RUNNER_TEMP/build-gpu-on.log"
+          python3 ../driver/tools/check_build_log.py "$RUNNER_TEMP/build-gpu-on.log"
+      - name: Build and link everything with GPU mode disabled
+        working-directory: kernel
+        run: |
+          set -o pipefail
           scripts/config --disable USB4_GPU_STREAM
           make olddefconfig
-          make -j2 W=1 drivers/thunderbolt/stream.o
+          python3 ../driver/tools/check_kconfig.py .config --gpu-off
+          # Force relinking (and modpost) of every USB4 consumer in this configuration.
+          find drivers/thunderbolt drivers/net/thunderbolt -name '*.ko' -delete
+          make -j"$(nproc)" W=1 vmlinux modules 2>&1 | tee "$RUNNER_TEMP/build-gpu-off.log"
+          python3 ../driver/tools/check_build_log.py "$RUNNER_TEMP/build-gpu-off.log"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-logs
+          path: ${{ runner.temp }}/build-gpu-*.log
+          if-no-files-found: ignore
+
+  # The native HIP consumer, on every push and pull request. The engine commit
+  # is the one the manifest pins (engine_commit), so the job checks exactly the
+  # integration that validate_native.py accepts; it fails while that commit is
+  # not published in strix-halo-engine-lab.
+  hip-integration:
+    needs: unit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container: rocm/dev-ubuntu-24.04:latest
+    steps:
+      - run: apt-get update && apt-get install -y cmake ninja-build git python3
+      - uses: actions/checkout@v4
+        with:
+          path: driver
+          persist-credentials: false
+      - name: Engine commit pinned by the manifest
+        id: engine
+        run: |
+          pinned=$(python3 -c 'import json; print(json.load(open("driver/provenance/software-validation.json"))["engine_commit"])')
+          echo "ref=${OVERRIDE:-$pinned}" >> "$GITHUB_OUTPUT"
+          echo "engine commit: ${OVERRIDE:-$pinned} (manifest: $pinned)"
+        env:
+          OVERRIDE: ${{ inputs.engine_ref }}
+      - uses: actions/checkout@v4
+        with:
+          repository: hyukudan/strix-halo-engine-lab
+          ref: ${{ steps.engine.outputs.ref }}
+          path: engine
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: torvalds/linux
+          ref: 72d3fcf802c45d00b300f25b848a93c3a2bd7c7e
+          path: pinned-linux
+          persist-credentials: false
+          sparse-checkout: |
+            drivers/thunderbolt
+            drivers/net/thunderbolt
+          sparse-checkout-cone-mode: true
+      - name: UAPI header equality (driver vs engine)
+        run: |
+          python3 driver/tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source" --kernel-source "$PWD/pinned-linux"
+          cmp "$RUNNER_TEMP/usb4-source/include/uapi/linux/strix_gpu_stream.h" \
+              engine/include/strix/linux_direct_gpu_stream_uapi.h
+      - name: Build strix-gpu-queue-visibility (gfx1151)
+        run: |
+          cmake -S engine/lab/gpu_queue -B "$RUNNER_TEMP/hip" -G Ninja \
+            -DSTRIX_ENABLE_HIP_RUNTIME=ON -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ -DCMAKE_HIP_ARCHITECTURES=gfx1151
+          cmake --build "$RUNNER_TEMP/hip" --target strix-gpu-queue-visibility -j"$(nproc)"

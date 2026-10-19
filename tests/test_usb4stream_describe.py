@@ -270,6 +270,153 @@ class DescribeTests(unittest.TestCase):
         self.assertEqual(setup.SERVICES, ['0-2.0', '1-2.0'])
         self.assertEqual(setup.LAYOUT, Path('/run/usb4stream-layout.json'))
 
+    def test_hopid_zero_is_not_openable(self):
+        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        cdir = a.configfs / '0-2.0/data0'
+        write(cdir / 'in_hopid', '0')
+        report = a.describe()
+        entry = report['0-2.0/data0']
+        self.assertTrue(entry['attached'] and entry['exists'])
+        self.assertFalse(entry['openable'])
+        self.assertIn('HopIDs not allocated (in 0, out 8)', entry['openable_reason'])
+        self.assertTrue(report['0-2.0/data1']['openable'])
+        self.assertEqual(report['topology']['cables'][0]['streams_openable'], 1)
+
+    def test_legacy_layout_without_hopids_is_not_openable(self):
+        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        layout = Path(self.tmp) / 'layout.json'
+        layout.write_text(json.dumps(a.legacy))
+        report = describe_mod.Describer(a.sys, configfs_root=Path(self.tmp) / 'missing',
+                                        dev_root=a.dev, layout_path=layout, hostname='x',
+                                        require_chardev=False).describe()
+        self.assertFalse(report['0-2.0/data0']['openable'])
+        self.assertIn('HopIDs unknown', report['0-2.0/data0']['openable_reason'])
+
+    def test_unknown_speed_is_not_below_gen3(self):
+        a = FakeHost(self.tmp, 'cluster1', BOTH,
+                     {S5: ('cluster2', S5, 20.0, 2), S6: ('cluster2', S6, 20.0, 2)})
+        xd = a.sys / 'bus/thunderbolt/devices/1-2'
+        write(xd / 'rx_speed', 'garbage')
+        (xd / 'tx_lanes').unlink()
+        topo = a.describe()['topology']
+        link = topo['cables'][1]['link']
+        self.assertIsNone(link['full_speed'])
+        self.assertIsNone(link['gbps'])
+        self.assertFalse(any('below Gen3' in w for w in topo['warnings']))
+        self.assertTrue(any('cable B' in w and 'speed unknown' in w for w in topo['warnings']))
+        self.assertTrue(topo['cables'][0]['link']['full_speed'])
+
+    def test_stream_removed_during_enumeration(self):
+        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        gone = a.configfs / '0-2.0/data1'
+
+        class Racy(describe_mod.Describer):
+            def stream_dirs(self):
+                found = super().stream_dirs()
+                for f in gone.iterdir():      # rmdir after listing, before reading
+                    f.unlink()
+                gone.rmdir()
+                return found
+
+        report = Racy(a.sys, dev_root=a.dev, hostname='cluster1', require_chardev=False).describe()
+        self.assertNotIn('0-2.0/data1', report)
+        self.assertIn('0-2.0/data0', report)
+        self.assertTrue(any('0-2.0/data1 vanished' in w for w in report['topology']['warnings']))
+
+    def test_vanished_service_directory_and_driver_link(self):
+        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        self.assertEqual(describe_mod.listdir(Path(self.tmp) / 'nope'), [])
+        self.assertIsNone(describe_mod.driver_name(Path(self.tmp) / 'nope'))
+        self.assertEqual(describe_mod.driver_name(a.sys / 'bus/thunderbolt/devices/0-2.0'),
+                         'thunderbolt_stream')
+
+    def test_journalctl_failure_is_reported(self):
+        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+
+        class Failed:
+            returncode, stdout, stderr = 1, '', 'No journal files were found.'
+
+        original = describe_mod.subprocess.run
+        describe_mod.subprocess.run = lambda *a, **k: Failed()
+        try:
+            out = Path(self.tmp) / 'out.json'
+            with contextlib.redirect_stdout(io.StringIO()):
+                describe_mod.main(['--sysfs-root', str(a.sys), '--dev-root', str(a.dev),
+                                   '--hostname', 'cluster1', '--logs', '--output', str(out),
+                                   '--port-labels', str(self._labels())])
+        finally:
+            describe_mod.subprocess.run = original
+        warnings = json.loads(out.read_text())['topology']['warnings']
+        self.assertIn('kernel log unavailable: journalctl failed: No journal files were found.',
+                      warnings)
+
+    def test_merge_rejects_duplicate_hostnames(self):
+        a, b = pair(self.tmp, BOTH, BOTH,
+                    {S5: ('cluster2', S5, 20.0, 2), S6: ('cluster2', S6, 20.0, 2)},
+                    {S5: ('cluster1', S5, 20.0, 2), S6: ('cluster1', S6, 20.0, 2)})
+        ra = a.describe()
+        with self.assertRaisesRegex(ValueError, "duplicate host 'cluster1'"):
+            describe_mod.merge([ra, ra])
+        files = []
+        for i, rep in enumerate((ra, ra)):
+            path = Path(self.tmp) / f'r{i}.json'
+            path.write_text(json.dumps(rep))
+            files.append(str(path))
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as ctx:
+            describe_mod.main(['--merge', *files])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn('duplicate host', err.getvalue())
+        self.assertEqual(len(describe_mod.merge([ra, b.describe()])['links']), 2)
+
+    def test_until_stable_repeats_a_pass_that_saw_a_hotplug(self):
+        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        gone = a.configfs / '1-2.0/data1'
+
+        class Hotplug(describe_mod.Describer):
+            calls = 0
+
+            def describe(self):
+                Hotplug.calls += 1
+                layout = super().describe()
+                if Hotplug.calls == 1:          # a group disappears during pass 1
+                    for f in gone.iterdir():
+                        f.unlink()
+                    gone.rmdir()
+                return layout
+
+        report = Hotplug(a.sys, dev_root=a.dev, hostname='cluster1',
+                         require_chardev=False).describe_stable(5)
+        self.assertEqual((Hotplug.calls, report['topology']['passes']), (2, 2))
+        self.assertNotIn('1-2.0/data1', report)
+        self.assertFalse(any('changed during each' in w for w in report['topology']['warnings']))
+
+    def test_until_stable_gives_up_with_a_warning(self):
+        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+
+        class Flapping(describe_mod.Describer):
+            n = 0
+
+            def describe(self):
+                Flapping.n += 1
+                (a.configfs / '0-2.0' / f'extra{Flapping.n}').mkdir()
+                return super().describe()
+
+        report = Flapping(a.sys, dev_root=a.dev, hostname='cluster1',
+                          require_chardev=False).describe_stable(3)
+        self.assertEqual((Flapping.n, report['topology']['passes']), (3, 3))
+        self.assertTrue(any('changed during each of 3 passes' in w
+                            for w in report['topology']['warnings']))
+
+    def test_refresh_units_converge(self):
+        rule = (REPO / 'tools/lab/90-usb4stream-describe.rules').read_text()
+        unit = (REPO / 'tools/lab/usb4stream-describe-refresh.service').read_text()
+        self.assertIn('--no-block restart usb4stream-describe-refresh.service', rule)
+        self.assertNotIn('--no-block start', rule)
+        self.assertIn('--until-stable 5', unit)
+        self.assertIn("rm -f /run/.usb4stream-layout.json.*.tmp", unit)
+        tmp_name = describe_mod.Path('/run/usb4stream-layout.json')
+        self.assertTrue(f'.{tmp_name.name}.' in unit)
+
     def _labels(self):
         path = Path(self.tmp) / 'ports.json'
         path.write_text(json.dumps(LABELS))

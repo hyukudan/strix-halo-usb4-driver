@@ -3,6 +3,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -61,6 +62,43 @@ class ReconstructionTests(unittest.TestCase):
             prepare.materialize(self.output, self.repo)
         self.assertFalse(self.output.exists())
         self.assertEqual(self.original.read_bytes(), b'old\n')
+
+    def test_unlisted_overlay_file_is_rejected(self):
+        (self.repo / 'overlay/drivers/extra.c').write_bytes(b'unhashed\n')
+        with self.assertRaisesRegex(ValueError, r"unexpected \['drivers/extra.c'\]"):
+            prepare.materialize(self.output, self.repo)
+        self.assertFalse(self.output.exists())
+
+    def test_missing_overlay_file_is_rejected(self):
+        self.original.unlink()
+        with self.assertRaisesRegex(ValueError, r"missing \['drivers/example.c'\]"):
+            prepare.materialize(self.output, self.repo)
+        self.assertFalse(self.output.exists())
+
+    def test_overlay_symlinks_are_rejected(self):
+        outside = self.repo / 'outside.c'
+        outside.write_bytes(b'outside\n')
+        for link in (self.repo / 'overlay/drivers/link.c', self.repo / 'overlay/linkdir'):
+            with self.subTest(link=link.name):
+                os.symlink(outside if link.suffix else self.repo / 'patches', link)
+                with self.assertRaisesRegex(ValueError, 'Symlink not allowed'):
+                    prepare.materialize(self.output, self.repo)
+                self.assertFalse(self.output.exists())
+                link.unlink()
+
+    def test_only_inventory_bytes_are_published(self):
+        prepare.materialize(self.output, self.repo)
+        published = sorted(p.relative_to(self.output).as_posix()
+                           for p in self.output.rglob('*') if p.is_file())
+        self.assertEqual(published, ['drivers/example.c'])
+
+    def test_audit_series_must_match_series(self):
+        (self.repo / 'patches/series').write_text(
+            '0001-usb4-current-source.patch\n0002-test.patch\n0003-missing.patch\n')
+        with self.assertRaisesRegex(ValueError, 'audit-series must equal'):
+            prepare.materialize(self.output, self.repo)
+        (self.repo / 'patches/series').write_text('0001-usb4-current-source.patch\n0002-test.patch\n')
+        prepare.materialize(self.output, self.repo)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

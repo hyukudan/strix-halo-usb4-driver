@@ -1,0 +1,15 @@
+[Unit]
+Description=Refresh /run/usb4stream-layout.json after a USB4 hotplug
+# Read-only: re-runs usb4stream-describe; never touches configfs or modules.
+ConditionKernelVersion=7.3.0-rc5-strix-gpu-bosgame-*
+After=usb4stream-lab.service
+Requisite=usb4stream-lab.service
+
+[Service]
+Type=oneshot
+# The udev rule *restarts* this unit, so an event that arrives while a pass
+# runs always gets a pass after it; a pass interrupted that way can leave its
+# temporary file, removed here. Each pass repeats until the inventory is stable.
+ExecStartPre=-/bin/sh -c 'rm -f /run/.usb4stream-layout.json.*.tmp'
+ExecStart=/usr/local/sbin/usb4stream-describe --logs --until-stable 5 --output /run/usb4stream-layout.json --summary
+TimeoutStartSec=60
