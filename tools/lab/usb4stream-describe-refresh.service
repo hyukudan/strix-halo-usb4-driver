@@ -7,5 +7,9 @@ Requisite=usb4stream-lab.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/usb4stream-describe --logs --output /run/usb4stream-layout.json --summary
-TimeoutStartSec=30
+# The udev rule *restarts* this unit, so an event that arrives while a pass
+# runs always gets a pass after it; a pass interrupted that way can leave its
+# temporary file, removed here. Each pass repeats until the inventory is stable.
+ExecStartPre=-/bin/sh -c 'rm -f /run/.usb4stream-layout.json.*.tmp'
+ExecStart=/usr/local/sbin/usb4stream-describe --logs --until-stable 5 --output /run/usb4stream-layout.json --summary
+TimeoutStartSec=60

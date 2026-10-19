@@ -1,4 +1,6 @@
 # /etc/udev/rules.d/90-usb4stream-describe.rules
 # Refresh the published stream layout when a USB4 peer or its stream service
 # appears or disappears (cable replug, peer reboot, controller reset).
-ACTION=="add|remove", SUBSYSTEM=="thunderbolt", ENV{DEVTYPE}=="thunderbolt_xdomain|thunderbolt_service", RUN+="/usr/bin/systemctl --no-block start usb4stream-describe-refresh.service"
+# restart (not start): a start request merges into a pass that is already
+# running and could be lost; restart queues a pass after the latest event.
+ACTION=="add|remove", SUBSYSTEM=="thunderbolt", ENV{DEVTYPE}=="thunderbolt_xdomain|thunderbolt_service", RUN+="/usr/bin/systemctl --no-block restart usb4stream-describe-refresh.service"

@@ -368,6 +368,55 @@ class DescribeTests(unittest.TestCase):
         self.assertIn('duplicate host', err.getvalue())
         self.assertEqual(len(describe_mod.merge([ra, b.describe()])['links']), 2)
 
+    def test_until_stable_repeats_a_pass_that_saw_a_hotplug(self):
+        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        gone = a.configfs / '1-2.0/data1'
+
+        class Hotplug(describe_mod.Describer):
+            calls = 0
+
+            def describe(self):
+                Hotplug.calls += 1
+                layout = super().describe()
+                if Hotplug.calls == 1:          # a group disappears during pass 1
+                    for f in gone.iterdir():
+                        f.unlink()
+                    gone.rmdir()
+                return layout
+
+        report = Hotplug(a.sys, dev_root=a.dev, hostname='cluster1',
+                         require_chardev=False).describe_stable(5)
+        self.assertEqual((Hotplug.calls, report['topology']['passes']), (2, 2))
+        self.assertNotIn('1-2.0/data1', report)
+        self.assertFalse(any('changed during each' in w for w in report['topology']['warnings']))
+
+    def test_until_stable_gives_up_with_a_warning(self):
+        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+
+        class Flapping(describe_mod.Describer):
+            n = 0
+
+            def describe(self):
+                Flapping.n += 1
+                (a.configfs / '0-2.0' / f'extra{Flapping.n}').mkdir()
+                return super().describe()
+
+        report = Flapping(a.sys, dev_root=a.dev, hostname='cluster1',
+                          require_chardev=False).describe_stable(3)
+        self.assertEqual((Flapping.n, report['topology']['passes']), (3, 3))
+        self.assertTrue(any('changed during each of 3 passes' in w
+                            for w in report['topology']['warnings']))
+
+    def test_refresh_units_converge(self):
+        rule = (REPO / 'tools/lab/90-usb4stream-describe.rules').read_text()
+        unit = (REPO / 'tools/lab/usb4stream-describe-refresh.service').read_text()
+        self.assertIn('--no-block restart usb4stream-describe-refresh.service', rule)
+        self.assertNotIn('--no-block start', rule)
+        self.assertIn('--until-stable 5', unit)
+        self.assertIn("rm -f /run/.usb4stream-layout.json.*.tmp", unit)
+        tmp_name = describe_mod.Path('/run/usb4stream-layout.json')
+        self.assertTrue(f'.{tmp_name.name}.' in unit)
+
     def _labels(self):
         path = Path(self.tmp) / 'ports.json'
         path.write_text(json.dumps(LABELS))

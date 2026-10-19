@@ -243,6 +243,38 @@ class Describer:
         return True, True, None
 
     # -- report ----------------------------------------------------------
+    def inventory(self):
+        """What a hotplug can change: Thunderbolt devices and their drivers, PCI
+        domains of the NHIs, configfs groups. Compared before/after a pass."""
+        items = []
+        devices = self.sysfs / 'bus/thunderbolt/devices'
+        for dev in listdir(devices):
+            items.append(('tb', dev.name, driver_name(dev)))
+        for pci in listdir(self.sysfs / 'bus/pci/devices'):
+            for child in listdir(pci):
+                if child.name.startswith('domain'):
+                    items.append(('pci', pci.name, child.name))
+        for svc in listdir(self.configfs):
+            for st in listdir(svc):
+                items.append(('cfg', svc.name, st.name))
+        return items
+
+    def describe_stable(self, passes):
+        """describe() until the inventory is unchanged across one pass (at most `passes`)."""
+        initial = list(self.warnings)       # e.g. a journalctl failure
+        for attempt in range(1, passes + 1):
+            before = self.inventory()
+            self.warnings = list(initial)
+            layout = self.describe()
+            if self.inventory() == before:
+                layout['topology']['passes'] = attempt
+                return layout
+        layout['topology']['passes'] = passes
+        layout['topology']['warnings'].append(
+            f'topology changed during each of {passes} passes; this layout may already be '
+            'stale (a later hotplug refresh will rewrite it)')
+        return layout
+
     def describe(self):
         ctrls = self.controllers()
         by_domain = {c['domain']: c for c in ctrls if c['domain'] is not None}
@@ -589,6 +621,9 @@ def main(argv=None):
                    help='read the kernel log (journalctl) to explain controllers that are down')
     p.add_argument('--output', type=Path, help='write atomically instead of stdout')
     p.add_argument('--summary', action='store_true', help='print only the summary line(s)')
+    p.add_argument('--until-stable', type=int, default=1, metavar='N',
+                   help='repeat the scan until sysfs/configfs did not change during a pass '
+                        '(at most N passes; the hotplug refresh uses 5)')
     p.add_argument('--merge', nargs='+', type=Path, metavar='REPORT',
                    help='combine per-host reports into a pair view (no sysfs access)')
     args = p.parse_args(argv)
@@ -607,7 +642,7 @@ def main(argv=None):
                               labels, args.hostname, kernel_log=log)
         if log_error:
             describer.warnings.append(log_error)
-        result = describer.describe()
+        result = describer.describe_stable(max(1, args.until_stable))
         summary = '\n'.join([result['topology']['summary']] +
                             [f'warning: {w}' for w in result['topology']['warnings']])
     text = json.dumps(result, indent=2) + '\n'
