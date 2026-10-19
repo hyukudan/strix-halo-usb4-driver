@@ -1,0 +1,315 @@
+diff --git a/drivers/thunderbolt/dma_recovery.c b/drivers/thunderbolt/dma_recovery.c
+--- a/drivers/thunderbolt/dma_recovery.c
++++ b/drivers/thunderbolt/dma_recovery.c
+@@ -287,8 +287,9 @@ put:
+  * every other user. Here the reset only runs once the NHI is idle: no
+  * allocated ring besides the control ring it restarts, no DMA tunnel in the
+  * CM and no other reset in progress (the admission of tb_domain_reset_dma()
+- * with an empty ring set). It is retried a bounded number of times, never
+- * waits for the domain lock, and logs what it did or what was in the way.
++ * with an empty ring set). It never waits for the domain lock, stays pending
++ * while the NHI is in use (see tb_domain_teardown_reset_work()) and logs
++ * what it did or what it waits for.
+  */
+ static bool teardown_reset = true;
+ module_param(teardown_reset, bool, 0644);
+@@ -315,29 +316,87 @@ static void nhi_dma_count_rings(struct tb_nhi *nhi, unsigned int *tx,
+ 	spin_unlock_irqrestore(&nhi->lock, flags);
+ }
+ 
++/* Clears the pending reset; returns whether one was pending. */
++static bool nhi_teardown_reset_clear(struct tb_nhi *nhi)
++{
++	unsigned long flags;
++	bool pending;
++
++	spin_lock_irqsave(&nhi->lock, flags);
++	pending = nhi->teardown_reset_pending;
++	nhi->teardown_reset_pending = false;
++	nhi->teardown_reset_parked = false;
++	spin_unlock_irqrestore(&nhi->lock, flags);
++	return pending;
++}
++
++/* Under nhi->lock: no data ring allocated, the admission's ring condition. */
++static bool nhi_data_rings_freed(struct tb_nhi *nhi)
++{
++	unsigned int i;
++
++	for (i = 1; i < nhi->hop_count; i++) {
++		if (nhi->tx_rings[i] || nhi->rx_rings[i])
++			return false;
++	}
++	return true;
++}
++
++/*
++ * Queues the pending reset with a fresh budget of fast attempts. Under
++ * nhi->lock, which orders it against dma_shutdown: without it the domain
++ * removal has not started, so @tb and its workqueue are alive.
++ */
++static void tb_teardown_reset_arm_locked(struct tb *tb)
++{
++	tb->nhi->teardown_reset_parked = false;
++	WRITE_ONCE(tb->teardown_reset_attempts, 0);
++	mod_delayed_work(tb->wq, &tb->teardown_reset_work,
++			 msecs_to_jiffies(TB_TEARDOWN_RESET_DELAY_MS));
++}
++
++/*
++ * A reset owed after a DMA path teardown stays pending until it can run:
++ * it is never dropped because the NHI is busy. A few fast attempts cover a
++ * closing owner that frees its rings just after its paths; then it parks
++ * with no polling while other consumers hold the NHI, and the events that
++ * remove them re-arm it: the next path teardown and the free of the last
++ * data ring. The admission of __tb_domain_reset_dma() re-checks, under the
++ * domain lock and right before the reset, that nothing uses the NHI.
++ */
+ static void tb_domain_teardown_reset_work(struct work_struct *work)
+ {
+ 	struct tb *tb = container_of(to_delayed_work(work), struct tb,
+ 				     teardown_reset_work);
++	struct tb_nhi *nhi = tb->nhi;
+ 	unsigned int attempt = READ_ONCE(tb->teardown_reset_attempts) + 1;
++	unsigned long flags;
+ 	unsigned int tx, rx;
+-	bool performed = false;
++	bool performed = false, pending;
+ 	int ret;
+ 
++	spin_lock_irqsave(&nhi->lock, flags);
++	pending = nhi->teardown_reset_pending;
++	spin_unlock_irqrestore(&nhi->lock, flags);
++	if (!pending)
++		return;
+ 	WRITE_ONCE(tb->teardown_reset_attempts, attempt);
+ 	ret = __tb_domain_reset_dma(tb, NULL, 0, &performed, true);
+ 	if (!ret) {
++		nhi_teardown_reset_clear(nhi);
+ 		dev_info(&tb->dev, "host interface reset after DMA teardown (attempt %u)\n",
+ 			 attempt);
+ 		return;
+ 	}
+ 	if (performed) {
++		nhi_teardown_reset_clear(nhi);
+ 		dev_err(&tb->dev, "host interface reset after DMA teardown failed: %d, new rings are refused until the NHI is probed again\n",
+ 			ret);
+ 		return;
+ 	}
+ 	/* Domain going away, controller gone, not a v1 interface, PM error */
+ 	if (ret != -EBUSY && ret != -EAGAIN) {
++		nhi_teardown_reset_clear(nhi);
+ 		dev_dbg(&tb->dev, "no host interface reset after DMA teardown: %d\n", ret);
+ 		return;
+ 	}
+@@ -346,9 +405,41 @@ static void tb_domain_teardown_reset_work(struct work_struct *work)
+ 				   msecs_to_jiffies(TB_TEARDOWN_RESET_RETRY_MS));
+ 		return;
+ 	}
+-	nhi_dma_count_rings(tb->nhi, &tx, &rx);
+-	dev_warn(&tb->dev, "no host interface reset after DMA teardown: %s after %u attempts (%u TX and %u RX rings allocated besides control; a DMA tunnel or a reset in progress also prevents it)\n",
+-		 ret == -EAGAIN ? "domain lock busy" : "NHI in use", attempt, tx, rx);
++	spin_lock_irqsave(&nhi->lock, flags);
++	/* Removal dropped it meanwhile, or a ring free re-armed it already */
++	if (!nhi->teardown_reset_pending ||
++	    delayed_work_pending(&tb->teardown_reset_work)) {
++		spin_unlock_irqrestore(&nhi->lock, flags);
++		return;
++	}
++	nhi->teardown_reset_parked = true;
++	spin_unlock_irqrestore(&nhi->lock, flags);
++	nhi_dma_count_rings(nhi, &tx, &rx);
++	dev_info(&tb->dev, "host interface reset after DMA teardown pending: %s (%u TX and %u RX rings allocated besides control; a DMA tunnel or a reset in progress also prevents it), runs when the last data ring is freed or after the next path teardown\n",
++		 ret == -EAGAIN ? "domain lock busy" : "NHI in use", tx, rx);
++}
++
++/**
++ * tb_nhi_ring_freed() - A data ring of @nhi was freed
++ * @nhi: Host interface
++ *
++ * When the last data ring goes and a teardown reset is pending (parked or
++ * still in its fast attempts), queue it with a fresh budget. Never once
++ * the domain removal began.
++ */
++void tb_nhi_ring_freed(struct tb_nhi *nhi)
++{
++	unsigned long flags;
++	struct tb *tb;
++
++	spin_lock_irqsave(&nhi->lock, flags);
++	if (nhi->teardown_reset_pending && !nhi->dma_shutdown &&
++	    !nhi->going_away && nhi_data_rings_freed(nhi)) {
++		tb = dev_get_drvdata(nhi->dev);
++		if (tb)
++			tb_teardown_reset_arm_locked(tb);
++	}
++	spin_unlock_irqrestore(&nhi->lock, flags);
+ }
+ 
+ /**
+@@ -356,24 +447,54 @@ static void tb_domain_teardown_reset_work(struct work_struct *work)
+  * @tb: Domain whose DMA path was just torn down
+  *
+  * Only on the quirked AMD v1 host interfaces and while the domain is not
+- * going away. A new teardown restarts the attempt budget.
++ * going away. Marks the reset pending and starts a fresh budget, also when
++ * an earlier one is parked.
+  */
+ void tb_domain_schedule_teardown_reset(struct tb *tb)
+ {
+ 	struct tb_nhi *nhi = READ_ONCE(tb->nhi);
+ 	unsigned long flags;
+-	bool stopping;
+ 
+ 	if (!READ_ONCE(teardown_reset) || !nhi || !nhi_dma_reset_supported(nhi))
+ 		return;
+ 	spin_lock_irqsave(&nhi->lock, flags);
+-	stopping = nhi->going_away || nhi->dma_shutdown;
++	if (!nhi->going_away && !nhi->dma_shutdown) {
++		nhi->teardown_reset_pending = true;
++		tb_teardown_reset_arm_locked(tb);
++	}
+ 	spin_unlock_irqrestore(&nhi->lock, flags);
+-	if (stopping)
++}
++
++/**
++ * tb_domain_teardown_reset_stop() - Stop the teardown reset work
++ * @tb: Domain
++ * @removal: The domain is being removed (dma_shutdown is already set)
++ *
++ * Waits for a running attempt. For suspend the reset stays pending and
++ * tb_domain_teardown_reset_resume() re-arms it; on removal it is dropped.
++ */
++void tb_domain_teardown_reset_stop(struct tb *tb, bool removal)
++{
++	cancel_delayed_work_sync(&tb->teardown_reset_work);
++	if (removal && tb->nhi && nhi_teardown_reset_clear(tb->nhi))
++		dev_info(&tb->dev, "host interface reset after DMA teardown dropped: the domain is being removed\n");
++}
++
++/**
++ * tb_domain_teardown_reset_resume() - Re-arm a pending reset after resume
++ * @tb: Domain
++ */
++void tb_domain_teardown_reset_resume(struct tb *tb)
++{
++	struct tb_nhi *nhi = tb->nhi;
++	unsigned long flags;
++
++	if (!nhi)
+ 		return;
+-	WRITE_ONCE(tb->teardown_reset_attempts, 0);
+-	mod_delayed_work(tb->wq, &tb->teardown_reset_work,
+-			 msecs_to_jiffies(TB_TEARDOWN_RESET_DELAY_MS));
++	spin_lock_irqsave(&nhi->lock, flags);
++	if (nhi->teardown_reset_pending && !nhi->going_away && !nhi->dma_shutdown)
++		tb_teardown_reset_arm_locked(tb);
++	spin_unlock_irqrestore(&nhi->lock, flags);
+ }
+ 
+ int tb_domain_reset_dma(struct tb *tb, struct tb_ring *tx, struct tb_ring *rx)
+diff --git a/drivers/thunderbolt/domain.c b/drivers/thunderbolt/domain.c
+--- a/drivers/thunderbolt/domain.c
++++ b/drivers/thunderbolt/domain.c
+@@ -620,10 +620,10 @@ void tb_domain_remove(struct tb *tb)
+ 
+ 	flush_workqueue(tb->wq);
+ 	/*
+-	 * dma_shutdown refuses new teardown resets; a pending one would now
+-	 * fail with -ENODEV anyway. The NHI must not see one after this point.
++	 * dma_shutdown refuses new teardown resets and re-arms; a pending one
++	 * is dropped here. The NHI must not see one after this point.
+ 	 */
+-	cancel_delayed_work_sync(&tb->teardown_reset_work);
++	tb_domain_teardown_reset_stop(tb, true);
+ 
+ 	/* CM stop and removal work have drained. Consumers release only contexts
+ 	 * with proven ring/callback/path quiescence before the NHI waits for its
+@@ -687,8 +687,9 @@ int tb_domain_resume_noirq(struct tb *tb)
+ 
+ int tb_domain_suspend(struct tb *tb)
+ {
+-	/* Service drivers suspended first; no reset into a suspending NHI */
+-	cancel_delayed_work_sync(&tb->teardown_reset_work);
++	/* Service drivers suspended first; no reset into a suspending NHI. A
++	 * pending one stays pending and is re-armed by tb_domain_complete(). */
++	tb_domain_teardown_reset_stop(tb, false);
+ 	return tb->cm_ops->suspend ? tb->cm_ops->suspend(tb) : 0;
+ }
+ 
+@@ -696,7 +697,7 @@ int tb_domain_freeze_noirq(struct tb *tb)
+ {
+ 	int ret = 0;
+ 
+-	cancel_delayed_work_sync(&tb->teardown_reset_work);
++	tb_domain_teardown_reset_stop(tb, false);
+ 	mutex_lock(&tb->lock);
+ 	if (tb->cm_ops->freeze_noirq)
+ 		ret = tb->cm_ops->freeze_noirq(tb);
+@@ -724,6 +725,7 @@ void tb_domain_complete(struct tb *tb)
+ {
+ 	if (tb->cm_ops->complete)
+ 		tb->cm_ops->complete(tb);
++	tb_domain_teardown_reset_resume(tb);
+ }
+ 
+ int tb_domain_runtime_suspend(struct tb *tb)
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -878,6 +878,7 @@ EXPORT_SYMBOL_GPL(tb_ring_stop);
+ void tb_ring_free(struct tb_ring *ring)
+ {
+ 	struct tb_nhi *nhi = ring->nhi;
++	bool data_ring = ring->hop != 0;
+ 
+ 	spin_lock_irq(&ring->nhi->lock);
+ 	/*
+@@ -916,6 +917,8 @@ void tb_ring_free(struct tb_ring *ring)
+ 	 */
+ 	flush_work(&ring->work);
+ 	kfree(ring);
++	if (data_ring)
++		tb_nhi_ring_freed(nhi);
+ }
+ EXPORT_SYMBOL_GPL(tb_ring_free);
+ 
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -782,6 +782,9 @@ int tb_domain_add(struct tb *tb, bool reset);
+ void tb_domain_remove(struct tb *tb);
+ bool tb_domain_wait_released(struct tb *tb, struct tb_nhi *nhi);
+ void tb_domain_schedule_teardown_reset(struct tb *tb);
++void tb_domain_teardown_reset_stop(struct tb *tb, bool removal);
++void tb_domain_teardown_reset_resume(struct tb *tb);
++void tb_nhi_ring_freed(struct tb_nhi *nhi);
+ int tb_domain_suspend_noirq(struct tb *tb);
+ int tb_domain_resume_noirq(struct tb *tb);
+ int tb_domain_suspend(struct tb *tb);
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -527,6 +527,12 @@ void tb_service_properties_changed(struct tb_service *svc);
+  * @dma_retained: DMA owners still retained during domain teardown
+  * @dma_revoked: Bus mastering was revoked during domain teardown
+  * @dma_abandoned: The domain was abandoned with leaked DMA owners
++ * @teardown_reset_pending: A DMA path teardown left an interface reset
++ *			    owed; cleared only when it runs, fails or the
++ *			    domain goes away (protected by @lock)
++ * @teardown_reset_parked: Its fast retries ran out with consumers present:
++ *			   it waits for the last data ring to be freed or
++ *			   for the next path teardown (protected by @lock)
+  * @dma_wq: Reclaim-capable workqueue for DMA completion and cancellation
+  * @iommu_dma_protection: An IOMMU will isolate external-facing ports.
+  * @interrupt_work: Work scheduled to handle ring interrupt when no
+@@ -555,6 +561,8 @@ struct tb_nhi {
+ 	unsigned int dma_retained;
+ 	bool dma_revoked;
+ 	bool dma_abandoned;
++	bool teardown_reset_pending;
++	bool teardown_reset_parked;
+ 	bool iommu_dma_protection;
+ 	struct work_struct interrupt_work;
+ 	struct workqueue_struct *dma_wq;

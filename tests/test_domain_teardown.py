@@ -143,8 +143,15 @@ class DomainTeardownTests(unittest.TestCase):
                                   r'(\t+/\*[^\n]*\*/\n)?\t+tb_domain_schedule_teardown_reset\(tb\);')
         self.assertIn('INIT_DELAYED_WORK(&tb->teardown_reset_work, tb_domain_teardown_reset_work);',
                       extract(domain_c, 'tb_domain_alloc'))
-        for name in ('tb_domain_release', 'tb_domain_remove', 'tb_domain_suspend', 'tb_domain_freeze_noirq'):
-            self.assertIn('cancel_delayed_work_sync(&tb->teardown_reset_work);', extract(domain_c, name), name)
+        nhi_c = (self.source / 'nhi.c').read_text()
+        self.assertRegex(extract(nhi_c, 'tb_ring_free'),
+                         r'\tkfree\(ring\);\n\tif \(data_ring\)\n\t\ttb_nhi_ring_freed\(nhi\);\n\}')
+        self.assertIn('cancel_delayed_work_sync(&tb->teardown_reset_work);', extract(domain_c, 'tb_domain_release'))
+        self.assertIn('tb_domain_teardown_reset_stop(tb, true);', extract(domain_c, 'tb_domain_remove'))
+        for name in ('tb_domain_suspend', 'tb_domain_freeze_noirq'):
+            self.assertIn('tb_domain_teardown_reset_stop(tb, false);', extract(domain_c, name), name)
+        self.assertRegex(extract(domain_c, 'tb_domain_complete'),
+                         r'\t\ttb->cm_ops->complete\(tb\);\n\ttb_domain_teardown_reset_resume\(tb\);\n\}')
 
     def test_failed_probe_wait_is_bounded(self):
         nhi_c = (self.source / 'nhi.c').read_text()

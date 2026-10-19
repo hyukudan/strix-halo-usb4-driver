@@ -113,6 +113,8 @@ struct tb_cm { bool hotplug_active; };
 /* The teardown reset work: removal must cancel it before the NHI goes. */
 struct delayed_work { bool pending; };
 static void cancel_delayed_work_sync(struct delayed_work *w) { w->pending = false; log_event("cancel_teardown_reset"); }
+struct tb;
+static void tb_domain_teardown_reset_stop(struct tb *tb, bool removal);
 struct tb_cm_ops {
     void (*remove_xdomains)(struct tb *tb);
     void (*stop)(struct tb *tb);
@@ -130,6 +132,12 @@ struct tb {
     struct delayed_work teardown_reset_work;
 };
 static struct tb_cm *tb_priv(struct tb *tb) { return &tb->cm; }
+/* Removal drops the pending reset (its behaviour: test_dma_recovery). */
+static void tb_domain_teardown_reset_stop(struct tb *tb, bool removal)
+{
+    assert(removal && tb->nhi->dma_shutdown);
+    cancel_delayed_work_sync(&tb->teardown_reset_work);
+}
 
 /* The XDomains of the test topology, as the bus would enumerate them. */
 static struct tb_xdomain *all_xdomains[4];
