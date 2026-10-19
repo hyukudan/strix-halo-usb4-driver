@@ -269,6 +269,7 @@ int main(int argc, char **argv)
         { "early_rx_completion_is_kept", early_rx_completion_is_kept },
         { "damaged_rx_frame_fails_stream", damaged_rx_frame_fails_stream },
         { "close_waits_for_tx_slot", close_waits_for_tx_slot },
+        { "partial_io_is_accounted", partial_io_is_accounted },
     };
 
     assert(argc == 2);

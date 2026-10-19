@@ -1,0 +1,129 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -752,7 +752,11 @@ tbstream_dev_alloc_tx(struct tbstream_dev *sdev, enum tbstream_frame_pdf pdf,
+ 	dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy, size,
+ 				DMA_TO_DEVICE);
+ 	if (pdf == TBSTREAM_DATA) {
+-		if (copy_page_from_iter(sf->page, 0, size, from) != size) {
++		size_t copied = copy_page_from_iter(sf->page, 0, size, from);
++
++		if (copied != size) {
++			/* Not sent: the caller reports only what was */
++			iov_iter_revert(from, copied);
+ 			sdev->tx_ring.cons--;
+ 			return ERR_PTR(-EFAULT);
+ 		}
+@@ -769,11 +773,17 @@ tbstream_dev_send_data(struct tbstream_dev *sdev, struct iov_iter *from,
+ 		       size_t size)
+ {
+ 	struct tbstream_frame *sf;
++	int ret;
+ 
+ 	sf = tbstream_dev_alloc_tx(sdev, TBSTREAM_DATA, from, size);
+ 	if (IS_ERR(sf))
+ 		return PTR_ERR(sf);
+-	return tb_ring_tx(sdev->tx_ring.ring, &sf->frame);
++	ret = tb_ring_tx(sdev->tx_ring.ring, &sf->frame);
++	if (ret) {
++		iov_iter_revert(from, size);
++		sdev->tx_ring.cons--;
++	}
++	return ret;
+ }
+ 
+ static void
+@@ -1025,6 +1035,8 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ #endif
+ 	if (tbstream_dev_detached(sdev))
+ 		return -ENODEV;
++	if (!iov_iter_count(to))
++		return 0;
+ 
+ 	ret = tbstream_dev_lock(sdev, nowait);
+ 	if (ret)
+@@ -1082,9 +1094,10 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 	}
+ 
+ 	nbytes = 0;
++	ret = 0;
+ 	while (iov_iter_count(to)) {
+ 		struct tbstream_frame *sf;
+-		size_t size, sf_size;
++		size_t size, sf_size, copied;
+ 
+ 		sf = tbstream_dev_completed_rx(sdev);
+ 		if (!sf)
+@@ -1116,32 +1129,34 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 		sf_size = tb_ring_frame_size(&sf->frame);
+ 		size = min(iov_iter_count(to), sf_size);
+ 
+-		if (copy_page_to_iter(sf->page, sf->offset, size, to) != size) {
+-			ret = -EFAULT;
+-			break;
+-		}
++		copied = copy_page_to_iter(sf->page, sf->offset, size, to);
++		nbytes += copied;
+ 
+ 		/*
+-		 * If not all data from the frame is read so leave it in
+-		 * place and update the offset accordingly so next read
+-		 * gets the rest.
++		 * If not all data from the frame is read (short buffer or a
++		 * fault) leave it in place and update the offset accordingly
++		 * so next read gets the rest.
+ 		 */
+-		if (size < sf_size) {
+-			sf->offset += size;
+-			sf->frame.size = sf_size - size;
++		if (copied < sf_size) {
++			sf->offset += copied;
++			sf->frame.size = sf_size - copied;
++			if (copied < size) {
++				ret = -EFAULT;
++				break;
++			}
+ 		} else {
++			/* Delivered; a failed re-post shows on the next call */
+ 			ret = tbstream_dev_consume_rx(sdev);
+ 			if (ret)
+ 				break;
+ 		}
+-
+-		nbytes += size;
+ 	}
+ 
+ 	mutex_unlock(&sdev->lock);
+-	if (ret)
+-		return ret;
+-	return nbytes;
++	/* Bytes already copied to the caller are never reported as lost */
++	if (nbytes)
++		return nbytes;
++	return ret;
+ }
+ 
+ static ssize_t
+@@ -1159,6 +1174,8 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ #endif
+ 	if (tbstream_dev_detached(sdev))
+ 		return -ENODEV;
++	if (!iov_iter_count(from))
++		return 0;
+ 
+ 	ret = tbstream_dev_lock(sdev, nowait);
+ 	if (ret)
+@@ -1231,9 +1248,10 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ 	}
+ 
+ 	mutex_unlock(&sdev->lock);
+-	if (ret)
+-		return ret;
+-	return nbytes;
++	/* Frames already queued are never reported as lost */
++	if (nbytes)
++		return nbytes;
++	return ret;
+ }
+ 
+ static __poll_t
