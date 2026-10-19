@@ -107,7 +107,7 @@ static void INIT_LIST_HEAD(struct list_head *l) { l->next=l->prev=l; }
 static bool list_empty(const struct list_head *l) { return l->next==l; }
 struct pci_dev;
 struct device { bool registered, pci; struct pci_dev *pdev; };
-struct pci_dev { unsigned vendor, device; bool present, master, master_stuck, config_fail; struct device dev; };
+struct pci_dev { unsigned vendor, device; bool present, master, master_stuck, config_fail, relaxed, devctl_fail; struct device dev; };
 struct tb_nhi;
 struct tb_ring { spinlock_t lock; struct tb_nhi *nhi; bool is_tx, running; unsigned hop; struct list_head queue, in_flight; };
 struct tb_nhi { spinlock_t lock; struct device *dev; struct tb_ring *tx_rings[8], *rx_rings[8]; bool going_away, dma_resetting, dma_shutdown; unsigned dma_retained; bool dma_revoked, dma_abandoned; unsigned hop_count; unsigned char *iobase; };
@@ -121,6 +121,14 @@ static struct pci_dev *to_pci_dev(struct device *d) { return d->pdev; }
 static bool device_is_registered(struct device *d) { return d->registered; }
 static bool pci_device_is_present(struct pci_dev *p) { return p->present; }
 static void pci_clear_master(struct pci_dev *p) { if (!p->master_stuck) p->master=false; }
+#define PCI_EXP_DEVCTL 8
+#define PCI_EXP_DEVCTL_RELAX_EN 0x0010
+static int pcie_capability_read_word(struct pci_dev *p, int where, uint16_t *value) {
+    assert(where == PCI_EXP_DEVCTL);
+    if (p->devctl_fail) return -EIO;
+    *value = p->relaxed ? PCI_EXP_DEVCTL_RELAX_EN : 0;
+    return 0;
+}
 static int pci_read_config_word(struct pci_dev *p, int where, uint16_t *value) {
     assert(where==PCI_COMMAND); if (p->config_fail) return -EIO; *value=p->master?PCI_COMMAND_MASTER:0; return 0;
 }

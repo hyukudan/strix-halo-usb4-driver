@@ -1,0 +1,41 @@
+diff --git a/drivers/thunderbolt/dma_recovery.c b/drivers/thunderbolt/dma_recovery.c
+--- a/drivers/thunderbolt/dma_recovery.c
++++ b/drivers/thunderbolt/dma_recovery.c
+@@ -440,14 +440,17 @@ EXPORT_SYMBOL_GPL(tb_domain_dma_retained);
+ /* Revoke and verify PCI bus mastering. Clearing Bus Master Enable forbids
+  * the function from issuing new memory requests (descriptor/data DMA and
+  * MSI-X). The non-posted reads that follow cannot complete ahead of posted
+- * writes the function issued earlier (PCIe ordering, Relaxed Ordering off),
+- * so once they return no earlier DMA write is still in flight either.
+- * Consistent with the series' rule, a function that does not answer is no
+- * proof: the caller then abandons the retained owners instead. */
++ * writes the function issued earlier (PCIe ordering), so once they return
++ * no earlier DMA write is still in flight either. That premise is checked,
++ * not assumed: with Relaxed Ordering enabled a posted write may pass the
++ * read, and a read that returns all ones did not complete at the function.
++ * Consistent with the series' rule, either is no proof: the caller then
++ * abandons the retained owners instead. Bus mastering stays revoked. */
+ static int tb_dma_revoke_bus_master(struct tb_nhi *nhi)
+ {
+     struct pci_dev *pdev;
+-    u16 command;
++    u16 command, devctl;
++    u32 caps;
+ 
+     if (!dev_is_pci(nhi->dev))
+         return -EOPNOTSUPP;
+@@ -458,7 +461,13 @@ static int tb_dma_revoke_bus_master(struct tb_nhi *nhi)
+     if (pci_read_config_word(pdev, PCI_COMMAND, &command) ||
+         (command & PCI_COMMAND_MASTER))
+         return -EIO;
+-    (void)ioread32(nhi->iobase + REG_CAPS);
++    /* No PCIe capability reads as 0: conventional ordering applies */
++    if (pcie_capability_read_word(pdev, PCI_EXP_DEVCTL, &devctl) ||
++        (devctl & PCI_EXP_DEVCTL_RELAX_EN))
++        return -EPROTO;
++    caps = ioread32(nhi->iobase + REG_CAPS);
++    if (caps == ~0U || !(caps & 0x3ff))
++        return -EIO;
+     return 0;
+ }
+ 

@@ -128,6 +128,25 @@ static void test_teardown_revoke(void)
     f.pci.present = false;
     tb_dma_retire_domain_clients(&f.tb);
     assert(core_events[1] == TB_DMA_DOMAIN_ABANDONED && !f.nhi.dma_revoked && f.nhi.dma_abandoned);
+    /* Audit A5: the read after the revoke returned all ones (it did not
+     * complete at the function): no proof, even with BME cleared. */
+    teardown_case(&f, 1, 0);
+    caps = ~0U;
+    before = reads;
+    tb_dma_retire_domain_clients(&f.tb);
+    assert(reads == before + 1 && !f.pci.master);
+    assert(core_events[1] == TB_DMA_DOMAIN_ABANDONED && !f.nhi.dma_revoked && f.nhi.dma_abandoned);
+    caps = 0x200008;
+    /* Relaxed Ordering lets earlier posted writes pass that read. */
+    teardown_case(&f, 1, 0);
+    f.pci.relaxed = true;
+    tb_dma_retire_domain_clients(&f.tb);
+    assert(core_events[1] == TB_DMA_DOMAIN_ABANDONED && !f.nhi.dma_revoked && f.nhi.dma_abandoned);
+    /* The ordering premise cannot be read either. */
+    teardown_case(&f, 1, 0);
+    f.pci.devctl_fail = true;
+    tb_dma_retire_domain_clients(&f.tb);
+    assert(core_events[1] == TB_DMA_DOMAIN_ABANDONED && f.nhi.dma_abandoned);
     teardown_consumer = NULL;
     assert(!writes && !starts && !stops);
 }

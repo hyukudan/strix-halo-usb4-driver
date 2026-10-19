@@ -20,3 +20,4 @@
 0021-stream-device-state-under-lock.patch
 0022-stream-resume-failure-fails-open-files.patch
 0023-stream-rx-counters-before-posting.patch
+0024-dma-revoke-proves-relaxed-ordering-off.patch
