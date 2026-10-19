@@ -54,6 +54,22 @@ def as_int(text):
         return None
 
 
+def driver_name(path):
+    """Basename of a driver symlink; None if absent or removed meanwhile."""
+    try:
+        return os.path.basename(os.readlink(path / 'driver'))
+    except OSError:
+        return None
+
+
+def listdir(path):
+    """Sorted children; empty if the directory vanished during enumeration."""
+    try:
+        return sorted(path.iterdir())
+    except OSError:
+        return []
+
+
 def uevent(path):
     out = {}
     for line in (read(path / 'uevent') or '').splitlines():
@@ -77,8 +93,11 @@ def link_of(device):
     rx, tx = link_direction(device, 'rx'), link_direction(device, 'tx')
     totals = [d['gbps'] for d in (rx, tx)]
     gbps = min(totals) if None not in totals else None
-    full = all(d['gbps_per_lane'] == FULL_LANE_GBPS and d['lanes'] == FULL_LANES
-               for d in (rx, tx))
+    if any(d['gbps_per_lane'] is None or d['lanes'] not in (1, 2) for d in (rx, tx)):
+        full = None                 # unreadable/unknown: neither full nor degraded
+    else:
+        full = all(d['gbps_per_lane'] == FULL_LANE_GBPS and d['lanes'] == FULL_LANES
+                   for d in (rx, tx))
     return dict(rx=rx, tx=tx, gbps=gbps, full_speed=full,
                 note='sysfs speed is per lane; gbps = per-lane speed x lanes, '
                      'minimum of both directions; raw link rate, not throughput')
@@ -109,14 +128,13 @@ class Describer:
     def controllers(self):
         out = []
         base = self.sysfs / 'bus/pci/devices'
-        for pci in sorted(base.glob('*')) if base.exists() else []:
+        for pci in listdir(base):
             if read(pci / 'class') != NHI_CLASS:
                 continue
             vendor, device = read(pci / 'vendor'), read(pci / 'device')
-            driver = pci / 'driver'
-            driver = os.path.basename(os.readlink(driver)) if driver.is_symlink() else None
-            domains = sorted(int(d.name[6:]) for d in pci.glob('domain*')
-                             if d.name[6:].isdecimal())
+            driver = driver_name(pci)
+            domains = sorted(int(d.name[6:]) for d in listdir(pci)
+                             if d.name.startswith('domain') and d.name[6:].isdecimal())
             item = dict(pci=pci.name,
                         device_id=f'{(vendor or "?")[2:]}:{(device or "?")[2:]}',
                         acpi_path=read(pci / 'firmware_node/path'),
@@ -128,8 +146,8 @@ class Describer:
                 item['host_router_uuid'] = read(router / 'unique_id')
                 item['generation'] = as_int(read(router / 'generation'))
                 item['usb4_ports'] = sorted(
-                    int(p.name[9:]) for p in router.glob('usb4_port*')
-                    if p.name[9:].isdecimal())
+                    int(p.name[9:]) for p in listdir(router)
+                    if p.name.startswith('usb4_port') and p.name[9:].isdecimal())
                 item['port_link'] = {str(p): read(router / f'usb4_port{p}/link')
                                      for p in item['usb4_ports']}
             elif driver is None:
@@ -156,7 +174,7 @@ class Describer:
     def tb_devices(self):
         xdomains, services = {}, {}
         base = self.sysfs / 'bus/thunderbolt/devices'
-        for dev in sorted(base.glob('*')) if base.exists() else []:
+        for dev in listdir(base):
             kind = uevent(dev).get('DEVTYPE')
             if kind == 'thunderbolt_xdomain':
                 match = DEVICE_NAME.fullmatch(dev.name)
@@ -176,10 +194,7 @@ class Describer:
                     maxhopid=as_int(read(dev / 'maxhopid')),
                     link=link_of(dev))
             elif kind == 'thunderbolt_service':
-                driver = dev / 'driver'
-                services[dev.name] = dict(
-                    key=read(dev / 'key'),
-                    driver=os.path.basename(os.readlink(driver)) if driver.is_symlink() else None)
+                services[dev.name] = dict(key=read(dev / 'key'), driver=driver_name(dev))
         return xdomains, services
 
     # -- streams ---------------------------------------------------------
@@ -188,13 +203,15 @@ class Describer:
         found = []
         if self.configfs.is_dir():
             try:
-                for svc in sorted(self.configfs.iterdir()):
-                    if svc.is_dir():
-                        for st in sorted(svc.iterdir()):
-                            if st.is_dir():
-                                found.append((svc.name, st.name, st, None))
+                services = sorted(self.configfs.iterdir())
             except OSError as exc:
+                services = []
                 self.warnings.append(f'cannot list {self.configfs}: {exc}')
+            # Groups can be removed (rmdir, unplug) while we walk: skip, do not crash.
+            for svc in services:
+                for st in listdir(svc):
+                    if st.is_dir():
+                        found.append((svc.name, st.name, st, None))
         if not found and self.layout_path and self.layout_path.exists():
             try:
                 old = json.loads(self.layout_path.read_text())
@@ -278,10 +295,14 @@ class Describer:
         for svc, st, cdir, legacy in self.stream_dirs():
             attrs = {}
             if cdir is not None:
-                for f in sorted(cdir.iterdir()):
-                    if f.is_file():
-                        value = read(f)
+                for f in listdir(cdir):
+                    value = read(f)
+                    if value is not None:
                         attrs[f.name] = as_int(value) if as_int(value) is not None else value
+                if 'index' not in attrs:
+                    # The group disappeared between listing and reading it.
+                    self.warnings.append(f'{svc}/{st} vanished during enumeration; skipped')
+                    continue
             index = attrs.get('index')
             if index is None and legacy:
                 m = re.search(r'(\d+)$', legacy.get('device', ''))
@@ -295,13 +316,20 @@ class Describer:
             node_ok, access_ok, why = self.device_state(index)
             svc_info = services.get(svc)
             attached = bool(svc_info and svc_info['driver'] == 'thunderbolt_stream')
+            # open() fails with EINVAL unless both HopIDs are > 0 (tbstream_dev_valid).
+            hops = (attrs.get('in_hopid'), attrs.get('out_hopid'))
+            hops_ok = all(isinstance(h, int) and h > 0 for h in hops)
             entry['exists'] = (cdir is not None or legacy is not None) and node_ok
             entry['attached'] = attached
-            entry['openable'] = entry['exists'] and access_ok and attached
+            entry['openable'] = entry['exists'] and access_ok and attached and hops_ok
             if not entry['openable']:
                 if why is None and not attached:
                     why = (f'service {svc} not present in sysfs (no peer on that domain/port)'
                            if not svc_info else f'service {svc} bound to {svc_info["driver"]}')
+                if why is None and not hops_ok:
+                    why = (f'HopIDs not allocated (in {hops[0]}, out {hops[1]}): '
+                           'open() rejects HopIDs <= 0' if cdir is not None else
+                           'HopIDs unknown (configfs not readable)')
                 entry['openable_reason'] = why
             entry['open_checked'] = False
 
@@ -352,7 +380,12 @@ class Describer:
             if cable['state'] == 'no-peer':
                 self.warnings.append(f'cable {cable["id"]} ({cable["key"]}) has no peer: '
                                      'cable unplugged or the far-end controller is down')
-            if cable['state'] == 'up' and link and not link['full_speed']:
+            if cable['state'] == 'up' and link and link['full_speed'] is None:
+                self.warnings.append(
+                    f'cable {cable["id"]} ({cable["key"]}) link speed unknown: '
+                    f'rx {link["rx"]["raw_speed"]!r} x {link["rx"]["raw_lanes"]!r}, '
+                    f'tx {link["tx"]["raw_speed"]!r} x {link["tx"]["raw_lanes"]!r}')
+            if cable['state'] == 'up' and link and link['full_speed'] is False:
                 self.warnings.append(
                     f'cable {cable["id"]} ({cable["key"]}) trained below Gen3 x2: '
                     f'rx {fmt_gbps(link["rx"]["gbps_per_lane"])}x{link["rx"]["lanes"]}, '
@@ -406,7 +439,15 @@ class Describer:
 
 # -- pair view ---------------------------------------------------------------
 def merge(reports):
-    hosts = {r['topology']['host']: r for r in reports}
+    hosts = {}
+    for rep in reports:
+        host = rep.get('topology', {}).get('host') if isinstance(rep, dict) else None
+        if not host:
+            raise ValueError('not a usb4stream-describe report (no topology.host)')
+        if host in hosts:
+            raise ValueError(f'duplicate host {host!r}: each report must come from a '
+                             'different node (check --hostname)')
+        hosts[host] = rep
     uuid_owner = {}
     for host, rep in hosts.items():
         for ctrl in rep['topology']['controllers']:
@@ -512,12 +553,17 @@ def load_labels(path, explicit):
 
 
 def read_kernel_log():
+    """(thunderbolt lines, error or None): a failed journalctl is reported, not hidden."""
     try:
         result = subprocess.run(['journalctl', '-k', '-b', '--no-pager', '-n', '5000'],
                                 text=True, capture_output=True, timeout=15)
-        return [l for l in result.stdout.splitlines() if 'thunderbolt' in l]
-    except (OSError, subprocess.TimeoutExpired):
-        return []
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [], f'kernel log unavailable: {exc}'
+    lines = [l for l in result.stdout.splitlines() if 'thunderbolt' in l]
+    if result.returncode:
+        detail = result.stderr.strip() or f'exit status {result.returncode}'
+        return lines, f'kernel log unavailable: journalctl failed: {detail}'
+    return lines, None
 
 
 def write_atomic(path, text):
@@ -548,14 +594,20 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     if args.merge:
-        result = merge([json.loads(f.read_text()) for f in args.merge])
+        try:
+            result = merge([json.loads(f.read_text()) for f in args.merge])
+        except (OSError, ValueError) as exc:
+            p.exit(2, f'{TOOL}: --merge: {exc}\n')
         summary = result['summary']
     else:
         labels = load_labels(args.port_labels or Path('/etc/usb4stream-ports.json'),
                              args.port_labels is not None)
-        result = Describer(args.sysfs_root, args.configfs_root, args.dev_root, args.layout,
-                           labels, args.hostname,
-                           kernel_log=read_kernel_log() if args.logs else None).describe()
+        log, log_error = read_kernel_log() if args.logs else (None, None)
+        describer = Describer(args.sysfs_root, args.configfs_root, args.dev_root, args.layout,
+                              labels, args.hostname, kernel_log=log)
+        if log_error:
+            describer.warnings.append(log_error)
+        result = describer.describe()
         summary = '\n'.join([result['topology']['summary']] +
                             [f'warning: {w}' for w in result['topology']['warnings']])
     text = json.dumps(result, indent=2) + '\n'
