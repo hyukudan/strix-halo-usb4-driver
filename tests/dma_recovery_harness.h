@@ -50,8 +50,45 @@ static int blocking_notifier_call_chain(struct blocking_notifier_head *h,unsigne
 #define PCI_DEVICE_ID_AMD_1AH_M70H_NHI1 11
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
-#define dev_warn(...) ((void)0)
-#define dev_err(...) ((void)0)
+/* The last message of each level, so cases can check what dmesg would say. */
+static char last_info[256], last_warn[256], last_err[256];
+static int infos, warns, errs;
+#define dev_info(d, ...) ((void)(d), ++infos, snprintf(last_info, sizeof(last_info), __VA_ARGS__))
+#define dev_warn(d, ...) ((void)(d), ++warns, snprintf(last_warn, sizeof(last_warn), __VA_ARGS__))
+#define dev_err(d, ...) ((void)(d), ++errs, snprintf(last_err, sizeof(last_err), __VA_ARGS__))
+#define dev_dbg(d, ...) ((void)(d))
+#define module_param(name, type, perm)
+#define MODULE_PARM_DESC(name, desc)
+#define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+/* Delayed work: queued with a delay, run explicitly by the cases. */
+struct work_struct { int unused; };
+struct workqueue_struct { int unused; };
+struct delayed_work { struct work_struct work; void (*func)(struct work_struct *); bool pending; unsigned delay_ms; struct workqueue_struct *wq; };
+static unsigned queued_delays[32], nqueued;
+#define msecs_to_jiffies(ms) (ms)
+static struct delayed_work *to_delayed_work(struct work_struct *w) { return container_of(w, struct delayed_work, work); }
+static bool queue_delayed_work(struct workqueue_struct *wq, struct delayed_work *w, unsigned delay)
+{
+    if (w->pending) return false;
+    w->pending = true; w->delay_ms = delay; w->wq = wq;
+    assert(nqueued < 32); queued_delays[nqueued++] = delay;
+    return true;
+}
+static bool mod_delayed_work(struct workqueue_struct *wq, struct delayed_work *w, unsigned delay)
+{
+    bool was = w->pending;
+    w->pending = false;
+    queue_delayed_work(wq, w, delay);
+    return was;
+}
+/* Runs the work once if it is queued; returns whether it ran. */
+static bool run_delayed(struct delayed_work *w)
+{
+    if (!w->pending) return false;
+    w->pending = false;
+    w->func(&w->work);
+    return true;
+}
 #define PCI_COMMAND 0x04
 #define PCI_COMMAND_MASTER 0x4
 #define EXPORT_SYMBOL_GPL(x)
@@ -77,7 +114,8 @@ struct tb_nhi { spinlock_t lock; struct device *dev; struct tb_ring *tx_rings[8]
 struct tb_ctl { struct tb_nhi *nhi; };
 struct tb;
 struct tb_cm_ops { int (*dma_paths_busy)(struct tb *, int, int); };
-struct tb { struct tb_cm_ops *cm_ops; struct tb_nhi *nhi; struct mutex lock; struct device dev; struct tb_ctl *ctl; };
+struct tb { struct tb_cm_ops *cm_ops; struct tb_nhi *nhi; struct mutex lock; struct device dev; struct tb_ctl *ctl;
+            struct workqueue_struct *wq; struct delayed_work teardown_reset_work; unsigned int teardown_reset_attempts; };
 static bool dev_is_pci(struct device *d) { return d->pci; }
 static struct pci_dev *to_pci_dev(struct device *d) { return d->pdev; }
 static bool device_is_registered(struct device *d) { return d->registered; }
