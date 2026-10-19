@@ -100,10 +100,24 @@ static void list_scan(void) {
     assert(tb_dma_paths_busy(&tb,2,33)==0);
     assert(tb_dma_paths_busy(&tb,-1,-1)==1);
 }
+/* Review of E3: the Gen3 retrain must see every tunnel, not only DMA ones. */
+static void any_tunnel(void) {
+    struct tb tb={.lock=true,.root_switch=&tb};
+    struct tb_tunnel pcie={.dma=false},dma={.dma=true};
+    assert(tb_tunnels_active(&tb)==0);
+    tb.cm.tunnel_list=&pcie;
+    assert(tb_tunnels_active(&tb)==1);
+    assert(tb_dma_paths_busy(&tb,-1,-1)==0); /* invisible to the DMA query */
+    tb.cm.tunnel_list=&dma;
+    assert(tb_tunnels_active(&tb)==1);
+    tb.root_switch=NULL;tb.cm.tunnel_list=NULL;
+    assert(tb_tunnels_active(&tb)==-ENODEV); /* after tb_stop(): no answer */
+}
 int main(int argc,char **argv) {
     assert(argc==2);
     if(!strcmp(argv[1],"filters"))query_filters();
     else if(!strcmp(argv[1],"list"))list_scan();
+    else if(!strcmp(argv[1],"any_tunnel"))any_tunnel();
     else return 2;
     puts("PASS actual DMA inventory callback");return 0;
 }

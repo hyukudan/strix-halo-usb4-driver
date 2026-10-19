@@ -36,3 +36,4 @@
 0036-gpu-nonblock-submit-does-not-sleep-on-dma-lock.patch
 0037-stream-damaged-close-is-an-error.patch
 0038-teardown-reset-pending-survives-requests-contention-suspend.patch
+0039-gen3-retrain-serialized-and-exclusive.patch

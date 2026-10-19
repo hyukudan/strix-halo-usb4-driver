@@ -49,6 +49,7 @@ class CmLinkTests(unittest.TestCase):
         parts = ['#include "cm_link_harness.h"\n']
         parts += [define(cls.xdomain_c, name) for name in XDOMAIN_DEFINES]
         parts += [extract(cls.xdomain_c, 'tb_xdomain_bond_lanes_uuid_low'),
+                  extract(cls.xdomain_c, '__tb_xdomain_maybe_retrain_gen3'),
                   extract(cls.xdomain_c, 'tb_xdomain_maybe_retrain_gen3'),
                   extract(cls.tb_c, 'tb_start_reset_host'),
                   '#include "cm_link_cases.h"\n']
