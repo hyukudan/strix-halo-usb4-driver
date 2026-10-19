@@ -270,6 +270,7 @@ int main(int argc, char **argv)
         { "damaged_rx_frame_fails_stream", damaged_rx_frame_fails_stream },
         { "close_waits_for_tx_slot", close_waits_for_tx_slot },
         { "partial_io_is_accounted", partial_io_is_accounted },
+        { "close_does_not_flush_rx", close_does_not_flush_rx },
     };
 
     assert(argc == 2);

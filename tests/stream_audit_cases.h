@@ -375,3 +375,46 @@ static void partial_io_is_accounted(void)
     assert_nothing_held();
     unplug_and_remove(&e, 0);
 }
+
+/* The far end of the cable: completes TX frames as they are posted. */
+struct wire { struct tb_ring *ring; atomic_bool stop; };
+static void *wire_thread(void *data)
+{
+    struct wire *w = data;
+
+    while (!atomic_load(&w->stop))
+        if (!complete_tx(w->ring))
+            usleep(200);
+    return NULL;
+}
+
+/* A10: close waited the full 500 ms for posted RX buffers that only
+ * complete when data arrives. TX is still drained; RX is stopped (the stop
+ * cancels the posted buffers and waits for their callbacks). */
+static void close_does_not_flush_rx(void)
+{
+    struct endpoint e;
+    unsigned char buf[64] = { 0 };
+    struct wire w;
+    pthread_t thread;
+    double t0, spent;
+
+    endpoint_init(&e, 0);
+    for (int written = 0; written < 2; ++written) {
+        assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+        if (written)
+            assert(file_write(&e, buf, sizeof(buf)) == sizeof(buf));
+        w = (struct wire){ .ring = e.dev.tx_ring.ring };
+        assert(!pthread_create(&thread, NULL, wire_thread, &w));
+        atomic_store(&rx_flushes, 0);
+        t0 = ktime_get() / 1e6;
+        assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+        spent = ktime_get() / 1e6 - t0;
+        atomic_store(&w.stop, true);
+        assert(!pthread_join(thread, NULL));
+        /* The data and the CLOSE went out; no wait on the idle RX ring. */
+        assert(spent < 200 && !atomic_load(&rx_flushes));
+        assert_nothing_held();
+    }
+    unplug_and_remove(&e, 0);
+}
