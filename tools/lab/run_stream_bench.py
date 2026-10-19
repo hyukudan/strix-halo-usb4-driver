@@ -19,6 +19,12 @@ read) divided by the common receiver-clock window: latest end minus earliest
 start over all receivers (one host, one CLOCK_MONOTONIC). Nothing is
 discarded; a failed or unverified stream makes the run invalid (exit 1).
 
+Every process runs under coreutils `timeout` on its own host, so a stuck end
+terminates even if the ssh session dies. The runner also enforces --timeout
+for the whole transfer phase: it terminates its local process groups, signals
+the peer's processes by their run marker, and always writes result.json with
+a status (complete, timeout, refused, error, interrupted).
+
 usage example (the benchmark binary and this driver checkout must be at the
 same paths on both hosts):
   tools/lab/run_stream_bench.py --peer cluster2 --out ~/bench/2026-10-20-4x \\
@@ -30,10 +36,13 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
+import uuid
 
 REPO = Path(__file__).resolve().parents[2]
 SIZE = re.compile(r'^(\d+)([KMG]?)$')
@@ -97,19 +106,34 @@ def last_json(text):
     return None
 
 
+KILL_GRACE = 10          # seconds between TERM and KILL, on both hosts
+
+
+def bounded(argv, seconds, marker):
+    """argv under coreutils timeout, with argv[0] renamed to a per-run marker."""
+    return ['bash', '-c', 'exec -a "$0" timeout --kill-after=%d %d "$@"' % (KILL_GRACE, seconds),
+            marker, *argv]
+
+
 def plan(args):
     send, recv = ('send', 'recv') if args.direction == 'send' else ('recv', 'send')
+    run_id = getattr(args, 'run_id', None) or uuid.uuid4().hex[:12]
+    ssh = shlex.split(getattr(args, 'ssh', None) or 'ssh -o BatchMode=yes')
+    seconds = getattr(args, 'timeout', 3600)
     streams = []
     for index, pair in enumerate(args.pair):
+        marker = f'usb4bench-{run_id}-{index}'
         local = ['taskset', '-c', str(pair['local_cpu']), str(args.bench), send, pair['local'],
                  str(args.bytes), str(args.block), '1']
         remote = ['taskset', '-c', str(pair['remote_cpu']), str(args.bench), recv, pair['remote'],
                   str(args.bytes), str(args.block), '1']
-        streams.append(dict(index=index, pair=pair, local=local,
-                            remote=['ssh', '-o', 'BatchMode=yes', args.peer, shlex.join(remote)]))
-    return dict(schema='usb4-stream-bench-v1', peer=args.peer, direction=args.direction,
+        streams.append(dict(index=index, pair=pair, marker=marker,
+                            local=bounded(local, seconds, marker),
+                            remote=ssh + [args.peer, shlex.join(bounded(remote, seconds, marker))]))
+    return dict(schema='usb4-stream-bench-v2', peer=args.peer, direction=args.direction,
                 bytes_per_stream=args.bytes, block_bytes=args.block, verify=1,
-                receiver='peer' if args.direction == 'send' else 'local',
+                receiver='peer' if args.direction == 'send' else 'local', run_id=run_id,
+                timeout_seconds=seconds, kill_grace_seconds=KILL_GRACE, ssh=ssh,
                 streams=streams)
 
 
@@ -118,6 +142,38 @@ def identity(command, bench, repo):
                             input=IDENTITY, capture_output=True, text=True, timeout=60)
     values = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
     return dict(values=values, returncode=result.returncode, stderr=result.stderr)
+
+
+def stop_local(proc):
+    """TERM, then KILL, the whole process group of a local benchmark process."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def stop_remote(ssh, peer, markers):
+    """Signal the peer's bounded processes by their run markers (TERM, then KILL)."""
+    pattern = '|'.join(markers)
+    script = (f"pkill -TERM -f -- '^({pattern}) '; sleep {KILL_GRACE // 2}; "
+              f"pkill -KILL -f -- '^({pattern}) '; true")
+    try:
+        subprocess.run(ssh + [peer, script], capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def exit_label(code):
+    if code is None or code < 0:
+        return 'killed'
+    return 'timeout' if code in (124, 137) else code
 
 
 def main(argv=None):
@@ -132,54 +188,94 @@ def main(argv=None):
     parser.add_argument('--pair', type=parse_pair, action='append', required=True)
     parser.add_argument('--direction', choices=('send', 'recv'), default='send',
                         help='what this host does (default: this host sends)')
+    parser.add_argument('--timeout', type=int, default=3600,
+                        help='seconds allowed for the transfer phase (default 3600)')
+    parser.add_argument('--ssh', default='ssh -o BatchMode=yes', help='remote shell command')
     parser.add_argument('--dry-run', action='store_true', help='print the plan only')
     args = parser.parse_args(argv)
     if not 1 <= args.block <= 64 << 20:
         parser.error('--block must be 1..64M')
+    if not 1 <= args.timeout <= 86400:
+        parser.error('--timeout must be 1..86400 seconds')
     the_plan = plan(args)
     if args.dry_run:
         print(json.dumps(the_plan, indent=2))
         return 0
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out / 'plan.json').write_text(json.dumps(the_plan, indent=2) + '\n')
-    ssh = ['ssh', '-o', 'BatchMode=yes', args.peer]
-    for role, prefix in (('local', []), ('peer', ssh)):
-        ident = identity(prefix, args.bench, REPO)
-        diag = subprocess.run(prefix + ['python3', str(REPO / 'tools/usb4_diagnose.py'),
-                                        '--require-budget'], capture_output=True, text=True,
-                              timeout=60)
-        topo = subprocess.run(prefix + ['python3', str(REPO / 'tools/lab/usb4stream_describe.py')],
-                              capture_output=True, text=True, timeout=60)
-        ident.update(diagnose=diag.stdout, diagnose_rc=diag.returncode, diagnose_err=diag.stderr,
-                     topology=topo.stdout, topology_rc=topo.returncode)
-        (args.out / f'{role}-identity.json').write_text(json.dumps(ident, indent=2) + '\n')
-        if diag.returncode:
-            print(f'{role}: ring budget check failed; not running:\n{diag.stderr}', file=sys.stderr)
-            return 1
-    receivers_cmd = 'remote' if args.direction == 'send' else 'local'
+    ssh = the_plan['ssh']
+    summary = dict(status='error', run_id=the_plan['run_id'], exit_codes={}, streams=[],
+                   aggregate=None, valid=False)
     procs = []
-    for stream in the_plan['streams']:
-        for role in (receivers_cmd, 'local' if receivers_cmd == 'remote' else 'remote'):
-            log = (args.out / f'{"peer" if role == "remote" else "local"}-{stream["index"]}.log').open('w')
-            procs.append((stream['index'], role, log,
-                          subprocess.Popen(stream[role], stdout=log, stderr=subprocess.STDOUT)))
-            if role == receivers_cmd:
-                time.sleep(0.5)          # receivers open first
-    codes = {}
-    for index, role, log, proc in procs:
-        codes[f'{role}-{index}'] = proc.wait(timeout=3600)
-        log.close()
-    results, receivers = [], []
-    for stream in the_plan['streams']:
-        entry = dict(index=stream['index'], pair=stream['pair'])
-        for role, name in (('local', 'local'), ('remote', 'peer')):
-            entry[role] = last_json((args.out / f'{name}-{stream["index"]}.log').read_text())
-        receivers.append(entry['remote' if args.direction == 'send' else 'local'])
-        results.append(entry)
-    summary = dict(exit_codes=codes, streams=results, aggregate=aggregate(receivers),
-                   valid=all(c == 0 for c in codes.values()) and aggregate(receivers) is not None)
-    (args.out / 'result.json').write_text(json.dumps(summary, indent=2) + '\n')
-    print(json.dumps(summary['aggregate'], indent=2))
+    try:
+        for role, prefix in (('local', []), ('peer', ssh + [args.peer])):
+            ident = identity(prefix, args.bench, REPO)
+            diag = subprocess.run(prefix + ['python3', str(REPO / 'tools/usb4_diagnose.py'),
+                                            '--require-budget'],
+                                  capture_output=True, text=True, timeout=60)
+            topo = subprocess.run(prefix + ['python3',
+                                            str(REPO / 'tools/lab/usb4stream_describe.py')],
+                                  capture_output=True, text=True, timeout=60)
+            ident.update(diagnose=diag.stdout, diagnose_rc=diag.returncode,
+                         diagnose_err=diag.stderr, topology=topo.stdout,
+                         topology_rc=topo.returncode)
+            (args.out / f'{role}-identity.json').write_text(json.dumps(ident, indent=2) + '\n')
+            if diag.returncode:
+                summary.update(status='refused', reason=f'{role}: ring budget check failed: '
+                               f'{diag.stderr.strip()}')
+                print(summary['reason'], file=sys.stderr)
+                return 1
+        receivers_cmd = 'remote' if args.direction == 'send' else 'local'
+        senders_cmd = 'local' if receivers_cmd == 'remote' else 'remote'
+        for stream in the_plan['streams']:
+            for role in (receivers_cmd, senders_cmd):
+                name = 'peer' if role == 'remote' else 'local'
+                log = (args.out / f'{name}-{stream["index"]}.log').open('w')
+                procs.append((stream['index'], role, log,
+                              subprocess.Popen(stream[role], stdout=log, stderr=subprocess.STDOUT,
+                                               start_new_session=True)))
+                if role == receivers_cmd:
+                    time.sleep(0.5)          # receivers open first
+        # Each end stops itself after --timeout (+ grace); this bound covers ssh too.
+        deadline = time.monotonic() + args.timeout + KILL_GRACE + 5
+        status = 'complete'
+        for index, role, log, proc in procs:
+            try:
+                code = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                status = 'timeout'
+                break
+            summary['exit_codes'][f'{role}-{index}'] = exit_label(code)
+            if code in (124, 137):
+                status = 'timeout'
+        summary['status'] = status
+    except KeyboardInterrupt:
+        summary['status'] = 'interrupted'
+    except (OSError, subprocess.SubprocessError) as exc:
+        summary.update(status='error', reason=str(exc))
+    finally:
+        if procs and summary['status'] != 'complete':
+            for _index, _role, _log, proc in procs:
+                stop_local(proc)
+            stop_remote(ssh, args.peer, [stream['marker'] for stream in the_plan['streams']])
+        for index, role, log, proc in procs:
+            log.close()
+            summary['exit_codes'].setdefault(f'{role}-{index}', exit_label(proc.poll()))
+        receivers = []
+        for stream in the_plan['streams']:
+            entry = dict(index=stream['index'], pair=stream['pair'])
+            for role, name in (('local', 'local'), ('remote', 'peer')):
+                path = args.out / f'{name}-{stream["index"]}.log'
+                entry[role] = last_json(path.read_text()) if path.exists() else None
+            receivers.append(entry['remote' if args.direction == 'send' else 'local'])
+            summary['streams'].append(entry)
+        if summary['status'] == 'complete':
+            summary['aggregate'] = aggregate(receivers)
+        summary['valid'] = (summary['status'] == 'complete' and summary['aggregate'] is not None
+                            and all(c == 0 for c in summary['exit_codes'].values()))
+        (args.out / 'result.json').write_text(json.dumps(summary, indent=2) + '\n')
+    print(json.dumps(dict(status=summary['status'], valid=summary['valid'],
+                          aggregate=summary['aggregate']), indent=2))
     return 0 if summary['valid'] else 1
 
 

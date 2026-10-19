@@ -5,6 +5,9 @@
 No /dev/tbstreamN is opened: FIFOs stand in for the device, so this checks the
 harness (pattern, verification, accounting), not the driver or the link.
 """
+import contextlib
+import io
+import time
 import importlib.util
 import json
 import os
@@ -101,20 +104,103 @@ class AggregateTests(unittest.TestCase):
         self.assertIsNone(bench.aggregate([self.recv(0, 1), None]))
         self.assertIsNone(bench.aggregate([]))
 
-    def test_plan_pins_every_process_and_verifies(self):
+    def test_plan_pins_bounds_and_marks_every_process(self):
         args = bench.argparse.Namespace(peer='cluster2', bench=Path('/opt/b'), bytes=1 << 30,
-                                        block=1 << 20, direction='send',
+                                        block=1 << 20, direction='send', timeout=600, run_id='r1',
+                                        ssh='ssh -o BatchMode=yes',
                                         pair=[bench.parse_pair('/dev/tbstream0:/dev/tbstream2:2:4')])
         plan = bench.plan(args)
         stream = plan['streams'][0]
-        self.assertEqual(stream['local'], ['taskset', '-c', '2', '/opt/b', 'send', '/dev/tbstream0',
-                                           str(1 << 30), str(1 << 20), '1'])
+        self.assertEqual(stream['marker'], 'usb4bench-r1-0')
+        self.assertEqual(stream['local'][:4], ['bash', '-c', 'exec -a "$0" timeout '
+                                               '--kill-after=10 600 "$@"', 'usb4bench-r1-0'])
+        self.assertEqual(stream['local'][4:], ['taskset', '-c', '2', '/opt/b', 'send',
+                                               '/dev/tbstream0', str(1 << 30), str(1 << 20), '1'])
+        self.assertEqual(stream['remote'][:4], ['ssh', '-o', 'BatchMode=yes', 'cluster2'])
+        self.assertIn('timeout --kill-after=10 600', stream['remote'][-1])
         self.assertIn('taskset -c 4 /opt/b recv /dev/tbstream2', stream['remote'][-1])
-        self.assertEqual(plan['receiver'], 'peer')
+        self.assertEqual((plan['receiver'], plan['timeout_seconds']), ('peer', 600))
         self.assertEqual(bench.parse_size('8G'), 8 << 30)
         with self.assertRaises(bench.argparse.ArgumentTypeError):
             bench.parse_pair('/dev/tbstream0:/dev/tbstream0')
 
+
+FAKE_SSH = """#!/bin/sh
+# Stand-in for ssh: drop options and the host, run the command locally.
+while [ "$1" = -o ]; do shift 2; done
+shift
+exec sh -c "$*"
+"""
+
+
+@unittest.skipUnless(shutil.which(CC) and hasattr(os, 'mkfifo') and shutil.which('timeout')
+                     and shutil.which('taskset') and shutil.which('pkill'),
+                     'needs cc, FIFOs, timeout, taskset and pkill')
+class RunnerEndToEndTests(unittest.TestCase):
+    """The whole runner with a local stand-in for ssh; FIFOs replace the devices."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix='bench-run-')
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.ssh = self.root / 'fake-ssh'
+        self.ssh.write_text(FAKE_SSH)
+        self.ssh.chmod(0o755)
+
+    def run_bench(self, bench_path, pairs, *extra):
+        args = ['--peer', 'peer', '--out', str(self.root / 'out'), '--bench', str(bench_path),
+                '--ssh', str(self.ssh), *extra]
+        for pair in pairs:
+            args += ['--pair', pair]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            status = bench.main(args)
+        return status, json.loads((self.root / 'out/result.json').read_text())
+
+    def test_complete_run_writes_valid_result(self):
+        binary = self.root / 'stream_mem_bench'
+        subprocess.run([CC, '-O2', str(REPO / 'tools/stream_mem_bench.c'), '-o', str(binary)],
+                       check=True)
+        pairs = []
+        for i in range(2):
+            fifo = self.root / f'dev{i}'
+            os.mkfifo(fifo)
+            pairs.append(f'{fifo}:{fifo}:0:0')
+        status, result = self.run_bench(binary, pairs, '--bytes', '4M', '--block', '64K',
+                                        '--timeout', '60')
+        self.assertEqual(status, 0, result)
+        self.assertEqual((result['status'], result['valid']), ('complete', True))
+        self.assertEqual(result['aggregate']['streams'], 2)
+        self.assertEqual(set(result['exit_codes'].values()), {0})
+        for name in ('plan.json', 'local-identity.json', 'peer-identity.json', 'local-0.log',
+                     'peer-1.log'):
+            self.assertTrue((self.root / 'out' / name).exists(), name)
+
+    def test_timeout_stops_both_ends_and_still_writes_result(self):
+        hang = self.root / 'hang'
+        hang.write_text('#!/bin/sh\nexec sleep 1000\n')
+        hang.chmod(0o755)
+        started = time.monotonic()
+        status, result = self.run_bench(hang, ['/dev/null:/dev/null:0:0'], '--timeout', '2')
+        self.assertEqual(status, 1)
+        self.assertEqual(result['status'], 'timeout')
+        self.assertFalse(result['valid'])
+        self.assertIsNone(result['aggregate'])
+        self.assertEqual(set(result['exit_codes'].values()), {'timeout'})
+        self.assertLess(time.monotonic() - started, 60)
+        leftover = subprocess.run(['pgrep', '-f', f'usb4bench-{result["run_id"]}'],
+                                  capture_output=True, text=True)
+        self.assertEqual(leftover.stdout, '')
+
+    def test_refused_run_records_why(self):
+        diag_fail = self.root / 'fake-ssh-refuse'
+        diag_fail.write_text(FAKE_SSH.replace('exec sh -c "$*"',
+                                              'case "$*" in *usb4_diagnose*) echo budget >&2; '
+                                              'exit 1;; esac\nexec sh -c "$*"'))
+        diag_fail.chmod(0o755)
+        self.ssh = diag_fail
+        status, result = self.run_bench(Path('/bin/true'), ['/dev/null:/dev/null:0:0'])
+        self.assertEqual((status, result['status'], result['valid']), (1, 'refused', False))
+        self.assertIn('peer: ring budget check failed', result['reason'])
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
