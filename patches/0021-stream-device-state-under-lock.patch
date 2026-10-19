@@ -1,0 +1,101 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -516,10 +516,16 @@ static inline struct tbstream_dev *to_tbstream_dev(struct miscdevice *misc)
+ 	return container_of(misc, struct tbstream_dev, misc);
+ }
+ 
++/*
++ * Looks inside the attached stream: only with sdev->lock held. Detach clears
++ * sdev->stream and drops its reference under that lock, and an open file
++ * keeps the device alive, not the stream.
++ */
+ static inline int tbstream_dev_valid(const struct tbstream_dev *sdev)
+ {
+ 	const struct tbstream *stream = sdev->stream;
+ 
++	lockdep_assert_held(&sdev->lock);
+ 	if (!tbstream_valid(stream))
+ 		return -ENXIO;
+ 	if (sdev->in_hopid <= 0 || sdev->out_hopid <= 0)
+@@ -527,6 +533,15 @@ static inline int tbstream_dev_valid(const struct tbstream_dev *sdev)
+ 	return 0;
+ }
+ 
++/*
++ * Lockless: whether a stream is attached, never a dereference of it. For the
++ * unlocked paths and wait conditions; the locked loops then validate it.
++ */
++static inline bool tbstream_dev_attached(const struct tbstream_dev *sdev)
++{
++	return READ_ONCE(sdev->stream) != NULL;
++}
++
+ static inline bool tbstream_dev_removed(const struct tbstream_dev *sdev)
+ {
+ 	return sdev->removed;
+@@ -973,9 +988,6 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ #endif
+ 	if (tbstream_dev_detached(sdev))
+ 		return -ENODEV;
+-	ret = tbstream_dev_valid(sdev);
+-	if (ret)
+-		return ret;
+ 
+ 	ret = tbstream_dev_lock(sdev, nowait);
+ 	if (ret)
+@@ -1019,7 +1031,7 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 			ret = wait_event_interruptible(sdev->wait,
+ 					tbstream_ring_available(&sdev->rx_ring) ||
+ 					READ_ONCE(sdev->rx_poll_pending) ||
+-					tbstream_dev_valid(sdev) != 0 ||
++					!tbstream_dev_attached(sdev) ||
+ 					tbstream_dev_detached(sdev) ||
+ 					tbstream_dev_closed(sdev) ||
+ 					tbstream_dev_removed(sdev));
+@@ -1100,9 +1112,6 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ #endif
+ 	if (tbstream_dev_detached(sdev))
+ 		return -ENODEV;
+-	ret = tbstream_dev_valid(sdev);
+-	if (ret)
+-		return ret;
+ 
+ 	ret = tbstream_dev_lock(sdev, nowait);
+ 	if (ret)
+@@ -1142,7 +1151,7 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ 		} else {
+ 			ret = wait_event_interruptible(sdev->wait,
+ 					tbstream_ring_available(&sdev->tx_ring) ||
+-					tbstream_dev_valid(sdev) != 0 ||
++					!tbstream_dev_attached(sdev) ||
+ 					tbstream_dev_detached(sdev) ||
+ 					tbstream_dev_closed(sdev) ||
+ 					tbstream_dev_removed(sdev));
+@@ -1255,7 +1264,7 @@ static int tbstream_dev_wait_stream(struct tbstream_dev *sdev, bool nonblock,
+ 		return -ETIMEDOUT;
+ 
+ 	ret = wait_event_interruptible_timeout(sdev->wait,
+-			tbstream_dev_valid(sdev) == 0 ||
++			tbstream_dev_attached(sdev) ||
+ 			tbstream_dev_removed(sdev),
+ 			min_t(long, remaining, HZ));
+ 	if (ret < 0)
+@@ -1992,7 +2001,7 @@ tbstream_dev_attach_stream(struct tbstream_dev *sdev, struct tbstream_group *sg)
+ 			return; /* never rebind an open/retained DMA endpoint */
+ 		}
+ #endif
+-		sdev->stream = stream;
++		WRITE_ONCE(sdev->stream, stream);
+ 		/*
+ 		 * If there is no existing configuration (or automatic
+ 		 * configuration is being used) check if the other side
+@@ -2043,7 +2052,7 @@ static void tbstream_dev_detach_stream(struct tbstream_dev *sdev)
+ 			tbstream_dev_stop(sdev);
+ 			WRITE_ONCE(sdev->detached, true);
+ 		}
+-		sdev->stream = NULL;
++		WRITE_ONCE(sdev->stream, NULL);
+ 		xd = tb_service_parent(stream->svc);
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+ 		if (!tbstream_gpu_paths_pending(sdev, stream)) {
