@@ -246,6 +246,29 @@ static void test_wait_concurrency(void) {
     dma_fence_signal(foreign);dma_fence_put(foreign);
     fixture_close(&f);assert(atomic_load(&module_refs)==0);
 }
+struct mutex_holder { struct mutex *m; atomic_int held; };
+static void *hold_mutex(void *data) {
+    struct mutex_holder *h=data;mutex_lock(h->m);atomic_store(&h->held,1);
+    usleep(200000);mutex_unlock(h->m);return NULL;
+}
+/* Audit A9: O_NONBLOCK SUBMIT/RX_REPOST slept on the device mutex. */
+static void test_nonblock_contended_mutex(void) {
+    struct fixture f;fixture_open(&f,2,64,true);
+    assert(prepare(&f,0,0,1,1,0,4096)==0);
+    struct mutex_holder h={.m=&f.sdev.lock};pthread_t holder;
+    assert(!pthread_create(&holder,NULL,hold_mutex,&h));
+    while(!atomic_load(&h.held))usleep(100);
+    f.file.f_flags=O_NONBLOCK;int before=dma_syncs;
+    assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==-EAGAIN);
+    assert(action(&f,SGU_IOC_RX_REPOST,1,2,1)==-EAGAIN);
+    assert(atomic_load(&h.held)&&dma_syncs==before);
+    assert(!pthread_join(holder,NULL));
+    assert(f.sdev.gpu_context->operations[0][0].fence==NULL);
+    /* Uncontended, the same call publishes. */
+    assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==0);
+    assert(f.sdev.gpu_context->operations[0][0].fence!=NULL);
+    fixture_close(&f);assert(atomic_load(&module_refs)==0);
+}
 static void test_wait_retry_and_order(void) {
     struct fixture f;fixture_open(&f,2,64,true);
     struct dma_fence *foreign=foreign_fence(&f.resv[0]);
@@ -349,7 +372,7 @@ int main(int argc,char **argv) {
     struct { const char *name; void (*run)(void); } tests[]={
         {"geometry",test_geometry},{"queue",test_queue},{"failure_isolation",test_failure_isolation},
         {"events_legacy",test_events_and_legacy},{"timeout_recovery",test_timeout_recovery},
-        {"wait_concurrency",test_wait_concurrency},{"wait_retry_order",test_wait_retry_and_order},
+        {"wait_concurrency",test_wait_concurrency},{"nonblock_contended_mutex",test_nonblock_contended_mutex},{"wait_retry_order",test_wait_retry_and_order},
         {"export_lifetime",test_export_lifetime},{"admission_rollback",test_admission_and_rollback},
         {"watchdog_schedule",test_watchdog_schedule},{"max_queue_reuse",test_max_queue_reuse},
         {"group_success",test_group_success},{"group_rejections",test_group_rejections},

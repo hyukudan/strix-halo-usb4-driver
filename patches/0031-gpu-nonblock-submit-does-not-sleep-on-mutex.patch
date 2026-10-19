@@ -1,0 +1,35 @@
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -1804,8 +1804,16 @@ static long tbstream_gpu_ioctl(struct file *file, unsigned int command, unsigned
+ 
+     if (command == SGU_IOC_RESET_GROUP)
+         return sgu_reset_group_ioctl(file, user);
+-    if (mutex_lock_interruptible(&sdev->lock))
++    /* SGU_CAP_NONBLOCK_SUBMIT: a non-blocking publication does not sleep on
++     * the device mutex either, which another ioctl or the data path can hold
++     * for long. Other commands keep their blocking semantics. */
++    if ((file->f_flags & O_NONBLOCK) &&
++        (command == SGU_IOC_SUBMIT || command == SGU_IOC_RX_REPOST)) {
++        if (!mutex_trylock(&sdev->lock))
++            return -EAGAIN;
++    } else if (mutex_lock_interruptible(&sdev->lock)) {
+         return -ERESTARTSYS;
++    }
+     ctx = sdev->gpu_context;
+     if (!ctx) {
+         ret = -ENXIO;
+diff --git a/include/uapi/linux/strix_gpu_stream.h b/include/uapi/linux/strix_gpu_stream.h
+--- a/include/uapi/linux/strix_gpu_stream.h
++++ b/include/uapi/linux/strix_gpu_stream.h
+@@ -212,7 +212,9 @@ struct sgu_sync_file {
+  * mandatory. It does NOT reset the NHI, retrain the cable, or certify the peer.
+  * Success returns the unimported identity in fence and SESSION_RECOVERED.
+  * Blocking SUBMIT/RX_REPOST waits for foreign fences without holding the
+- * device mutex; O_NONBLOCK returns EAGAIN without publishing/enqueuing. */
++ * device mutex; O_NONBLOCK returns EAGAIN without publishing/enqueuing, both
++ * for an unsignalled dependency and for a contended device mutex. It still
++ * takes the short internal context and reservation locks. */
+ 
+ /* Experimental numbers local to this opt-in device mode, not allocated stock
+  * USB4STREAM ioctls. Exact command/size is checked; unknown commands fail. */
