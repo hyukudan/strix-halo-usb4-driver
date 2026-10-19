@@ -1,0 +1,19 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -982,9 +982,14 @@ static void tbstream_dev_stop(struct tbstream_dev *sdev)
+ 		tb_ring_stop(sdev->tx_ring.ring);
+ 		tb_ring_stop(sdev->rx_ring.ring);
+ 	} else {
++		/* Let queued data reach the wire */
+ 		tb_ring_flush(sdev->tx_ring.ring, 500);
+ 		tb_ring_stop(sdev->tx_ring.ring);
+-		tb_ring_flush(sdev->rx_ring.ring, 500);
++		/*
++		 * Not RX: its buffers stay posted until data arrives, so a
++		 * flush only ever times out. The stop cancels them and waits
++		 * for their callbacks before anything is freed.
++		 */
+ 		if (sdev->rx_napi)
+ 			tb_ring_poll_complete(sdev->rx_ring.ring);
+ 		tb_ring_stop(sdev->rx_ring.ring);
