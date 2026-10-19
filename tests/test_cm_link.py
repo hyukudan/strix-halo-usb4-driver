@@ -17,7 +17,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = Path(os.environ.get('USB4_SOURCE_TREE', ROOT / 'audited-overlay'))
-CASES = ('bonding_retried_and_bounded',)
+CASES = ('bonding_retried_and_bounded', 'host_reset_result_checked')
 XDOMAIN_DEFINES = ('XDOMAIN_BONDING_RETRIES',)
 
 
@@ -48,6 +48,7 @@ class CmLinkTests(unittest.TestCase):
         parts = ['#include "cm_link_harness.h"\n']
         parts += [define(cls.xdomain_c, name) for name in XDOMAIN_DEFINES]
         parts += [extract(cls.xdomain_c, 'tb_xdomain_bond_lanes_uuid_low'),
+                  extract(cls.tb_c, 'tb_start_reset_host'),
                   '#include "cm_link_cases.h"\n']
         unit = tmp / 'test.c'
         unit.write_text(''.join(parts))
@@ -77,6 +78,10 @@ class CmLinkTests(unittest.TestCase):
                       '\t\ttb_xdomain_queue_properties(xd);\n', work)
         self.assertIn('xd->state_retries = XDOMAIN_BONDING_RETRIES;',
                       extract(self.xdomain_c, 'tb_xdomain_queue_bonding_uuid_low'))
+    def test_start_wiring(self):
+        start = extract(self.tb_c, 'tb_start')
+        self.assertIn('\tdiscover = tb_start_reset_host(tb, reset);\n\tif (discover) {', start)
+        self.assertNotIn('tb_switch_reset(', start)
 
 
 for _case in CASES:
