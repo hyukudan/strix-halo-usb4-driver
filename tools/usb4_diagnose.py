@@ -2,12 +2,19 @@
 """Read-only USB4 link report; speeds in sysfs are per lane, not per cable."""
 import argparse
 import json
+import os
 import platform
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 SPEED = re.compile(r'^\s*(\d+(?:\.\d+)?)\s+Gb/s\s*$')
+# Data ring pairs per AMD Strix Halo NHI that the lab gives to USB4STREAM
+# (two streams per port). USB4NET takes one of them when it binds a service.
+LAB_DATA_RING_PAIRS = 2
+POLICY = 'usb4stream-dedicated.conf'
+SERVICE = re.compile(r'^(\d+)-[0-9a-f]+\.\d+$')
 
 def read(path):
     try:
@@ -25,6 +32,65 @@ def direction(device, which):
     total = speed * lanes if speed and lanes in (1, 2, 3) else None
     return dict(speed_gbps_per_lane=speed, lanes=lanes, raw_gbps=total,
                 raw_speed=raw_speed, raw_lanes=raw_lanes)
+
+def ring_budget(root, configfs=None, modprobe_dir=Path('/etc/modprobe.d'), kernel=None):
+    """Ring-pair consumers per Thunderbolt domain against the lab budget.
+
+    Consumers: configured USB4STREAM endpoints (configfs groups) and services
+    bound to thunderbolt-net. Read-only; problems are listed, never fixed.
+    """
+    configfs = Path(configfs) if configfs else root / 'kernel/config/thunderbolt/stream'
+    domains = {}
+
+    def slot(domain):
+        return domains.setdefault(domain, dict(streams=[], usb4net_services=[]))
+
+    try:
+        groups = sorted(configfs.iterdir()) if configfs.is_dir() else []
+    except OSError:
+        groups = []
+    for group in groups:
+        match = SERVICE.match(group.name)
+        if not match:
+            continue
+        try:
+            names = sorted(p.name for p in group.iterdir() if p.is_dir())
+        except OSError:
+            continue
+        slot(int(match[1]))['streams'] += [f'{group.name}/{n}' for n in names]
+    devices = root / 'bus/thunderbolt/devices'
+    for dev in sorted(devices.glob('*')) if devices.is_dir() else []:
+        match = SERVICE.match(dev.name)
+        if not match:
+            continue
+        try:
+            driver = Path(os.readlink(dev / 'driver')).name
+        except OSError:
+            continue
+        if driver in ('thunderbolt-net', 'thunderbolt_net'):
+            slot(int(match[1]))['usb4net_services'].append(dev.name)
+    problems = []
+    for domain, item in sorted(domains.items()):
+        item['budget'] = LAB_DATA_RING_PAIRS
+        item['used'] = len(item['streams']) + len(item['usb4net_services'])
+        if item['usb4net_services']:
+            problems.append(f'domain {domain}: thunderbolt-net bound to '
+                            f'{", ".join(item["usb4net_services"])} takes a ring pair')
+        if item['used'] > item['budget']:
+            problems.append(f'domain {domain}: {item["used"]} ring-pair consumers for a budget '
+                            f'of {item["budget"]}; some stream opens will fail')
+    net_loaded = (root / 'module/thunderbolt_net').exists()
+    policy = Path(modprobe_dir) / POLICY
+    lab_kernel = (kernel or platform.release()).startswith('7.3.0-rc5-strix-gpu-bosgame-')
+    if lab_kernel and not policy.is_file():
+        problems.append(f'{policy} missing: thunderbolt_net can load and take a ring pair '
+                        '(install tools/lab/usb4stream-dedicated.conf)')
+    if lab_kernel and net_loaded:
+        problems.append('thunderbolt_net is loaded on a lab kernel')
+    return dict(domains={str(d): v for d, v in sorted(domains.items())},
+                thunderbolt_net_loaded=net_loaded, modprobe_policy=str(policy),
+                modprobe_policy_present=policy.is_file(), problems=problems)
+
 
 def collect(root):
     links = []
@@ -48,12 +114,17 @@ def collect(root):
     return dict(kernel=platform.release(), links=links, modules=params,
                 note='raw_gbps = Gb/s per lane multiplied by lane count, per direction; not application throughput. No hardware or configuration changes made.')
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--sysfs-root', type=Path, default=Path('/sys'))
     parser.add_argument('--logs', action='store_true', help='Also read recent filtered kernel logs')
-    args = parser.parse_args()
+    parser.add_argument('--modprobe-dir', type=Path, default=Path('/etc/modprobe.d'))
+    parser.add_argument('--require-budget', action='store_true',
+                        help='exit 1 if USB4NET or extra consumers take the lab ring pairs '
+                             '(run before every benchmark)')
+    args = parser.parse_args(argv)
     report = collect(args.sysfs_root)
+    report['ring_budget'] = ring_budget(args.sysfs_root, modprobe_dir=args.modprobe_dir)
     if args.logs:
         try:
             result = subprocess.run(['journalctl', '-k', '-b', '--no-pager', '-n', '2000'],
@@ -65,6 +136,12 @@ def main():
         except (OSError, subprocess.TimeoutExpired) as exc:
             report['log_warning'] = str(exc)
     print(json.dumps(report, indent=2))
+    problems = report['ring_budget']['problems']
+    if args.require_budget and problems:
+        for problem in problems:
+            print(f'ring budget: {problem}', file=sys.stderr)
+        return 1
+    return 0
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

@@ -1,7 +1,11 @@
 [Unit]
 Description=Prepare two USB4STREAM channels per BOSGAME USB4 port
 After=systemd-modules-load.service
-ConditionKernelVersion=7.3.0-rc5-strix-gpu-bosgame-20261014
+# Lab kernels only: every build has its own LOCALVERSION under this prefix
+# (tools/check_kconfig.py enforces it). The stock/recovery kernel skips the
+# unit. To tie the lab profile to one reviewed build, install the drop-in
+# usb4stream-lab.service.d/10-reviewed-kernel.conf.example.
+ConditionKernelVersion=7.3.0-rc5-strix-gpu-bosgame-*
 
 [Service]
 Type=oneshot
