@@ -212,3 +212,76 @@ static void damaged_rx_frame_fails_stream(void)
 }
 
 struct tx_completer { struct tb_ring *ring; int delay_ms; };
+static void *tx_completer_thread(void *data)
+{
+    struct tx_completer *c = data;
+
+    usleep(c->delay_ms * 1000);
+    complete_tx(c->ring);
+    return NULL;
+}
+
+static ring_cb last_posted_is_close(struct tb_ring *r)
+{
+    struct ring_frame *f;
+
+    pthread_mutex_lock(&r->lock);
+    f = list_empty(&r->posted) ? NULL : container_of(r->posted.prev, struct ring_frame, list);
+    pthread_mutex_unlock(&r->lock);
+    return f && f->eof == TBSTREAM_CLOSE ? f->callback : NULL;
+}
+
+/* A7: with the TX ring full in interrupt mode, CLOSE was tried once and
+ * silently dropped (the comment claimed two tries): the peer's reader never
+ * saw EOF. Now close waits a bounded time for a TX slot, and says so if
+ * none frees up. */
+static void close_waits_for_tx_slot(void)
+{
+    struct endpoint e;
+    struct tx_completer c;
+    unsigned char buf[64] = { 1 };
+    pthread_t thread;
+    double t0;
+    int frames, warned;
+
+    /* A data frame completes 50 ms into the close: CLOSE goes out. */
+    endpoint_init(&e, 0);
+    assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+    while (tbstream_ring_available(&e.dev.tx_ring))
+        assert(file_write(&e, buf, sizeof(buf)) == sizeof(buf));
+    frames = atomic_load(&tx_frames);
+    c = (struct tx_completer){ e.dev.tx_ring.ring, 50 };
+    assert(!pthread_create(&thread, NULL, tx_completer_thread, &c));
+    {
+        /* Observe the CLOSE before stop() cancels the posted frames. */
+        struct tb_ring *ring = e.dev.tx_ring.ring;
+
+        mutex_lock(&e.dev.lock);
+        t0 = ktime_get() / 1e6;
+        assert(tbstream_dev_send_close(&e.dev) == 0);
+        assert(ktime_get() / 1e6 - t0 >= 40);
+        assert(atomic_load(&tx_frames) == frames + 1 && last_posted_is_close(ring));
+        mutex_unlock(&e.dev.lock);
+    }
+    assert(!pthread_join(thread, NULL));
+    assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+    assert_nothing_held();
+    unplug_and_remove(&e, 0);
+
+    /* Nothing completes: close gives up after the bound, logs, and still
+     * stops and frees everything. */
+    endpoint_init(&e, 0);
+    assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+    while (tbstream_ring_available(&e.dev.tx_ring))
+        assert(file_write(&e, buf, sizeof(buf)) == sizeof(buf));
+    frames = atomic_load(&tx_frames);
+    warned = atomic_load(&warnings);
+    t0 = ktime_get() / 1e6;
+    assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+    assert(ktime_get() / 1e6 - t0 >= 450);
+    assert(atomic_load(&tx_frames) == frames && atomic_load(&warnings) == warned + 1);
+    assert_nothing_held();
+    unplug_and_remove(&e, 0);
+}
+
+struct zero_io { struct endpoint *e; int write; atomic_bool done; ssize_t ret; };
