@@ -86,6 +86,9 @@ static void complete_one(struct tb_ring *r) {
     struct sgu_hw_frame *sf=container_of(rf,struct sgu_hw_frame,frame);
     rf->size=sf->result.expected_bytes==4096?0:sf->result.expected_bytes;
     rf->sof=sf->result.expected_bytes<=256?0:1;rf->eof=2;
+    /* As ring_work: an IRQ, the collection start and the reap, then callbacks */
+    r->cb_stamps.irq_ns=ktime_get_ns();r->cb_stamps.start_ns=ktime_get_ns();r->cb_stamps.reap_ns=ktime_get_ns();
+    ++r->irqs;++r->collections;
     list_del_init(&rf->list);rf->callback(r,rf,false);
 }
 static void complete_all(struct tb_ring *r) { while(!list_empty(&r->queue))complete_one(r); }
@@ -302,6 +305,67 @@ static void test_nonblock_contended_dma_lock(void) {
     assert(action(&f,SGU_IOC_RX_REPOST,1,2,1)==0&&rx->fence!=rx_fence);
     fixture_close(&f);assert(atomic_load(&module_refs)==0);
 }
+/* 0040: completion path timing, accounted when EVENT returns an operation. */
+static void test_completion_timing(void) {
+    struct fixture f;fixture_open(&f,1,256,true);
+    struct tbstream_gpu_context *ctx=f.sdev.gpu_context;
+    assert(prepare(&f,0,0,1,1,0,4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==0);
+    assert(ctx->operations[0][0].doorbell_ns>=ctx->operations[0][0].submitted_ns);
+    complete_all(f.sdev.tx_ring.ring);
+    assert(!ctx->timing[0].ops); /* only once EVENT hands it back */
+    consume_event(&f,0,1,2);
+    struct sgu_timing *t=&ctx->timing[0];
+    assert(t->ops==1);
+    for(unsigned s=0;s<SGU_T_STAGES;++s)assert(t->count[s]==1);
+    assert(t->max_ns[SGU_T_TOTAL]>=t->max_ns[SGU_T_REAP]&&t->sum_ns[SGU_T_TOTAL]==t->max_ns[SGU_T_TOTAL]);
+    unsigned buckets=0;for(unsigned b=0;b<SGU_T_BUCKETS;++b)buckets+=t->hist[SGU_T_TOTAL][b];
+    assert(buckets==1&&t->last[0].sequence==1&&t->last[0].slot==0);
+    assert(t->last[0].at[0]>=t->last[0].submit_ns&&t->last[0].at[6]>=t->last[0].at[5]);
+    /* RX, with an IRQ older than its doorbell: no IRQ->work stage for it. */
+    assert(prepare(&f,1,0,2,1,0,8192)==0);assert(action(&f,SGU_IOC_SUBMIT,1,2,1)==0);
+    struct tb_ring *rx=f.sdev.rx_ring.ring;
+    while(!list_empty(&rx->queue)) {
+        complete_one(rx);
+    }
+    ctx->operations[1][0].irq_ns=1;
+    consume_event(&f,1,2,3);
+    t=&ctx->timing[1];
+    assert(t->ops==1&&t->count[SGU_T_IRQ_WORK]==0&&t->count[SGU_T_REAP]==1&&t->count[SGU_T_TOTAL]==1);
+    /* The read-out: one page, both directions, every stage. */
+    char *buf=calloc(1,PAGE_SIZE);assert(buf);
+    ssize_t len=sgu_timing_show(ctx,buf);
+    assert(len>0&&(size_t)len<PAGE_SIZE-1&&strlen(buf)==(size_t)len);
+    assert(strstr(buf,"mode irq")&&strstr(buf,"tx ops 1\n")&&strstr(buf,"rx ops 1\n"));
+    assert(strstr(buf,"tx irq_work n 1 ")&&strstr(buf,"rx irq_work n 0 ")&&strstr(buf,"tx last seq 1 slot 0 ns "));
+    assert(strstr(buf,"ring tx irqs ")&&strstr(buf,"ring rx irqs "));
+    /* Filled to the maximum: still within a page. */
+    for(unsigned d=0;d<2;++d){ctx->timing[d].ops=~0ULL>>1;ctx->timing[d].next=SGU_T_RECORDS;
+        for(unsigned s=0;s<SGU_T_STAGES;++s){ctx->timing[d].count[s]=~0ULL>>1;ctx->timing[d].max_ns[s]=~0ULL>>1;
+            for(unsigned b=0;b<SGU_T_BUCKETS;++b)ctx->timing[d].hist[s][b]=0xffffffffU;}}
+    len=sgu_timing_show(ctx,buf);assert((size_t)len<PAGE_SIZE&&strstr(buf,"rx last seq"));
+    free(buf);
+    /* Reset through the attribute's path. */
+    assert(tbstream_gpu_timing_reset(&f.sdev)==0&&!ctx->timing[0].ops&&!ctx->timing[1].count[SGU_T_TOTAL]);
+    fixture_close(&f);assert(atomic_load(&module_refs)==0);
+    /* A failed operation (CRC error on RX) is not part of the timing. */
+    fixture_open(&f,1,256,true);ctx=f.sdev.gpu_context;
+    assert(prepare(&f,1,0,2,1,0,8192)==0);assert(action(&f,SGU_IOC_SUBMIT,1,2,1)==0);
+    rx=f.sdev.rx_ring.ring;
+    {
+        struct ring_frame *rf=container_of(rx->queue.next,struct ring_frame,list);
+        rf->flags=RING_DESC_CRC_ERROR;rf->size=0;rf->sof=1;rf->eof=2;
+        list_del_init(&rf->list);rf->callback(rx,rf,false);
+    }
+    complete_all(rx);
+    unsigned events=0;
+    for(;;){struct sgu_event e={.fence=ctx->identity};
+        if(tbstream_gpu_ioctl(&f.file,SGU_IOC_EVENT,(unsigned long)&e))break;
+        assert(e.status==SGU_EVENT_FAILED);events+=e.count;}
+    assert(events==3&&!ctx->timing[1].ops&&!ctx->timing[1].count[SGU_T_TOTAL]);
+    fixture_close(&f);assert(atomic_load(&module_refs)==0);
+    struct tbstream_dev none={0};static char small[PAGE_SIZE];
+    assert(tbstream_gpu_timing_reset(&none)==-ENXIO&&tbstream_gpu_timing_show(&none,small)==5);
+}
 static void test_wait_retry_and_order(void) {
     struct fixture f;fixture_open(&f,2,64,true);
     struct dma_fence *foreign=foreign_fence(&f.resv[0]);
@@ -405,7 +469,7 @@ int main(int argc,char **argv) {
     struct { const char *name; void (*run)(void); } tests[]={
         {"geometry",test_geometry},{"queue",test_queue},{"failure_isolation",test_failure_isolation},
         {"events_legacy",test_events_and_legacy},{"timeout_recovery",test_timeout_recovery},
-        {"wait_concurrency",test_wait_concurrency},{"nonblock_contended_mutex",test_nonblock_contended_mutex},{"nonblock_contended_dma_lock",test_nonblock_contended_dma_lock},{"wait_retry_order",test_wait_retry_and_order},
+        {"wait_concurrency",test_wait_concurrency},{"nonblock_contended_mutex",test_nonblock_contended_mutex},{"nonblock_contended_dma_lock",test_nonblock_contended_dma_lock},{"completion_timing",test_completion_timing},{"wait_retry_order",test_wait_retry_and_order},
         {"export_lifetime",test_export_lifetime},{"admission_rollback",test_admission_and_rollback},
         {"watchdog_schedule",test_watchdog_schedule},{"max_queue_reuse",test_max_queue_reuse},
         {"group_success",test_group_success},{"group_rejections",test_group_rejections},

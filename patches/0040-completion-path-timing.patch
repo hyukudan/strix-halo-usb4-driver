@@ -1,0 +1,388 @@
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -81,10 +81,39 @@ struct sgu_hw_operation {
+     enum sgu_op_phase phase;
+     u32 payload_frames, total_frames, remaining, event_cursor, error_flags;
+     u64 completion_ns, deadline_ns, submitted_ns;
++    /* Completion path timing (ktime ns): enqueue returned (doorbell rung),
++     * the final frame's collection (its IRQ, start, reap) and callback. */
++    u64 doorbell_ns, irq_ns, work_ns, reap_ns, callback_ns;
+     struct dma_fence *wait_fence; /* retained across EAGAIN and exporter pruning */
+     int dependency_error; /* sticky until this operation is cleared */
+     bool event_pending, retired, canceled, reuse_rx;
+ };
++/*
++ * Completion path timing per direction, accounted when EVENT hands a
++ * completed operation back. Stages (ns): submit->doorbell, doorbell->reap
++ * (the descriptor seen completed; includes the wire and, for RX, the peer),
++ * irq->work (IRQ to collection start: the deferred completion), reap->
++ * callback (the operation's final callback), callback->fence, fence->event
++ * (EVENT returned it) and submit->event.
++ */
++enum {
++    SGU_T_DOORBELL, SGU_T_REAP, SGU_T_IRQ_WORK, SGU_T_CALLBACK, SGU_T_FENCE,
++    SGU_T_EVENT, SGU_T_TOTAL, SGU_T_STAGES
++};
++#define SGU_T_BUCKETS 16 /* <1 us, then [2^(k-1), 2^k) us, the last open */
++#define SGU_T_RECORDS 4
++struct sgu_timing_record {
++    u64 sequence, submit_ns;
++    u64 at[SGU_T_STAGES]; /* doorbell, reap, irq, work, callback, fence, event */
++    u32 slot;
++};
++struct sgu_timing {
++    u64 ops, count[SGU_T_STAGES], sum_ns[SGU_T_STAGES], max_ns[SGU_T_STAGES];
++    u32 hist[SGU_T_STAGES][SGU_T_BUCKETS];
++    struct sgu_timing_record last[SGU_T_RECORDS];
++    u32 next;
++};
++
+ struct tbstream_gpu_context {
+     struct tbstream_dev *sdev;
+     struct list_head client_node;
+@@ -96,6 +125,7 @@ struct tbstream_gpu_context {
+     struct mutex dma_lock;
+     struct workqueue_struct *watchdog_wq;
+     struct sgu_stats stats;
++    struct sgu_timing timing[2]; /* under @lock */
+     struct sgu_fence identity;
+     struct sgu_window windows[2];
+     struct sgu_hw_operation operations[2][SGU_MAX_QUEUE_DEPTH];
+@@ -350,6 +380,12 @@ static void sgu_callback(struct tb_ring *ring, struct ring_frame *frame, bool ca
+         op->error_flags |= f->result.error_flags;
+         if (op->error_flags)
+             WRITE_ONCE(ctx->failed, true);
++        if (!op->remaining) {
++            op->irq_ns = ring->cb_stamps.irq_ns;
++            op->work_ns = ring->cb_stamps.start_ns;
++            op->reap_ns = ring->cb_stamps.reap_ns;
++            op->callback_ns = ktime_get_ns();
++        }
+     }
+     sgu_complete_locked(ctx, op, &signal, &error);
+ unlock:
+@@ -679,6 +715,8 @@ static int sgu_enqueue(struct tbstream_gpu_context *ctx, struct sgu_hw_operation
+     }
+     spin_unlock_irqrestore(&ctx->lock, flags);
+ 
++    /* Before the doorbell: a fast completion may run before enqueue returns */
++    op->doorbell_ns = ktime_get_ns();
+     ret = __tb_ring_enqueue_list(ring, &frames);
+     if (!ret) {
+         /* New traffic must not push out an older operation's watchdog. */
+@@ -1274,6 +1312,144 @@ static int sgu_prepare_operation(struct tbstream_gpu_context *ctx,
+     return 0;
+ }
+ 
++static void sgu_timing_add(struct sgu_timing *t, u32 stage, u64 from, u64 to)
++{
++    u64 ns, us;
++    u32 bucket;
++
++    if (!from || to < from)
++        return; /* that stage did not happen (e.g. no IRQ when polled) */
++    ns = to - from;
++    us = div_u64(ns, NSEC_PER_USEC);
++    bucket = us ? min_t(u32, fls64(us), SGU_T_BUCKETS - 1) : 0;
++    ++t->count[stage];
++    t->sum_ns[stage] += ns;
++    if (ns > t->max_ns[stage])
++        t->max_ns[stage] = ns;
++    ++t->hist[stage][bucket];
++}
++
++/* ctx->lock held; @event_ns: EVENT is returning the operation's last batch. */
++static void sgu_timing_account(struct tbstream_gpu_context *ctx, struct sgu_hw_operation *op,
++                               u64 event_ns)
++{
++    struct sgu_timing *t = &ctx->timing[op->request.direction];
++    struct sgu_timing_record *r = &t->last[t->next++ % SGU_T_RECORDS];
++    /* A reused RX buffer was posted before its SUBMIT: start at the later. */
++    u64 submit = op->submitted_ns, doorbell = max(op->doorbell_ns, submit);
++    /* An IRQ older than the doorbell belongs to an earlier collection. */
++    u64 irq = op->irq_ns >= doorbell ? op->irq_ns : 0;
++
++    ++t->ops;
++    sgu_timing_add(t, SGU_T_DOORBELL, submit, doorbell);
++    sgu_timing_add(t, SGU_T_REAP, doorbell, op->reap_ns);
++    sgu_timing_add(t, SGU_T_IRQ_WORK, irq, op->work_ns);
++    sgu_timing_add(t, SGU_T_CALLBACK, op->reap_ns, op->callback_ns);
++    sgu_timing_add(t, SGU_T_FENCE, op->callback_ns, op->completion_ns);
++    sgu_timing_add(t, SGU_T_EVENT, op->completion_ns, event_ns);
++    sgu_timing_add(t, SGU_T_TOTAL, submit, event_ns);
++    r->sequence = op->request.sequence;
++    r->slot = sgu_operation_slot(ctx, op);
++    r->submit_ns = submit;
++    r->at[0] = doorbell;
++    r->at[1] = op->reap_ns;
++    r->at[2] = irq;
++    r->at[3] = op->work_ns;
++    r->at[4] = op->callback_ns;
++    r->at[5] = op->completion_ns;
++    r->at[6] = event_ns;
++}
++
++static const char *const sgu_timing_stage_names[SGU_T_STAGES] = {
++    "submit_doorbell", "doorbell_reap", "irq_work", "reap_callback",
++    "callback_fence", "fence_event", "submit_event",
++};
++
++static void sgu_ring_counters(struct tb_ring *ring, u64 *irqs, u64 *collections,
++                              u64 *total_ns, u64 *max_ns)
++{
++    unsigned long flags;
++
++    spin_lock_irqsave(&ring->lock, flags);
++    *irqs = ring->irqs;
++    *collections = ring->collections;
++    *total_ns = ring->collect_ns_total;
++    *max_ns = ring->collect_ns_max;
++    spin_unlock_irqrestore(&ring->lock, flags);
++}
++
++/* The gpu_timing configfs attribute. Caller holds sdev->lock. */
++static ssize_t sgu_timing_show(struct tbstream_gpu_context *ctx, char *buf)
++{
++    static const char *const dirs[2] = { "tx", "rx" };
++    struct sgu_timing *t;
++    unsigned long flags;
++    ssize_t len = 0;
++    u32 d, s, b, i;
++
++    len += scnprintf(buf + len, PAGE_SIZE - len, "mode irq\n");
++    for (d = 0; d < 2; ++d) {
++        struct tb_ring *ring = d ? ctx->sdev->rx_ring.ring : ctx->sdev->tx_ring.ring;
++        u64 irqs = 0, collections = 0, total = 0, max = 0;
++
++        if (ring)
++            sgu_ring_counters(ring, &irqs, &collections, &total, &max);
++        len += scnprintf(buf + len, PAGE_SIZE - len,
++                         "ring %s irqs %llu collections %llu collect_ns_mean %llu collect_ns_max %llu\n",
++                         dirs[d], irqs, collections,
++                         collections ? div64_u64(total, collections) : 0, max);
++    }
++    spin_lock_irqsave(&ctx->lock, flags);
++    for (d = 0; d < 2; ++d) {
++        t = &ctx->timing[d];
++        len += scnprintf(buf + len, PAGE_SIZE - len, "%s ops %llu\n", dirs[d], t->ops);
++        for (s = 0; s < SGU_T_STAGES; ++s) {
++            len += scnprintf(buf + len, PAGE_SIZE - len, "%s %s n %llu mean_ns %llu max_ns %llu hist_us",
++                             dirs[d], sgu_timing_stage_names[s], t->count[s],
++                             t->count[s] ? div64_u64(t->sum_ns[s], t->count[s]) : 0, t->max_ns[s]);
++            for (b = 0; b < SGU_T_BUCKETS; ++b)
++                len += scnprintf(buf + len, PAGE_SIZE - len, " %u", t->hist[s][b]);
++            len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
++        }
++        for (i = 0; i < SGU_T_RECORDS && i < t->ops; ++i) {
++            const struct sgu_timing_record *r = &t->last[(t->next - 1 - i) % SGU_T_RECORDS];
++
++            len += scnprintf(buf + len, PAGE_SIZE - len, "%s last seq %llu slot %u ns", dirs[d],
++                             r->sequence, r->slot);
++            for (s = 0; s < ARRAY_SIZE(r->at); ++s)
++                len += scnprintf(buf + len, PAGE_SIZE - len, " %lld",
++                                 r->at[s] ? (s64)(r->at[s] - r->submit_ns) : -1LL);
++            len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
++        }
++    }
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    return len;
++}
++
++static void sgu_timing_reset(struct tbstream_gpu_context *ctx)
++{
++    unsigned long flags;
++
++    spin_lock_irqsave(&ctx->lock, flags);
++    memset(ctx->timing, 0, sizeof(ctx->timing));
++    spin_unlock_irqrestore(&ctx->lock, flags);
++}
++
++static ssize_t tbstream_gpu_timing_show(struct tbstream_dev *sdev, char *buf)
++{
++    if (!sdev->gpu_context)
++        return sysfs_emit(buf, "none\n");
++    return sgu_timing_show(sdev->gpu_context, buf);
++}
++
++static int tbstream_gpu_timing_reset(struct tbstream_dev *sdev)
++{
++    if (!sdev->gpu_context)
++        return -ENXIO;
++    sgu_timing_reset(sdev->gpu_context);
++    return 0;
++}
++
+ static long sgu_event_ioctl(struct tbstream_gpu_context *ctx, void __user *user)
+ {
+     struct sgu_event *out;
+@@ -1331,6 +1507,8 @@ static long sgu_event_ioctl(struct tbstream_gpu_context *ctx, void __user *user)
+     if (op->event_cursor == op->total_frames) {
+         op->event_pending = false;
+         op->phase = SGU_OP_TAKEN;
++        if (out->status == SGU_EVENT_COMPLETE)
++            sgu_timing_account(ctx, op, ktime_get_ns());
+     }
+     spin_unlock_irqrestore(&ctx->lock, flags);
+     ret = 0;
+diff --git a/drivers/thunderbolt/gpu_stream.h b/drivers/thunderbolt/gpu_stream.h
+--- a/drivers/thunderbolt/gpu_stream.h
++++ b/drivers/thunderbolt/gpu_stream.h
+@@ -12,6 +12,8 @@ static bool tbstream_gpu_paths_pending(struct tbstream_dev *sdev,
+                                        const struct tbstream *detaching);
+ static int tbstream_gpu_reap(struct tbstream_dev *sdev, bool reset);
+ static bool tbstream_gpu_quarantined(struct tbstream_dev *sdev);
++static ssize_t tbstream_gpu_timing_show(struct tbstream_dev *sdev, char *buf);
++static int tbstream_gpu_timing_reset(struct tbstream_dev *sdev);
+ static long tbstream_gpu_ioctl(struct file *file, unsigned int command, unsigned long argument);
+ static __poll_t tbstream_gpu_poll(struct file *file, poll_table *wait);
+ static int tbstream_gpu_lifecycle_init(void);
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -302,8 +302,9 @@ static void ring_work(struct work_struct *work)
+ 	bool cookie = dma_fence_begin_signalling();
+ #endif
+ 	struct tb_ring *ring = container_of(work, typeof(*ring), work);
++	u64 start = ktime_get_ns(), elapsed;
+ 	struct ring_frame *frame;
+-	bool canceled = false;
++	bool canceled = false, timed;
+ 	unsigned long flags;
+ 	LIST_HEAD(done);
+ 
+@@ -332,11 +333,18 @@ static void ring_work(struct work_struct *work)
+ 		}
+ 		ring->tail = (ring->tail + 1) % ring->size;
+ 	}
++	/* Completion path timing, read by the callbacks below */
++	if (!list_empty(&done)) {
++		ring->cb_stamps.irq_ns = ring->last_irq_ns;
++		ring->cb_stamps.start_ns = start;
++		ring->cb_stamps.reap_ns = ktime_get_ns();
++	}
+ 	ring_write_descriptors(ring);
+ 
+ invoke_callback:
+ 	/* allow callbacks to schedule new work */
+ 	spin_unlock_irqrestore(&ring->lock, flags);
++	timed = !canceled && !list_empty(&done);
+ 	while (!list_empty(&done)) {
+ 		frame = list_first_entry(&done, typeof(*frame), list);
+ 		/*
+@@ -347,6 +355,15 @@ invoke_callback:
+ 		if (frame->callback)
+ 			frame->callback(ring, frame, canceled);
+ 	}
++	if (timed) {
++		elapsed = ktime_get_ns() - start;
++		spin_lock_irqsave(&ring->lock, flags);
++		ring->collections++;
++		ring->collect_ns_total += elapsed;
++		if (elapsed > ring->collect_ns_max)
++			ring->collect_ns_max = elapsed;
++		spin_unlock_irqrestore(&ring->lock, flags);
++	}
+ 
+ 	wake_up(&ring->wait);
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+@@ -459,6 +476,8 @@ static void __ring_interrupt(struct tb_ring *ring)
+ 	if (!ring->running)
+ 		return;
+ 
++	ring->last_irq_ns = ktime_get_ns();
++	ring->irqs++;
+ 	if (ring->start_poll) {
+ 		__ring_interrupt_mask(ring, true);
+ 		ring->start_poll(ring->poll_data);
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -2001,6 +2001,27 @@ static ssize_t tbstream_dev_gpu_quarantine_show(struct config_item *item, char *
+ }
+ CONFIGFS_ATTR_RO(tbstream_dev_, gpu_quarantine);
+ 
++/* Completion path timing of the GPU session; any write resets it. */
++static ssize_t tbstream_dev_gpu_timing_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	guard(mutex)(&sdev->lock);
++	return tbstream_gpu_timing_show(sdev, buf);
++}
++
++static ssize_t tbstream_dev_gpu_timing_store(struct config_item *item,
++					     const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++	int ret;
++
++	guard(mutex)(&sdev->lock);
++	ret = tbstream_gpu_timing_reset(sdev);
++	return ret ?: count;
++}
++CONFIGFS_ATTR(tbstream_dev_, gpu_timing);
++
+ static ssize_t tbstream_dev_gpu_recover_store(struct config_item *item,
+ 					     const char *buf, size_t count)
+ {
+@@ -2033,6 +2054,7 @@ static struct configfs_attribute *tbstream_dev_attrs[] = {
+ 	&tbstream_dev_attr_gpu_direct,
+ 	&tbstream_dev_attr_gpu_quarantine,
+ 	&tbstream_dev_attr_gpu_recover,
++	&tbstream_dev_attr_gpu_timing,
+ #endif
+ 	&tbstream_dev_attr_index,
+ 	&tbstream_dev_attr_in_hopid,
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -581,6 +581,21 @@ struct tb_nhi {
+ 	bool host_reset;
+ };
+ 
++/**
++ * struct tb_ring_stamps - Completion path timestamps of one collection
++ * @irq_ns: Last interrupt of the ring before the collection (0 if none)
++ * @start_ns: The collection started (ring work or a poller)
++ * @reap_ns: Completed descriptors were seen and taken off the ring
++ *
++ * ktime_get_ns() values. While completion callbacks run, &tb_ring.cb_stamps
++ * describes the collection that runs them.
++ */
++struct tb_ring_stamps {
++	u64 irq_ns;
++	u64 start_ns;
++	u64 reap_ns;
++};
++
+ /**
+  * struct tb_ring - thunderbolt TX or RX ring associated with a NHI
+  * @lock: Lock serializing actions to this ring. Must be acquired after
+@@ -610,6 +625,13 @@ struct tb_nhi {
+  * @interval_nsec: Interval counter if interrupt throttling is to be
+  *		   used with this ring (in ns)
+  * @wait: Used to signal that the ring may be empty now
++ * @last_irq_ns: Time of the last interrupt (protected by @lock)
++ * @cb_stamps: Stamps of the collection whose callbacks are running
++ * @irqs: Interrupts of the ring (protected by @lock)
++ * @collections: Collections that took completed frames (protected by @lock)
++ * @collect_ns_total: Time those collections took, from their start to their
++ *		      last callback (protected by @lock)
++ * @collect_ns_max: Longest of them (protected by @lock)
+  */
+ struct tb_ring {
+ 	spinlock_t lock;
+@@ -635,6 +657,12 @@ struct tb_ring {
+ 	void *poll_data;
+ 	unsigned int interval_nsec;
+ 	wait_queue_head_t wait;
++	u64 last_irq_ns;
++	struct tb_ring_stamps cb_stamps;
++	u64 irqs;
++	u64 collections;
++	u64 collect_ns_total;
++	u64 collect_ns_max;
+ };
+ 
+ /* Leave ring interrupt enabled on suspend */

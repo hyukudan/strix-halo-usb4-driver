@@ -68,6 +68,23 @@ static void destroy_workqueue(struct workqueue_struct *w) { assert(w && workqueu
 #define ERESTARTSYS 512
 #define BIT(n) (1U << (n))
 #define min_t(t,a,b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
+#ifndef max
+#define max(a,b) ((a) > (b) ? (a) : (b))
+#endif
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
+#ifndef PAGE_SIZE
+#define PAGE_SIZE 4096UL
+#endif
+typedef int64_t s64;
+#define NSEC_PER_USEC 1000ULL
+static u64 div_u64(u64 a, u32 b) { return a / b; }
+static u64 div64_u64(u64 a, u64 b) { return a / b; }
+static int fls64(u64 x) { return x ? 64 - __builtin_clzll(x) : 0; }
+#define scnprintf(buf, size, ...) ({ size_t __s = (size); int __n = __s ? snprintf((buf), __s, __VA_ARGS__) : 0; \
+    __n < 0 ? 0 : (size_t)__n >= __s ? (int)(__s ? __s - 1 : 0) : __n; })
+#define sysfs_emit(buf, ...) scnprintf((buf), PAGE_SIZE, __VA_ARGS__)
 #define READ_ONCE(x) __atomic_load_n(&(x), __ATOMIC_SEQ_CST)
 #define WRITE_ONCE(x,v) __atomic_store_n(&(x), (v), __ATOMIC_SEQ_CST)
 #define container_of(p,t,m) ((t *)((char *)(p) - offsetof(t,m)))
@@ -76,6 +93,8 @@ static void destroy_workqueue(struct workqueue_struct *w) { assert(w && workqueu
 #define EXPORT_SYMBOL_GPL(x)
 #define MODULE_PARM_DESC(...)
 #define module_param_cb(...)
+#define module_param(...)
+#define clamp_val(v,lo,hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))
 #define THIS_MODULE ((void *)1)
 #define WARN_ON_ONCE(x) (!!(x))
 #define dev_warn(...) ((void)0)
@@ -331,7 +350,9 @@ static void uuid_gen(uuid_t *u) { static u32 n=1;memset(u,0,sizeof(*u));memcpy(u
 struct tb_ring;
 struct ring_frame { struct list_head list;dma_addr_t buffer_phy;unsigned flags,sof,eof,size;void (*callback)(struct tb_ring *,struct ring_frame *,bool); };
 struct tb_nhi { struct device dev; bool going_away, dma_shutdown; };
-struct tb_ring { struct work_struct work; spinlock_t lock;bool running,is_tx;unsigned hop,size;struct list_head queue;struct tb_nhi *nhi; };
+struct tb_ring_stamps { u64 irq_ns, start_ns, reap_ns; };
+struct tb_ring { struct work_struct work; spinlock_t lock;bool running,is_tx;unsigned hop,size;struct list_head queue;struct tb_nhi *nhi;
+    struct tb_ring_stamps cb_stamps; u64 irqs, collections, collect_ns_total, collect_ns_max; };
 #define RING_DESC_CRC_ERROR 1U
 #define RING_DESC_BUFFER_OVERRUN 2U
 #define RING_FLAG_FRAME 1U
