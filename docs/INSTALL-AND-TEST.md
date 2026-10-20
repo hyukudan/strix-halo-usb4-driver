@@ -233,11 +233,15 @@ which also covers GPU contexts retained after close or `rmdir` (orphans that
 no configfs group shows). `--require-budget` exits 1 when planned consumers do
 not fit, when rings are already held (`--allow-held` relaxes that while a run
 is in progress), when more rings are held than there are configured
-consumers, or when configfs shows a quarantined GPU context; with `--logs` the
-kernel's orphan, retained and abandoned-ring messages count too. Not visible
-in `/proc/interrupts`: busy_poll rings (no interrupts) and rings whose IRQ was
-released when their owner was abandoned; the kernel log is the evidence for
-those. Run it before every test.
+consumers, when configfs shows a quarantined GPU context, or when the
+kernel log (always read by `--require-budget`) reports an orphaned or retained
+GPU context or a ring leaked by an abandoned owner. Rings without an interrupt
+(busy_poll streams) are checked through the processes that hold the
+`/dev/tbstreamN` open (`/proc/<pid>/fd`). The preflight **fails closed**:
+anything it cannot verify (unreadable `/proc/interrupts` or configfs, a
+kernel log that cannot be read, busy_poll openers hidden from a non-root
+user) is listed under `unknown` and makes it exit 1. Run it before every test;
+`tools/lab/run_stream_bench.py` runs it on both hosts with `--logs`.
 
 Install (maintenance window, as root, on each node):
 
