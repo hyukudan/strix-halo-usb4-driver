@@ -29,8 +29,10 @@ static struct sgu_import import_request(struct fixture *f,u64 epoch) {
     }
     return req;
 }
+static int fixture_gpu_poll; /* the endpoint's configfs gpu_poll for the next open */
 static void fixture_open(struct fixture *f,unsigned depth,unsigned frames,bool import) {
     memset(f,0,sizeof(*f));
+    f->sdev.cfg_gpu_poll=fixture_gpu_poll;
     mutex_init(&f->sdev.lock);
     f->sdev.ring_size=frames;f->sdev.stream=&f->stream;f->sdev.in_hopid=8;f->sdev.out_hopid=9;
     f->file.private_data=&f->sdev;
@@ -92,6 +94,16 @@ static void complete_one(struct tb_ring *r) {
     list_del_init(&rf->list);rf->callback(r,rf,false);
 }
 static void complete_all(struct tb_ring *r) { while(!list_empty(&r->queue))complete_one(r); }
+/* Polled rings: the controller finishes a frame, nobody is told. */
+static void hw_complete_one(struct tb_ring *r) {
+    assert(!list_empty(&r->queue));
+    struct ring_frame *rf=container_of(r->queue.next,struct ring_frame,list);
+    struct sgu_hw_frame *sf=container_of(rf,struct sgu_hw_frame,frame);
+    rf->size=sf->result.expected_bytes==4096?0:sf->result.expected_bytes;
+    rf->sof=sf->result.expected_bytes<=256?0:1;rf->eof=2;
+    list_del_init(&rf->list);list_add_tail(&rf->list,&r->done);
+}
+static void hw_complete_all(struct tb_ring *r) { while(!list_empty(&r->queue))hw_complete_one(r); }
 static void consume_event(struct fixture *f,unsigned expected_direction,u64 expected_handle,unsigned frames) {
     unsigned cursor=0;
     while(cursor<frames) {
@@ -366,6 +378,72 @@ static void test_completion_timing(void) {
     struct tbstream_dev none={0};static char small[PAGE_SIZE];
     assert(tbstream_gpu_timing_reset(&none)==-ENXIO&&tbstream_gpu_timing_show(&none,small)==5);
 }
+/* 0041: opt-in polled completion. */
+static void test_polled_completion(void) {
+    struct fixture f;
+    fixture_gpu_poll=1;fixture_open(&f,1,256,true);fixture_gpu_poll=0;
+    struct tbstream_gpu_context *ctx=f.sdev.gpu_context;
+    assert(ctx->polled&&(f.sdev.tx_ring.ring->flags&RING_FLAG_NO_INTERRUPT)&&(f.sdev.rx_ring.ring->flags&RING_FLAG_NO_INTERRUPT));
+    collect_requires=&ctx->dma_lock;collect_calls=0;
+    /* The controller finished the TX operation; the first EVENT completes it. */
+    assert(prepare(&f,0,0,1,1,0,4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==0);
+    assert(ctx->watchdog.due<=jiffies+1); /* fallback re-arm: 1 ms, not 100 */
+    hw_complete_all(f.sdev.tx_ring.ring);
+    assert(ctx->operations[0][0].remaining==2);
+    {struct sgu_event e={.fence=ctx->identity};
+     assert(tbstream_gpu_ioctl(&f.file,SGU_IOC_EVENT,(unsigned long)&e)==0);
+     assert(e.direction==0&&e.handle==1&&e.status==SGU_EVENT_COMPLETE&&e.count==2);}
+    assert(collect_calls==2&&ctx->polls==1&&ctx->polled_frames==2);
+    assert(ctx->timing[0].ops==1&&ctx->timing[0].count[SGU_T_IRQ_WORK]==0&&ctx->timing[0].count[SGU_T_REAP]==1);
+    /* Budget: one frame per ring and call; the RX operation needs three calls. */
+    gpu_poll_budget=1;
+    assert(prepare(&f,1,0,2,1,0,8192)==0);assert(action(&f,SGU_IOC_SUBMIT,1,2,1)==0);
+    hw_complete_all(f.sdev.rx_ring.ring);
+    for(int i=0;i<2;++i){struct sgu_event e={.fence=ctx->identity};
+        assert(tbstream_gpu_ioctl(&f.file,SGU_IOC_EVENT,(unsigned long)&e)==-EAGAIN);}
+    assert(ctx->operations[1][0].remaining==1);
+    consume_event(&f,1,2,3);
+    gpu_poll_budget=64;
+    /* dma_lock held (enqueue, watchdog, STOP): EVENT does not wait and collects nothing. */
+    assert(action(&f,SGU_IOC_RX_REPOST,1,2,1)==0);assert(action(&f,SGU_IOC_RETIRE,1,2,1)==0);
+    assert(action(&f,SGU_IOC_RETIRE,0,1,1)==0);
+    assert(prepare(&f,0,0,3,2,0,4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,3,2)==0);
+    hw_complete_all(f.sdev.tx_ring.ring);
+    struct mutex_holder h={.m=&ctx->dma_lock};pthread_t holder;
+    assert(!pthread_create(&holder,NULL,hold_mutex,&h));while(!atomic_load(&h.held))usleep(100);
+    int calls=collect_calls;
+    {struct sgu_event e={.fence=ctx->identity};
+     assert(tbstream_gpu_ioctl(&f.file,SGU_IOC_EVENT,(unsigned long)&e)==-EAGAIN);}
+    assert(collect_calls==calls&&atomic_load(&h.held));
+    assert(!pthread_join(holder,NULL));
+    /* Nobody calls EVENT: the watchdog's fallback collects it and wakes pollers. */
+    int before=wakeups;run_delayed_work(&ctx->watchdog);
+    assert(collect_calls==calls+2&&wakeups>before&&ctx->operations[0][0].event_pending);
+    assert(tbstream_gpu_poll(&f.file,NULL)&EPOLLIN);
+    consume_event(&f,0,3,2);assert(action(&f,SGU_IOC_RETIRE,0,3,2)==0);
+    /* STOP with finished but uncollected frames: canceled once, nothing collected after. */
+    assert(prepare(&f,0,0,4,3,0,4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,4,3)==0);
+    hw_complete_one(f.sdev.tx_ring.ring);
+    assert(action(&f,SGU_IOC_STOP,0,0,0)==0);
+    assert(ctx->lifetime.pending_callbacks==0&&ctx->operations[0][0].canceled);
+    calls=collect_calls;
+    {struct sgu_event e={.fence=ctx->identity};
+     tbstream_gpu_ioctl(&f.file,SGU_IOC_EVENT,(unsigned long)&e);}
+    assert(collect_calls==calls);
+    collect_requires=NULL;
+    char *buf=calloc(1,PAGE_SIZE);assert(buf);sgu_timing_show(ctx,buf);
+    assert(strstr(buf,"mode poll polls "));free(buf);
+    fixture_close(&f);assert(atomic_load(&module_refs)==0);
+    /* Interrupt mode (the default) never collects. */
+    fixture_open(&f,1,256,true);
+    assert(!f.sdev.gpu_context->polled&&!(f.sdev.tx_ring.ring->flags&RING_FLAG_NO_INTERRUPT));
+    calls=collect_calls;
+    assert(prepare(&f,0,0,1,1,0,4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==0);
+    assert(f.sdev.gpu_context->watchdog.due>=jiffies+50);
+    complete_all(f.sdev.tx_ring.ring);consume_event(&f,0,1,2);
+    assert(collect_calls==calls);
+    fixture_close(&f);assert(atomic_load(&module_refs)==0);
+}
 static void test_wait_retry_and_order(void) {
     struct fixture f;fixture_open(&f,2,64,true);
     struct dma_fence *foreign=foreign_fence(&f.resv[0]);
@@ -469,7 +547,7 @@ int main(int argc,char **argv) {
     struct { const char *name; void (*run)(void); } tests[]={
         {"geometry",test_geometry},{"queue",test_queue},{"failure_isolation",test_failure_isolation},
         {"events_legacy",test_events_and_legacy},{"timeout_recovery",test_timeout_recovery},
-        {"wait_concurrency",test_wait_concurrency},{"nonblock_contended_mutex",test_nonblock_contended_mutex},{"nonblock_contended_dma_lock",test_nonblock_contended_dma_lock},{"completion_timing",test_completion_timing},{"wait_retry_order",test_wait_retry_and_order},
+        {"wait_concurrency",test_wait_concurrency},{"nonblock_contended_mutex",test_nonblock_contended_mutex},{"nonblock_contended_dma_lock",test_nonblock_contended_dma_lock},{"completion_timing",test_completion_timing},{"polled_completion",test_polled_completion},{"wait_retry_order",test_wait_retry_and_order},
         {"export_lifetime",test_export_lifetime},{"admission_rollback",test_admission_and_rollback},
         {"watchdog_schedule",test_watchdog_schedule},{"max_queue_reuse",test_max_queue_reuse},
         {"group_success",test_group_success},{"group_rejections",test_group_rejections},

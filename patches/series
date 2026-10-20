@@ -38,3 +38,4 @@
 0038-teardown-reset-pending-survives-requests-contention-suspend.patch
 0039-gen3-retrain-serialized-and-exclusive.patch
 0040-completion-path-timing.patch
+0041-gpu-opt-in-polled-completion.patch

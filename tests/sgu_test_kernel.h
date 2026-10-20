@@ -352,18 +352,20 @@ struct ring_frame { struct list_head list;dma_addr_t buffer_phy;unsigned flags,s
 struct tb_nhi { struct device dev; bool going_away, dma_shutdown; };
 struct tb_ring_stamps { u64 irq_ns, start_ns, reap_ns; };
 struct tb_ring { struct work_struct work; spinlock_t lock;bool running,is_tx;unsigned hop,size;struct list_head queue;struct tb_nhi *nhi;
-    struct tb_ring_stamps cb_stamps; u64 irqs, collections, collect_ns_total, collect_ns_max; };
+    struct tb_ring_stamps cb_stamps; u64 irqs, collections, collect_ns_total, collect_ns_max;
+    unsigned flags; struct list_head done; u64 polls; };
 #define RING_DESC_CRC_ERROR 1U
 #define RING_DESC_BUFFER_OVERRUN 2U
 #define RING_FLAG_FRAME 1U
 #define RING_FLAG_E2E 2U
+#define RING_FLAG_NO_INTERRUPT 8U
 #define TBSTREAM_FRAME_START 1U
 #define TBSTREAM_DATA 2U
 static unsigned tb_ring_frame_size(struct ring_frame *f) { return f->size?f->size:4096; }
 static struct device *tb_ring_dma_device(struct tb_ring *r) { return &r->nhi->dev; }
 static struct tb_ring *tb_ring_alloc_tx(struct tb_nhi *nhi,int hop,unsigned size,unsigned flags) {
-    struct tb_ring *r=calloc(1,sizeof(*r));assert(r);(void)hop;(void)flags;
-    spin_lock_init(&r->lock);r->nhi=nhi;r->is_tx=true;r->hop=2;r->size=size;INIT_LIST_HEAD(&r->queue);return r;
+    struct tb_ring *r=calloc(1,sizeof(*r));assert(r);(void)hop;r->flags=flags;
+    spin_lock_init(&r->lock);r->nhi=nhi;r->is_tx=true;r->hop=2;r->size=size;INIT_LIST_HEAD(&r->queue);INIT_LIST_HEAD(&r->done);return r;
 }
 static struct tb_ring *tb_ring_alloc_rx(struct tb_nhi *nhi,int hop,unsigned size,unsigned flags,int tx_hop,unsigned sof,unsigned eof,void *cb,void *data) {
     struct tb_ring *r=tb_ring_alloc_tx(nhi,hop,size,flags);(void)tx_hop;(void)sof;(void)eof;(void)cb;(void)data;r->is_tx=false;r->hop=3;return r;
@@ -373,10 +375,34 @@ static bool stop_fails;
 static void tb_ring_stop(struct tb_ring *r) {
     if(stop_fails)return;
     r->running=false;
+    /* Finished but not collected (polled rings) are canceled like the rest. */
+    while(!list_empty(&r->done)) {
+        struct ring_frame *f=container_of(r->done.next,struct ring_frame,list);
+        list_del_init(&f->list);f->callback(r,f,true);
+    }
     while(!list_empty(&r->queue)) {
         struct ring_frame *f=container_of(r->queue.next,struct ring_frame,list);
         list_del_init(&f->list);f->callback(r,f,true);
     }
+}
+/* The polled collector: frames the "controller" finished (r->done), in
+ * order, at most @budget, callbacks never canceled. A test may require a
+ * mutex (dma_lock) to be held by the caller. */
+static struct mutex *collect_requires;
+static int collect_calls;
+static unsigned tb_ring_collect(struct tb_ring *r,unsigned budget) {
+    unsigned n=0;
+    assert(r->flags&RING_FLAG_NO_INTERRUPT);
+    if(collect_requires)assert(pthread_mutex_trylock(&collect_requires->m));
+    ++collect_calls;++r->polls;
+    if(!r->running)return 0;
+    while(n<budget&&!list_empty(&r->done)) {
+        struct ring_frame *f=container_of(r->done.next,struct ring_frame,list);
+        r->cb_stamps.irq_ns=0;r->cb_stamps.start_ns=ktime_get_ns();r->cb_stamps.reap_ns=ktime_get_ns();
+        list_del_init(&f->list);f->callback(r,f,false);++n;
+    }
+    if(n)++r->collections;
+    return n;
 }
 static bool flush_work(struct work_struct *work) {
     struct tb_ring *ring = container_of(work, struct tb_ring, work);
@@ -384,7 +410,7 @@ static bool flush_work(struct work_struct *work) {
         tb_ring_stop(ring);
     return true;
 }
-static void tb_ring_free(struct tb_ring *r) { assert(!r->running&&list_empty(&r->queue));pthread_mutex_destroy(&r->lock.m);free(r); }
+static void tb_ring_free(struct tb_ring *r) { assert(!r->running&&list_empty(&r->queue)&&list_empty(&r->done));pthread_mutex_destroy(&r->lock.m);free(r); }
 static int tb_ring_throttling(struct tb_ring *r,unsigned interval) { (void)r;(void)interval;return 0; }
 static int enqueue_fail;
 static int __tb_ring_enqueue_list(struct tb_ring *r,struct list_head *frames) {
@@ -401,7 +427,7 @@ struct tb_xdomain { struct tb *tb;uuid_t *local_uuid,*remote_uuid;struct device 
 struct tb_service { struct device dev;struct tb_xdomain *xd; };
 struct tbstream { struct tb_service *svc; };
 struct tbstream_gpu_context;
-struct tbstream_dev { struct mutex lock;struct tbstream *stream;struct { struct tb_ring *ring; } tx_ring,rx_ring;struct tbstream_gpu_context *gpu_context;unsigned ring_size,throttling,in_hopid,out_hopid;bool busy_poll,rx_napi,removed,gpu_direct;u64 gpu_last_epoch;int wait,refs,users; };
+struct tbstream_dev { struct mutex lock;struct tbstream *stream;struct { struct tb_ring *ring; } tx_ring,rx_ring;struct tbstream_gpu_context *gpu_context;unsigned ring_size,throttling,in_hopid,out_hopid;bool busy_poll,rx_napi,removed,gpu_direct;u64 gpu_last_epoch;int wait,refs,users;int cfg_gpu_poll; };
 static struct tb_xdomain *tbstream_dev_xdomain(struct tbstream_dev *s) { return s->stream?s->stream->svc->xd:NULL; }
 static struct tbstream *tbstream_get(struct tbstream *s) { return s; }
 static void tbstream_put(struct tbstream *s) { (void)s; }

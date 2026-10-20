@@ -168,6 +168,80 @@ static void cancel_is_not_a_collection(void)
     assert(calls == 9 && canceled_calls == 9 && !f.ring.collections && !f.ring.collect_ns_total);
 }
 
+/* 0041: a polled ring (no interrupt) is completed by tb_ring_collect(): in
+ * order, at most @budget frames, freed slots refilled from the queue (the
+ * descriptors carry no interrupt flag), callbacks outside the lock, never
+ * as canceled; a collection is timed like the ring work's, without IRQ. */
+static void collect_in_order_with_budget_and_refill(void)
+{
+    struct fixture f;
+
+    fixture_init(&f, true);
+    f.ring.flags = RING_FLAG_NO_INTERRUPT;
+    post(&f, 0, 10);
+    assert(in_flight(&f) == 7 && doorbells == 1);
+    for (int i = 0; i < 7; ++i)
+        assert(!(f.desc[i].flags & RING_DESC_INTERRUPT) && (f.desc[i].flags & RING_DESC_POSTED));
+    hw_complete(&f, 4);
+    assert(tb_ring_collect(&f.ring, 2) == 2);
+    assert(calls == 2 && !canceled_calls && seen_count == 2 && f.ring.polls == 1 && f.ring.collections == 1);
+    assert(seen[0].irq_ns == 0 && seen[0].reap_ns > seen[0].start_ns);
+    assert(list_empty(&f.frames[0].list) && list_empty(&f.frames[1].list));
+    assert(in_flight(&f) == 7 && doorbells == 2); /* 2 queued frames took the freed slots */
+    assert(tb_ring_collect(&f.ring, 64) == 2 && calls == 4);
+    assert(in_flight(&f) == 6 && doorbells == 3 && list_empty(&f.ring.queue));
+    /* Nothing completed: no callback, no collection, no doorbell. */
+    assert(tb_ring_collect(&f.ring, 64) == 0 && calls == 4 && f.ring.collections == 2);
+    assert(f.ring.polls == 3 && doorbells == 3 && !warnings);
+}
+
+/* An interrupt ring is never collected this way (its ring work does it). */
+static void collect_refuses_interrupt_ring(void)
+{
+    struct fixture f;
+
+    fixture_init(&f, true);
+    post(&f, 0, 3);
+    hw_complete(&f, 3);
+    warnings = 0;
+    assert(tb_ring_collect(&f.ring, 64) == 0 && !calls && warnings == 1 && in_flight(&f) == 3);
+    warnings = 0;
+}
+
+/* Collected frames are completed once; the stop cancels the rest once, also
+ * the ones the controller had finished but nobody collected. */
+static void collect_then_stop_exactly_once(void)
+{
+    struct fixture f;
+
+    fixture_init(&f, true);
+    f.ring.flags = RING_FLAG_NO_INTERRUPT;
+    post(&f, 0, 5);
+    hw_complete(&f, 3);
+    assert(tb_ring_collect(&f.ring, 1) == 1 && calls == 1);
+    f.ring.running = false;              /* tb_ring_stop() */
+    ring_work(&f.ring.work);             /* its cancellation run */
+    assert(calls == 5 && canceled_calls == 4);
+    assert(tb_ring_collect(&f.ring, 64) == 0 && calls == 5);
+}
+
+/* RX: size, PDFs and flags (CRC/overrun) come from the descriptor. */
+static void collect_rx_fields(void)
+{
+    struct fixture f;
+
+    fixture_init(&f, false);
+    f.ring.flags = RING_FLAG_NO_INTERRUPT;
+    post(&f, 0, 2);
+    hw_complete(&f, 2);
+    f.desc[1].length = 100;
+    f.desc[1].eof = 3;
+    f.desc[1].flags |= RING_DESC_CRC_ERROR;
+    assert(tb_ring_collect(&f.ring, 64) == 2);
+    assert(f.frames[0].size == 64 && f.frames[0].eof == 2 && f.frames[0].sof == 1);
+    assert(f.frames[1].size == 100 && f.frames[1].eof == 3 && (f.frames[1].flags & RING_DESC_CRC_ERROR));
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -179,6 +253,14 @@ int main(int argc, char **argv)
         work_collection_is_stamped();
     else if (!strcmp(argv[1], "cancel_is_not_a_collection"))
         cancel_is_not_a_collection();
+    else if (!strcmp(argv[1], "collect_in_order_with_budget_and_refill"))
+        collect_in_order_with_budget_and_refill();
+    else if (!strcmp(argv[1], "collect_refuses_interrupt_ring"))
+        collect_refuses_interrupt_ring();
+    else if (!strcmp(argv[1], "collect_then_stop_exactly_once"))
+        collect_then_stop_exactly_once();
+    else if (!strcmp(argv[1], "collect_rx_fields"))
+        collect_rx_fields();
     else
         return 2;
     printf("PASS %s\n", argv[1]);

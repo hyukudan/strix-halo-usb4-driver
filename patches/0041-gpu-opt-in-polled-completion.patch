@@ -1,0 +1,332 @@
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -26,6 +26,22 @@
+ MODULE_IMPORT_NS("DMA_BUF");
+ 
+ /* Finite DMA leases, including legacy RX standby ownership. Sampled on enqueue. */
++/*
++ * Opt-in polled completion: the GPU rings are allocated without interrupt
++ * and their completed frames are collected by SGU_IOC_EVENT (a bounded batch
++ * per call) and, as a fallback for waiters that do not call EVENT (fences,
++ * poll/epoll), by the watchdog every gpu_poll_fallback_ms while operations
++ * are pending. Per endpoint: configfs gpu_poll, read when the session opens.
++ */
++static bool gpu_poll;
++module_param(gpu_poll, bool, 0644);
++MODULE_PARM_DESC(gpu_poll, "GPU sessions complete DMA by polling from SGU_IOC_EVENT instead of ring interrupts; per endpoint configfs gpu_poll, read when a session opens (default: false)");
++static unsigned int gpu_poll_budget = 64;
++module_param(gpu_poll_budget, uint, 0644);
++MODULE_PARM_DESC(gpu_poll_budget, "Frames completed per ring and EVENT call in polled mode (1..4096, default 64)");
++static unsigned int gpu_poll_fallback_ms = 1;
++module_param(gpu_poll_fallback_ms, uint, 0644);
++MODULE_PARM_DESC(gpu_poll_fallback_ms, "Polled mode: collection by the watchdog while operations are pending, every N ms (1..100, default 1)");
+ static unsigned int gpu_dma_timeout_ms = 30000;
+ static unsigned int gpu_standby_timeout_ms = 300000;
+ 
+@@ -139,6 +155,8 @@ struct tbstream_gpu_context {
+     /* Kernel terminal buffers for SGU_PREPARE_TERMINAL_HEADER, per slot. */
+     struct page *terminal_page[2][SGU_MAX_QUEUE_DEPTH];
+     dma_addr_t terminal_dma[2][SGU_MAX_QUEUE_DEPTH];
++    bool polled; /* rings without interrupt: EVENT and the watchdog collect */
++    u64 polls, polled_frames; /* under @dma_lock */
+     bool imported, started, armed, stopped, failed, rearming_rx, quarantined;
+     bool closing, requires_new_epoch;
+     bool path_check_required, detached_hopids;
+@@ -196,6 +214,7 @@ static const struct dma_fence_ops sgu_fence_ops = {
+ 
+ static void tbstream_gpu_stop(struct tbstream_dev *sdev);
+ static void sgu_watchdog(struct work_struct *work);
++static unsigned long sgu_watchdog_delay(struct tbstream_gpu_context *ctx);
+ 
+ static u32 sgu_operation_slot(struct tbstream_gpu_context *ctx, struct sgu_hw_operation *op)
+ {
+@@ -720,7 +739,7 @@ static int sgu_enqueue(struct tbstream_gpu_context *ctx, struct sgu_hw_operation
+     ret = __tb_ring_enqueue_list(ring, &frames);
+     if (!ret) {
+         /* New traffic must not push out an older operation's watchdog. */
+-        queue_delayed_work(ctx->watchdog_wq, &ctx->watchdog, msecs_to_jiffies(100));
++        queue_delayed_work(ctx->watchdog_wq, &ctx->watchdog, sgu_watchdog_delay(ctx));
+         mutex_unlock(&ctx->dma_lock);
+         dma_fence_end_signalling(cookie);
+         return 0;
+@@ -771,6 +790,7 @@ static int tbstream_gpu_open(struct tbstream_dev *sdev)
+     struct tb_xdomain *xd = tbstream_dev_xdomain(sdev);
+     uuid_t instance;
+     struct tb_ring *ring;
++    unsigned int ring_flags;
+     int ret;
+ 
+     if (sdev->busy_poll || !xd || !xd->local_uuid || !xd->remote_uuid ||
+@@ -808,13 +828,15 @@ static int tbstream_gpu_open(struct tbstream_dev *sdev)
+     ctx->identity.route = xd->route;
+     ctx->identity.in_hopid = sdev->in_hopid;
+     ctx->identity.out_hopid = sdev->out_hopid;
+-    ring = tb_ring_alloc_tx(xd->tb->nhi, -1, sdev->ring_size, RING_FLAG_FRAME | RING_FLAG_E2E);
++    ctx->polled = sdev->cfg_gpu_poll < 0 ? READ_ONCE(gpu_poll) : sdev->cfg_gpu_poll;
++    ring_flags = RING_FLAG_FRAME | RING_FLAG_E2E | (ctx->polled ? RING_FLAG_NO_INTERRUPT : 0);
++    ring = tb_ring_alloc_tx(xd->tb->nhi, -1, sdev->ring_size, ring_flags);
+     if (!ring)
+         goto fail;
+     sdev->tx_ring.ring = ring;
+     /* GPU rings complete through their own callbacks, never start_poll. */
+     sdev->rx_napi = false;
+-    ring = tb_ring_alloc_rx(xd->tb->nhi, -1, sdev->ring_size, RING_FLAG_FRAME | RING_FLAG_E2E,
++    ring = tb_ring_alloc_rx(xd->tb->nhi, -1, sdev->ring_size, ring_flags,
+                             sdev->tx_ring.ring->hop, BIT(TBSTREAM_FRAME_START), BIT(TBSTREAM_DATA), NULL, NULL);
+     if (!ring) {
+         tb_ring_free(sdev->tx_ring.ring);
+@@ -843,6 +865,47 @@ fail:
+     return -ENOMEM;
+ }
+ 
++/*
++ * Polled mode: complete what the controller finished on both rings. Under
++ * dma_lock, which STOP holds while it stops the rings and joins their work:
++ * no collected callback is still running once a stop returns, and the frames
++ * the stop cancels were not collected. The callbacks are the interrupt
++ * path's (terminal check, FINISHING -> fence -> EVENT), each exactly once.
++ */
++static unsigned int sgu_collect_locked(struct tbstream_gpu_context *ctx)
++{
++    struct tbstream_dev *sdev = ctx->sdev;
++    unsigned int budget = clamp_val(READ_ONCE(gpu_poll_budget), 1, 4096), n;
++    bool cookie;
++
++    lockdep_assert_held(&ctx->dma_lock);
++    if (!ctx->polled || !ctx->started || ctx->stopped || READ_ONCE(ctx->closing))
++        return 0;
++    cookie = dma_fence_begin_signalling();
++    n = tb_ring_collect(sdev->tx_ring.ring, budget);
++    n += tb_ring_collect(sdev->rx_ring.ring, budget);
++    dma_fence_end_signalling(cookie);
++    ++ctx->polls;
++    ctx->polled_frames += n;
++    return n;
++}
++
++/* EVENT never waits for dma_lock: a holder (enqueue, watchdog, STOP) is
++ * already making progress or stopping. */
++static void sgu_collect(struct tbstream_gpu_context *ctx)
++{
++    if (!ctx->polled || !mutex_trylock(&ctx->dma_lock))
++        return;
++    sgu_collect_locked(ctx);
++    mutex_unlock(&ctx->dma_lock);
++}
++
++static unsigned long sgu_watchdog_delay(struct tbstream_gpu_context *ctx)
++{
++    return msecs_to_jiffies(ctx->polled ?
++                            clamp_val(READ_ONCE(gpu_poll_fallback_ms), 1, 100) : 100);
++}
++
+ static void sgu_stop_dma_locked(struct tbstream_gpu_context *ctx)
+ {
+     struct tbstream_dev *sdev = ctx->sdev;
+@@ -948,6 +1011,8 @@ static void sgu_watchdog(struct work_struct *work)
+     mutex_lock(&ctx->dma_lock);
+     if (READ_ONCE(ctx->closing) || ctx->stopped)
+         goto unlock;
++    /* Fallback progress for waiters that do not call EVENT */
++    sgu_collect_locked(ctx);
+     now = ktime_get_ns();
+     spin_lock_irqsave(&ctx->lock, flags);
+     for (direction = 0; direction < 2; ++direction) {
+@@ -978,7 +1043,7 @@ static void sgu_watchdog(struct work_struct *work)
+          * Never fake DMA completion: an unsuccessful stop retains ownership. */
+         sgu_stop_dma_locked(ctx);
+     } else if (pending) {
+-        queue_delayed_work(ctx->watchdog_wq, &ctx->watchdog, msecs_to_jiffies(100));
++        queue_delayed_work(ctx->watchdog_wq, &ctx->watchdog, sgu_watchdog_delay(ctx));
+     }
+ unlock:
+     mutex_unlock(&ctx->dma_lock);
+@@ -1387,7 +1452,9 @@ static ssize_t sgu_timing_show(struct tbstream_gpu_context *ctx, char *buf)
+     ssize_t len = 0;
+     u32 d, s, b, i;
+ 
+-    len += scnprintf(buf + len, PAGE_SIZE - len, "mode irq\n");
++    len += scnprintf(buf + len, PAGE_SIZE - len, "mode %s polls %llu polled_frames %llu\n",
++                     ctx->polled ? "poll" : "irq", READ_ONCE(ctx->polls),
++                     READ_ONCE(ctx->polled_frames));
+     for (d = 0; d < 2; ++d) {
+         struct tb_ring *ring = d ? ctx->sdev->rx_ring.ring : ctx->sdev->tx_ring.ring;
+         u64 irqs = 0, collections = 0, total = 0, max = 0;
+@@ -1472,6 +1539,7 @@ static long sgu_event_ioctl(struct tbstream_gpu_context *ctx, void __user *user)
+         ret = -EINVAL;
+         goto free;
+     }
++    sgu_collect(ctx);
+     spin_lock_irqsave(&ctx->lock, flags);
+     for (direction = 0; direction < 2; ++direction) {
+         for (slot = 0; slot < ctx->queue_depth; ++slot) {
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -455,6 +455,78 @@ unlock:
+ }
+ EXPORT_SYMBOL_GPL(tb_ring_poll);
+ 
++/**
++ * tb_ring_collect() - Complete the finished frames of a polled ring
++ * @ring: Ring allocated with %RING_FLAG_NO_INTERRUPT
++ * @budget: Complete at most this many frames
++ *
++ * Does for a ring without interrupt what the ring work does after an
++ * interrupt: takes the completed descriptors in order, posts queued frames
++ * into the slots they free (nothing else would: the ring work is not queued
++ * for such a ring while it runs) and then calls the callbacks outside the
++ * ring lock, each exactly once and never as canceled. The caller serializes
++ * its collections with tb_ring_stop() of the ring: once stop returns, the
++ * frames it canceled were not collected, but a callback of a collection
++ * still running would not be covered by its flush.
++ *
++ * Return: Number of frames completed.
++ */
++unsigned int tb_ring_collect(struct tb_ring *ring, unsigned int budget)
++{
++	u64 start = ktime_get_ns(), elapsed;
++	struct ring_frame *frame;
++	unsigned long flags;
++	unsigned int n = 0;
++	LIST_HEAD(done);
++
++	if (WARN_ON_ONCE(!(ring->flags & RING_FLAG_NO_INTERRUPT)))
++		return 0;
++	spin_lock_irqsave(&ring->lock, flags);
++	ring->polls++;
++	if (!ring->running) {
++		spin_unlock_irqrestore(&ring->lock, flags);
++		return 0;
++	}
++	while (n < budget && !ring_empty(ring) &&
++	       (ring->descriptors[ring->tail].flags & RING_DESC_COMPLETED)) {
++		frame = list_first_entry(&ring->in_flight, typeof(*frame), list);
++		list_move_tail(&frame->list, &done);
++		if (!ring->is_tx) {
++			frame->size = ring->descriptors[ring->tail].length;
++			frame->eof = ring->descriptors[ring->tail].eof;
++			frame->sof = ring->descriptors[ring->tail].sof;
++			frame->flags = ring->descriptors[ring->tail].flags;
++		}
++		ring->tail = (ring->tail + 1) % ring->size;
++		n++;
++	}
++	if (n) {
++		ring->cb_stamps.irq_ns = 0;
++		ring->cb_stamps.start_ns = start;
++		ring->cb_stamps.reap_ns = ktime_get_ns();
++	}
++	ring_write_descriptors(ring);
++	spin_unlock_irqrestore(&ring->lock, flags);
++
++	while (!list_empty(&done)) {
++		frame = list_first_entry(&done, typeof(*frame), list);
++		list_del_init(&frame->list);
++		if (frame->callback)
++			frame->callback(ring, frame, false);
++	}
++	if (n) {
++		elapsed = ktime_get_ns() - start;
++		spin_lock_irqsave(&ring->lock, flags);
++		ring->collections++;
++		ring->collect_ns_total += elapsed;
++		if (elapsed > ring->collect_ns_max)
++			ring->collect_ns_max = elapsed;
++		spin_unlock_irqrestore(&ring->lock, flags);
++	}
++	return n;
++}
++EXPORT_SYMBOL_GPL(tb_ring_collect);
++
+ static void __ring_interrupt_mask(struct tb_ring *ring, bool mask)
+ {
+ 	int idx = ring_interrupt_index(ring);
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -161,6 +161,8 @@ struct tbstream_ring {
+  *	      stream is attached meanwhile.
+  * @domain_index: Domain of the connection named by the parent group
+  * @route: Route of that connection's XDomain
++ * @cfg_gpu_poll: GPU sessions complete DMA by polling instead of ring
++ *		  interrupts (-1 follows the gpu_poll module parameter)
+  * @cfg_open_timeout_ms: How long open() waits for the peer's stream service
+  *			 (-1 follows the open_timeout_ms module parameter)
+  * @wait: Waitqueue for open, read and write
+@@ -200,6 +202,7 @@ struct tbstream_dev {
+ 	unsigned int domain_index;
+ 	u64 route;
+ 	int cfg_open_timeout_ms;
++	int cfg_gpu_poll;
+ 	wait_queue_head_t wait;
+ 	struct mutex lock;
+ 	struct tbstream_ring tx_ring;
+@@ -2001,6 +2004,23 @@ static ssize_t tbstream_dev_gpu_quarantine_show(struct config_item *item, char *
+ }
+ CONFIGFS_ATTR_RO(tbstream_dev_, gpu_quarantine);
+ 
++static ssize_t tbstream_dev_gpu_poll_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return sysfs_emit(buf, "%d\n", sdev->cfg_gpu_poll);
++}
++
++/* -1 follows the gpu_poll module parameter, 0 interrupts, 1 polling. */
++static ssize_t tbstream_dev_gpu_poll_store(struct config_item *item,
++					   const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return tbstream_dev_int_store(sdev, &sdev->cfg_gpu_poll, buf, count, -1, 1);
++}
++CONFIGFS_ATTR(tbstream_dev_, gpu_poll);
++
+ /* Completion path timing of the GPU session; any write resets it. */
+ static ssize_t tbstream_dev_gpu_timing_show(struct config_item *item, char *buf)
+ {
+@@ -2055,6 +2075,7 @@ static struct configfs_attribute *tbstream_dev_attrs[] = {
+ 	&tbstream_dev_attr_gpu_quarantine,
+ 	&tbstream_dev_attr_gpu_recover,
+ 	&tbstream_dev_attr_gpu_timing,
++	&tbstream_dev_attr_gpu_poll,
+ #endif
+ 	&tbstream_dev_attr_index,
+ 	&tbstream_dev_attr_in_hopid,
+@@ -2246,6 +2267,7 @@ tbstream_dev_make_group(struct config_group *group, const char *name)
+ 	sdev->cfg_rx_napi = -1;
+ 	sdev->cfg_spin_us = -1;
+ 	sdev->cfg_open_timeout_ms = -1;
++	sdev->cfg_gpu_poll = -1;
+ 	sdev->domain_index = sg->domain_index;
+ 	sdev->route = sg->route;
+ 	sdev->irq_cpu = -1;
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -632,6 +632,7 @@ struct tb_ring_stamps {
+  * @collect_ns_total: Time those collections took, from their start to their
+  *		      last callback (protected by @lock)
+  * @collect_ns_max: Longest of them (protected by @lock)
++ * @polls: tb_ring_collect() calls (protected by @lock)
+  */
+ struct tb_ring {
+ 	spinlock_t lock;
+@@ -663,6 +664,7 @@ struct tb_ring {
+ 	u64 collections;
+ 	u64 collect_ns_total;
+ 	u64 collect_ns_max;
++	u64 polls;
+ };
+ 
+ /* Leave ring interrupt enabled on suspend */
+@@ -793,6 +795,7 @@ static inline int tb_ring_tx(struct tb_ring *ring, struct ring_frame *frame)
+ 
+ /* Used only when the ring is in polling mode */
+ struct ring_frame *tb_ring_poll(struct tb_ring *ring);
++unsigned int tb_ring_collect(struct tb_ring *ring, unsigned int budget);
+ void tb_ring_poll_complete(struct tb_ring *ring);
+ 
+ int tb_ring_throttling(struct tb_ring *ring, unsigned int interval_nsec);

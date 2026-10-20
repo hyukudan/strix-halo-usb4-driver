@@ -17,9 +17,10 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent
 CASES = ('irq_is_stamped', 'irq_is_stamped_with_start_poll', 'work_collection_is_stamped',
-         'cancel_is_not_a_collection')
+         'cancel_is_not_a_collection', 'collect_in_order_with_budget_and_refill',
+         'collect_refuses_interrupt_ring', 'collect_then_stop_exactly_once', 'collect_rx_fields')
 FUNCTIONS = ('ring_full', 'ring_empty', 'ring_write_descriptors', 'ring_work', 'tb_ring_poll',
-             '__ring_interrupt')
+             '__ring_interrupt', 'tb_ring_collect')
 
 
 def extract(text, name):

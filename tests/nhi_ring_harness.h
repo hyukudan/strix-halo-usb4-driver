@@ -23,6 +23,8 @@ typedef uint64_t dma_addr_t;
 #define IS_ENABLED(x) 0
 #define BIT(n) (1U << (n))
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+static int warnings;
+#define WARN_ON_ONCE(c) ({ bool __c = (c); if (__c) ++warnings; __c; })
 
 struct list_head { struct list_head *next, *prev; };
 static void INIT_LIST_HEAD(struct list_head *l) { l->next = l->prev = l; }
