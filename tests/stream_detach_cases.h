@@ -37,6 +37,7 @@ static void endpoint_init(struct endpoint *e, int mode)
     s->group.cg_item.ci_name = "s0";
     s->domain_index = 1; s->route = 2;
     s->cfg_open_timeout_ms = -1;
+    s->cfg_latency_qos_us = -1;
     s->misc.name = "tbstream0";
     s->in_hopid = 8; s->out_hopid = 9;
     s->ring_size = 64; s->throttling = 8192;
@@ -97,6 +98,7 @@ static void assert_rings_gone(struct endpoint *e)
     assert(!e->dev.tx_ring.frames && !e->dev.rx_ring.frames);
     assert(!atomic_load(&live_rings) && !atomic_load(&live_arrays));
     assert(!atomic_load(&live_pages) && !atomic_load(&live_mappings));
+    assert(!qos_live);
 }
 
 static void close_stale_file(struct endpoint *e)

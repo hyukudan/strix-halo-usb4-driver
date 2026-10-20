@@ -30,9 +30,11 @@ static struct sgu_import import_request(struct fixture *f,u64 epoch) {
     return req;
 }
 static int fixture_gpu_poll; /* the endpoint's configfs gpu_poll for the next open */
+static int fixture_qos_us = -1; /* its configfs latency_qos_us */
 static void fixture_open(struct fixture *f,unsigned depth,unsigned frames,bool import) {
     memset(f,0,sizeof(*f));
     f->sdev.cfg_gpu_poll=fixture_gpu_poll;
+    f->sdev.cfg_latency_qos_us=fixture_qos_us;
     mutex_init(&f->sdev.lock);
     f->sdev.ring_size=frames;f->sdev.stream=&f->stream;f->sdev.in_hopid=8;f->sdev.out_hopid=9;
     f->file.private_data=&f->sdev;
@@ -379,6 +381,58 @@ static void test_completion_timing(void) {
     assert(tbstream_gpu_timing_reset(&none)==-ENXIO&&tbstream_gpu_timing_show(&none,small)==5);
 }
 /* 0041: opt-in polled completion. */
+/* 0042: the session's CPU latency request lives from ARM to STOP, close,
+ * a failed arm or abandonment; never more than one per session. */
+static void test_session_latency_qos(void) {
+    struct fixture f;
+    char *buf=calloc(1,PAGE_SIZE);assert(buf);
+    /* Default: no request. */
+    qos_live=qos_adds=0;
+    fixture_open(&f,1,64,true);
+    assert(f.sdev.gpu_context->qos_us==-1&&!qos_live&&!qos_adds);
+    sgu_timing_show(f.sdev.gpu_context,buf);assert(strstr(buf," qos_us -1\n"));
+    fixture_close(&f);
+    /* The module parameter, clamped; the endpoint's value overrides it. */
+    latency_qos_us=1000000;
+    fixture_open(&f,1,64,true);
+    assert(qos_live==1&&f.sdev.gpu_context->qos.value==100000&&f.sdev.gpu_context->qos_us==100000);
+    fixture_close(&f);assert(!qos_live);
+    fixture_qos_us=0;
+    fixture_open(&f,1,64,true);
+    struct tbstream_gpu_context *ctx=f.sdev.gpu_context;
+    assert(qos_live==1&&ctx->qos.active&&ctx->qos.value==0&&ctx->qos_us==0);
+    sgu_timing_show(ctx,buf);assert(strstr(buf," qos_us 0\n"));
+    /* STOP releases it; a second stop and the close do nothing more. */
+    assert(action(&f,SGU_IOC_STOP,0,0,0)==0);
+    assert(!qos_live&&!ctx->qos.active&&ctx->qos_us==-1);
+    mutex_lock(&f.sdev.lock);tbstream_gpu_stop(&f.sdev);mutex_unlock(&f.sdev.lock);
+    assert(!qos_live);
+    fixture_close(&f);assert(!qos_live&&qos_adds==2);
+    /* Close while armed releases it. */
+    fixture_open(&f,1,64,true);assert(qos_live==1);
+    fixture_close(&f);assert(!qos_live);
+    /* An arm that fails after starting the rings releases it. */
+    fixture_open(&f,1,64,false);
+    /* Not armed yet: nothing held, and the read-out says so. */
+    assert(!qos_live&&f.sdev.gpu_context->qos_us==-1);
+    sgu_timing_show(f.sdev.gpu_context,buf);assert(strstr(buf," qos_us -1\n"));
+    {struct sgu_import req=import_request(&f,1);
+     assert(tbstream_gpu_ioctl(&f.file,SGU_IOC_IMPORT,(unsigned long)&req)==0);
+     struct sgu_action a={.fence=req.fence};
+     enable_fail=1;
+     assert(tbstream_gpu_ioctl(&f.file,SGU_IOC_ARM,(unsigned long)&a)==-EIO);
+     enable_fail=0;}
+    assert(!qos_live&&f.sdev.gpu_context->qos_us==-1);
+    fixture_close(&f);
+    /* Abandonment stops nothing, but the request goes. */
+    fixture_open(&f,1,64,true);ctx=f.sdev.gpu_context;assert(qos_live==1);
+    mutex_lock(&f.sdev.lock);sgu_abandon(&f.sdev);mutex_unlock(&f.sdev.lock);
+    assert(ctx->abandoned&&!qos_live&&ctx->qos_us==-1);
+    /* Test-only teardown of what a real abandonment leaks until reboot. */
+    ctx->abandoned=false;ctx->dma_revoked=true;ctx->lifetime.pending_callbacks=0;
+    fixture_close(&f);assert(!qos_live&&!f.sdev.refs&&!atomic_load(&module_refs));
+    fixture_qos_us=-1;latency_qos_us=-1;free(buf);
+}
 static void test_polled_completion(void) {
     struct fixture f;
     fixture_gpu_poll=1;fixture_open(&f,1,256,true);fixture_gpu_poll=0;
@@ -547,7 +601,7 @@ int main(int argc,char **argv) {
     struct { const char *name; void (*run)(void); } tests[]={
         {"geometry",test_geometry},{"queue",test_queue},{"failure_isolation",test_failure_isolation},
         {"events_legacy",test_events_and_legacy},{"timeout_recovery",test_timeout_recovery},
-        {"wait_concurrency",test_wait_concurrency},{"nonblock_contended_mutex",test_nonblock_contended_mutex},{"nonblock_contended_dma_lock",test_nonblock_contended_dma_lock},{"completion_timing",test_completion_timing},{"polled_completion",test_polled_completion},{"wait_retry_order",test_wait_retry_and_order},
+        {"wait_concurrency",test_wait_concurrency},{"nonblock_contended_mutex",test_nonblock_contended_mutex},{"nonblock_contended_dma_lock",test_nonblock_contended_dma_lock},{"completion_timing",test_completion_timing},{"polled_completion",test_polled_completion},{"session_latency_qos",test_session_latency_qos},{"wait_retry_order",test_wait_retry_and_order},
         {"export_lifetime",test_export_lifetime},{"admission_rollback",test_admission_and_rollback},
         {"watchdog_schedule",test_watchdog_schedule},{"max_queue_reuse",test_max_queue_reuse},
         {"group_success",test_group_success},{"group_rejections",test_group_rejections},

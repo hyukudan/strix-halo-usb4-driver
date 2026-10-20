@@ -1,0 +1,205 @@
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -157,6 +157,9 @@ struct tbstream_gpu_context {
+     dma_addr_t terminal_dma[2][SGU_MAX_QUEUE_DEPTH];
+     bool polled; /* rings without interrupt: EVENT and the watchdog collect */
+     u64 polls, polled_frames; /* under @dma_lock */
++    /* Held from arm to stop (or abandonment), under @dma_lock. */
++    struct pm_qos_request qos;
++    int qos_us; /* its limit, -1 when none */
+     bool imported, started, armed, stopped, failed, rearming_rx, quarantined;
+     bool closing, requires_new_epoch;
+     bool path_check_required, detached_hopids;
+@@ -829,6 +832,7 @@ static int tbstream_gpu_open(struct tbstream_dev *sdev)
+     ctx->identity.in_hopid = sdev->in_hopid;
+     ctx->identity.out_hopid = sdev->out_hopid;
+     ctx->polled = sdev->cfg_gpu_poll < 0 ? READ_ONCE(gpu_poll) : sdev->cfg_gpu_poll;
++    ctx->qos_us = -1;
+     ring_flags = RING_FLAG_FRAME | RING_FLAG_E2E | (ctx->polled ? RING_FLAG_NO_INTERRUPT : 0);
+     ring = tb_ring_alloc_tx(xd->tb->nhi, -1, sdev->ring_size, ring_flags);
+     if (!ring)
+@@ -906,6 +910,13 @@ static unsigned long sgu_watchdog_delay(struct tbstream_gpu_context *ctx)
+                             clamp_val(READ_ONCE(gpu_poll_fallback_ms), 1, 100) : 100);
+ }
+ 
++static void sgu_qos_release(struct tbstream_gpu_context *ctx)
++{
++    lockdep_assert_held(&ctx->dma_lock);
++    tbstream_qos_release(&ctx->qos);
++    WRITE_ONCE(ctx->qos_us, -1);
++}
++
+ static void sgu_stop_dma_locked(struct tbstream_gpu_context *ctx)
+ {
+     struct tbstream_dev *sdev = ctx->sdev;
+@@ -932,6 +943,7 @@ static void sgu_stop_dma_locked(struct tbstream_gpu_context *ctx)
+     if (running || !sgu_controller_stopped(&ctx->lifetime))
+         WRITE_ONCE(ctx->failed, true);
+     spin_unlock_irqrestore(&ctx->lock, flags);
++    sgu_qos_release(ctx);
+     wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLERR);
+ }
+ 
+@@ -1272,6 +1284,7 @@ static int sgu_arm(struct tbstream_gpu_context *ctx)
+     tb_ring_start(ctx->sdev->rx_ring.ring);
+     tbstream_dev_irq_affinity(ctx->sdev);
+     WRITE_ONCE(ctx->started, true);
++    WRITE_ONCE(ctx->qos_us, tbstream_qos_acquire(ctx->sdev, &ctx->qos));
+     spin_lock_irqsave(&ctx->lock, flags);
+     ctx->lifetime.stop_confirmed = 0;
+     spin_unlock_irqrestore(&ctx->lock, flags);
+@@ -1452,9 +1465,10 @@ static ssize_t sgu_timing_show(struct tbstream_gpu_context *ctx, char *buf)
+     ssize_t len = 0;
+     u32 d, s, b, i;
+ 
+-    len += scnprintf(buf + len, PAGE_SIZE - len, "mode %s polls %llu polled_frames %llu\n",
++    len += scnprintf(buf + len, PAGE_SIZE - len,
++                     "mode %s polls %llu polled_frames %llu qos_us %d\n",
+                      ctx->polled ? "poll" : "irq", READ_ONCE(ctx->polls),
+-                     READ_ONCE(ctx->polled_frames));
++                     READ_ONCE(ctx->polled_frames), READ_ONCE(ctx->qos_us));
+     for (d = 0; d < 2; ++d) {
+         struct tb_ring *ring = d ? ctx->sdev->rx_ring.ring : ctx->sdev->tx_ring.ring;
+         u64 irqs = 0, collections = 0, total = 0, max = 0;
+@@ -2268,6 +2282,10 @@ static void sgu_abandon(struct tbstream_dev *sdev)
+     WRITE_ONCE(ctx->failed, true);
+     WRITE_ONCE(ctx->closing, true);
+     cancel_delayed_work_sync(&ctx->watchdog);
++    /* Nothing stops these rings: the request goes now. */
++    mutex_lock(&ctx->dma_lock);
++    sgu_qos_release(ctx);
++    mutex_unlock(&ctx->dma_lock);
+     if (!ctx->quarantined) {
+         tbstream_dev_get(sdev);
+         __module_get(THIS_MODULE);
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -21,6 +21,7 @@
+ #include <linux/miscdevice.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/pm_qos.h>
+ #include <linux/poll.h>
+ #include <linux/sizes.h>
+ #include <linux/thunderbolt.h>
+@@ -165,6 +166,10 @@ struct tbstream_ring {
+  *		  interrupts (-1 follows the gpu_poll module parameter)
+  * @cfg_open_timeout_ms: How long open() waits for the peer's stream service
+  *			 (-1 follows the open_timeout_ms module parameter)
++ * @cfg_latency_qos_us: CPU latency limit held while the rings run, in
++ *			microseconds (-1 follows the latency_qos_us module
++ *			parameter, which is -1, no limit, by default)
++ * @qos: CPU latency request of a host stream (protected by @lock)
+  * @wait: Waitqueue for open, read and write
+  * @lock: Lock protecting this structure
+  * @tx_ring: Transmit ring
+@@ -203,6 +208,8 @@ struct tbstream_dev {
+ 	u64 route;
+ 	int cfg_open_timeout_ms;
+ 	int cfg_gpu_poll;
++	int cfg_latency_qos_us;
++	struct pm_qos_request qos;
+ 	wait_queue_head_t wait;
+ 	struct mutex lock;
+ 	struct tbstream_ring tx_ring;
+@@ -370,6 +377,41 @@ module_param_cb(spin_us, &spin_us_ops, &spin_us, 0644);
+ MODULE_PARM_DESC(spin_us,
+ 		 "With rx_napi, keep polling the RX ring this many microseconds before re-arming its interrupt, at most 1000 (default: 0)");
+ 
++#define TBSTREAM_DEV_MAX_QOS_US		100000
++
++static int latency_qos_us = -1;
++module_param(latency_qos_us, int, 0644);
++MODULE_PARM_DESC(latency_qos_us,
++		 "While a stream's rings run, keep the CPUs' exit latency from idle at most this many microseconds, at most 100000; applies when a stream is opened or a GPU session armed (default: -1, no limit)");
++
++/*
++ * A CPU waking from a deep idle state delays the interrupt and the worker
++ * that complete a ring's frames. Hold a CPU latency QoS request while the
++ * rings run. The caller serialises @req. Returns the limit in
++ * microseconds, or -1 when the endpoint asks for none.
++ */
++static int tbstream_qos_acquire(struct tbstream_dev *sdev, struct pm_qos_request *req)
++{
++	int us = sdev->cfg_latency_qos_us < 0 ? READ_ONCE(latency_qos_us) :
++		 sdev->cfg_latency_qos_us;
++
++	if (us < 0)
++		return -1;
++	us = min(us, TBSTREAM_DEV_MAX_QOS_US);
++	if (cpu_latency_qos_request_active(req))
++		cpu_latency_qos_update_request(req, us);
++	else
++		cpu_latency_qos_add_request(req, us);
++	return us;
++}
++
++/* Idempotent: every stop path calls it. */
++static void tbstream_qos_release(struct pm_qos_request *req)
++{
++	if (cpu_latency_qos_request_active(req))
++		cpu_latency_qos_remove_request(req);
++}
++
+ /* Hard IRQ context, nhi->lock and ring->lock held: the ring is masked. */
+ static void tbstream_rx_start_poll(void *data)
+ {
+@@ -942,6 +984,7 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 	ret = tbstream_dev_alloc_rx_buffers(sdev);
+ 	if (ret)
+ 		goto err_stop;
++	tbstream_qos_acquire(sdev, &sdev->qos);
+ 	return 0;
+ 
+ err_stop:
+@@ -996,6 +1039,7 @@ static void tbstream_dev_stop(struct tbstream_dev *sdev)
+ 		return;
+ 	}
+ #endif
++	tbstream_qos_release(&sdev->qos);
+ 	/* Already stopped: the stream was detached, or resume failed. */
+ 	if (!sdev->tx_ring.ring)
+ 		return;
+@@ -1689,6 +1733,24 @@ static ssize_t tbstream_dev_open_timeout_ms_store(struct config_item *item,
+ }
+ CONFIGFS_ATTR(tbstream_dev_, open_timeout_ms);
+ 
++static ssize_t tbstream_dev_latency_qos_us_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return sysfs_emit(buf, "%d\n", sdev->cfg_latency_qos_us);
++}
++
++/* -1 follows the latency_qos_us module parameter; 0 keeps CPUs out of idle states. */
++static ssize_t tbstream_dev_latency_qos_us_store(struct config_item *item,
++						 const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return tbstream_dev_int_store(sdev, &sdev->cfg_latency_qos_us, buf, count, -1,
++				      TBSTREAM_DEV_MAX_QOS_US);
++}
++CONFIGFS_ATTR(tbstream_dev_, latency_qos_us);
++
+ static ssize_t tbstream_dev_index_show(struct config_item *item, char *buf)
+ {
+ 	struct config_group *group = to_config_group(item);
+@@ -2068,6 +2130,7 @@ static struct configfs_attribute *tbstream_dev_attrs[] = {
+ 	&tbstream_dev_attr_busy_poll,
+ 	&tbstream_dev_attr_irq_cpu,
+ 	&tbstream_dev_attr_open_timeout_ms,
++	&tbstream_dev_attr_latency_qos_us,
+ 	&tbstream_dev_attr_rx_napi,
+ 	&tbstream_dev_attr_spin_us,
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+@@ -2268,6 +2331,7 @@ tbstream_dev_make_group(struct config_group *group, const char *name)
+ 	sdev->cfg_spin_us = -1;
+ 	sdev->cfg_open_timeout_ms = -1;
+ 	sdev->cfg_gpu_poll = -1;
++	sdev->cfg_latency_qos_us = -1;
+ 	sdev->domain_index = sg->domain_index;
+ 	sdev->route = sg->route;
+ 	sdev->irq_cpu = -1;

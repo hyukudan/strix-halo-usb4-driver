@@ -73,6 +73,7 @@ static void second_dev(struct endpoint *e, struct tbstream_dev *s, struct file *
     s->in_hopid = 10; s->out_hopid = 11;
     s->ring_size = 64; s->throttling = 8192;
     s->cfg_rx_napi = 0; s->cfg_spin_us = 0; s->cfg_open_timeout_ms = -1;
+    s->cfg_latency_qos_us = -1;
     s->irq_cpu = -1;
     mutex_init(&s->lock); mutex_init(&s->rx_lock);
     list_add_tail(&s->list, &e->sg.dev_list);
@@ -543,4 +544,59 @@ static void resume_failure_at_every_step(void)
         unplug_and_remove(&e, 0);
         assert(!atomic_load(&stream_refs) && !atomic_load(&dev_refs));
     }
+}
+
+/* 0042: an open host stream holds one CPU latency request while its rings
+ * run: from a successful start to the stop of the last close, a suspend or
+ * a detach. A failed open or resume holds none. */
+static void latency_qos_follows_rings(void)
+{
+    struct endpoint e;
+    struct file second;
+
+    qos_live = qos_adds = 0;
+    endpoint_init(&e, 0);
+    assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+    assert(!qos_live && !qos_adds);                 /* default: none */
+    assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+
+    e.dev.cfg_latency_qos_us = 20;
+    assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+    assert(qos_live == 1 && e.dev.qos.active && e.dev.qos.value == 20);
+    second = (struct file){ 0, &e.dev.misc };
+    assert(tbstream_dev_fops_open(NULL, &second) == 0 && qos_adds == 1);
+    assert(tbstream_dev_fops_release(NULL, &second) == 0 && qos_live == 1);
+    assert(tbstream_dev_fops_release(NULL, &e.file) == 0);
+    assert(!qos_live && !e.dev.qos.active);
+
+    /* The module parameter, clamped to 100 ms; 0 from the endpoint wins. */
+    e.dev.cfg_latency_qos_us = -1;
+    latency_qos_us = 1000000;
+    assert(tbstream_dev_fops_open(NULL, &e.file) == 0);
+    assert(qos_live == 1 && e.dev.qos.value == 100000);
+    /* Suspend stops the rings and drops it; resume takes it again. */
+    assert(tbstream_suspend(&e.svc[0].dev) == 0 && !qos_live);
+    assert(tbstream_resume(&e.svc[0].dev) == 0 && qos_live == 1);
+    assert(tbstream_dev_fops_release(NULL, &e.file) == 0 && !qos_live);
+    e.dev.cfg_latency_qos_us = 0;
+    assert(tbstream_dev_fops_open(NULL, &e.file) == 0 && e.dev.qos.value == 0);
+    assert(tbstream_dev_fops_release(NULL, &e.file) == 0 && !qos_live);
+
+    /* A failed open or resume holds none. */
+    ring_fail_after = 0;
+    assert(tbstream_dev_fops_open(NULL, &e.file) == -ENOMEM && !qos_live);
+    assert(tbstream_dev_fops_open(NULL, &e.file) == 0 && qos_live == 1);
+    assert(tbstream_suspend(&e.svc[0].dev) == 0 && !qos_live);
+    ring_fail_after = 0;
+    assert(tbstream_resume(&e.svc[0].dev) < 0 && !qos_live);
+    close_stale_file(&e);
+
+    /* Detach with the file open drops it. */
+    assert(tbstream_dev_fops_open(NULL, &e.file) == 0 && qos_live == 1);
+    unplug_and_remove(&e, 0);
+    assert(e.dev.detached && !qos_live);
+    assert_rings_gone(&e);
+    close_stale_file(&e);
+    latency_qos_us = -1;
+    assert(!atomic_load(&stream_refs) && !atomic_load(&dev_refs));
 }

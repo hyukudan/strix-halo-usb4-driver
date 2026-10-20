@@ -565,6 +565,20 @@ static void *tb_service_get_drvdata(struct tb_service *svc) { return svc->drvdat
 static bool rx_napi;
 static unsigned int spin_us;
 static unsigned int open_timeout_ms = 30000;
+static int latency_qos_us = -1;
+/* CPU latency QoS requests (0042): one per open host stream at most. */
+struct pm_qos_request { bool active; int value; };
+static int qos_live, qos_adds;
+static bool cpu_latency_qos_request_active(struct pm_qos_request *r) { return r->active; }
+static void cpu_latency_qos_add_request(struct pm_qos_request *r, int v)
+{
+    assert(!r->active); r->active = true; r->value = v; ++qos_live; ++qos_adds;
+}
+static void cpu_latency_qos_update_request(struct pm_qos_request *r, int v) { assert(r->active); r->value = v; }
+static void cpu_latency_qos_remove_request(struct pm_qos_request *r)
+{
+    assert(r->active); memset(r, 0, sizeof(*r)); --qos_live;
+}
 /* Module parameter plumbing for the spin_us setter. */
 struct kernel_param { unsigned int *arg; };
 static int kstrtouint(const char *s, unsigned int base, unsigned int *res)

@@ -70,6 +70,7 @@ static void destroy_workqueue(struct workqueue_struct *w) { assert(w && workqueu
 #define min_t(t,a,b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
 #ifndef max
 #define max(a,b) ((a) > (b) ? (a) : (b))
+#define min(a, b) ((a) < (b) ? (a) : (b))
 #endif
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
@@ -427,7 +428,34 @@ struct tb_xdomain { struct tb *tb;uuid_t *local_uuid,*remote_uuid;struct device 
 struct tb_service { struct device dev;struct tb_xdomain *xd; };
 struct tbstream { struct tb_service *svc; };
 struct tbstream_gpu_context;
-struct tbstream_dev { struct mutex lock;struct tbstream *stream;struct { struct tb_ring *ring; } tx_ring,rx_ring;struct tbstream_gpu_context *gpu_context;unsigned ring_size,throttling,in_hopid,out_hopid;bool busy_poll,rx_napi,removed,gpu_direct;u64 gpu_last_epoch;int wait,refs,users;int cfg_gpu_poll; };
+struct tbstream_dev { struct mutex lock;struct tbstream *stream;struct { struct tb_ring *ring; } tx_ring,rx_ring;struct tbstream_gpu_context *gpu_context;unsigned ring_size,throttling,in_hopid,out_hopid;bool busy_poll,rx_napi,removed,gpu_direct;u64 gpu_last_epoch;int wait,refs,users;int cfg_gpu_poll;int cfg_latency_qos_us; };
+/* CPU latency QoS: the core's request API, and stream.c's helpers verbatim. */
+struct pm_qos_request { bool active; int value; };
+static int qos_live, qos_adds, latency_qos_us = -1;
+#define TBSTREAM_DEV_MAX_QOS_US 100000
+static bool cpu_latency_qos_request_active(struct pm_qos_request *r) { return r->active; }
+static void cpu_latency_qos_add_request(struct pm_qos_request *r, int v) { assert(!r->active); r->active = true; r->value = v; ++qos_live; ++qos_adds; }
+static void cpu_latency_qos_update_request(struct pm_qos_request *r, int v) { assert(r->active); r->value = v; }
+static void cpu_latency_qos_remove_request(struct pm_qos_request *r) { assert(r->active); memset(r, 0, sizeof(*r)); --qos_live; }
+static int tbstream_qos_acquire(struct tbstream_dev *sdev, struct pm_qos_request *req)
+{
+	int us = sdev->cfg_latency_qos_us < 0 ? READ_ONCE(latency_qos_us) :
+		 sdev->cfg_latency_qos_us;
+
+	if (us < 0)
+		return -1;
+	us = min(us, TBSTREAM_DEV_MAX_QOS_US);
+	if (cpu_latency_qos_request_active(req))
+		cpu_latency_qos_update_request(req, us);
+	else
+		cpu_latency_qos_add_request(req, us);
+	return us;
+}
+static void tbstream_qos_release(struct pm_qos_request *req)
+{
+	if (cpu_latency_qos_request_active(req))
+		cpu_latency_qos_remove_request(req);
+}
 static struct tb_xdomain *tbstream_dev_xdomain(struct tbstream_dev *s) { return s->stream?s->stream->svc->xd:NULL; }
 static struct tbstream *tbstream_get(struct tbstream *s) { return s; }
 static void tbstream_put(struct tbstream *s) { (void)s; }

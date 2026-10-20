@@ -22,6 +22,7 @@ static void host_init(struct host *h, unsigned int ring_size)
         s->in_hopid = 8 + 2 * i; s->out_hopid = 9 + 2 * i;
         s->ring_size = ring_size; s->throttling = 8192;
         s->cfg_rx_napi = -1; s->cfg_spin_us = -1; s->irq_cpu = -1;
+        s->cfg_latency_qos_us = -1;
         mutex_init(&s->lock); mutex_init(&s->rx_lock);
     }
 }
@@ -49,6 +50,7 @@ static void assert_nothing_held(void)
     assert(!tunnel_count());
     assert(!atomic_load(&live_rings) && !atomic_load(&live_arrays));
     assert(!atomic_load(&live_pages) && !atomic_load(&live_mappings));
+    assert(!qos_live);
 }
 
 /* cluster1, 2026-10-19: an order-4 allocation failed during open() and every
@@ -274,6 +276,7 @@ int main(int argc, char **argv)
         { "spin_us_parameter_is_bounded", spin_us_parameter_is_bounded },
         { "damaged_close_is_not_eof", damaged_close_is_not_eof },
         { "resume_failure_at_every_step", resume_failure_at_every_step },
+        { "latency_qos_follows_rings", latency_qos_follows_rings },
     };
 
     assert(argc == 2);
