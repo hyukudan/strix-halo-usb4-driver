@@ -4,6 +4,7 @@
  * 7e8284575dffb10b0d4da87786e2a7481024f673. Transport structs/list are doubles;
  * tb_tunnel_match_dma below is copied from that upstream implementation. */
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -13,12 +14,13 @@ struct tb_path_hop { struct tb_port *in_port,*out_port;int in_hop_index,next_hop
 struct tb_path { int path_length;struct tb_path_hop hops[2]; };
 struct tb_tunnel { struct tb_tunnel *next;bool dma;int npaths;struct tb_path *paths[2]; };
 struct tb_cm { struct tb_tunnel *tunnel_list; };
-struct tb { bool lock;struct tb_cm cm; };
+struct tb { bool lock;void *root_switch;struct tb_cm cm; };
 static struct tb_cm *tb_priv(struct tb *tb) {return &tb->cm;}
 static bool tb_tunnel_is_dma(const struct tb_tunnel *t) {return t->dma;}
 static bool tb_port_is_nhi(const struct tb_port *p) {return p && p->nhi;}
 #define lockdep_assert_held(l) assert(*(l))
 #define list_for_each_entry(t,h,member) for((t)=*(h);(t);(t)=(t)->next)
+#define list_empty(h) (!*(h))
 static bool tb_tunnel_match_dma(const struct tb_tunnel *tunnel, int transmit_path,
                               int transmit_ring, int receive_path, int receive_ring)
 {
@@ -57,7 +59,7 @@ static bool tb_tunnel_match_dma(const struct tb_tunnel *tunnel, int transmit_pat
 }
 #include "dma_path_query.h"
 static void query_filters(void) {
-    struct tb tb={.lock=true};
+    struct tb tb={.lock=true,.root_switch=&tb};
     struct tb_port nhi={true},port={false};
     struct tb_path tx={.path_length=2,.hops={{&nhi,&port,2,7},{&port,&port,7,9}}};
     struct tb_path rx={.path_length=2,.hops={{&port,&port,8,7},{&port,&nhi,7,3}}};
@@ -87,7 +89,7 @@ static void query_filters(void) {
     assert(tb_dma_paths_busy(&tb,2,3)==0);
 }
 static void list_scan(void) {
-    struct tb tb={.lock=true};struct tb_port nhi={true},port={false};
+    struct tb tb={.lock=true,.root_switch=&tb};struct tb_port nhi={true},port={false};
     struct tb_path rx={.path_length=1,.hops={{&port,&nhi,9,33}}};
     struct tb_tunnel tail={.dma=true,.npaths=1,.paths={&rx}};
     struct tb_tunnel middle={.dma=true,.next=&tail};
@@ -98,10 +100,24 @@ static void list_scan(void) {
     assert(tb_dma_paths_busy(&tb,2,33)==0);
     assert(tb_dma_paths_busy(&tb,-1,-1)==1);
 }
+/* Review of E3: the Gen3 retrain must see every tunnel, not only DMA ones. */
+static void any_tunnel(void) {
+    struct tb tb={.lock=true,.root_switch=&tb};
+    struct tb_tunnel pcie={.dma=false},dma={.dma=true};
+    assert(tb_tunnels_active(&tb)==0);
+    tb.cm.tunnel_list=&pcie;
+    assert(tb_tunnels_active(&tb)==1);
+    assert(tb_dma_paths_busy(&tb,-1,-1)==0); /* invisible to the DMA query */
+    tb.cm.tunnel_list=&dma;
+    assert(tb_tunnels_active(&tb)==1);
+    tb.root_switch=NULL;tb.cm.tunnel_list=NULL;
+    assert(tb_tunnels_active(&tb)==-ENODEV); /* after tb_stop(): no answer */
+}
 int main(int argc,char **argv) {
     assert(argc==2);
     if(!strcmp(argv[1],"filters"))query_filters();
     else if(!strcmp(argv[1],"list"))list_scan();
+    else if(!strcmp(argv[1],"any_tunnel"))any_tunnel();
     else return 2;
     puts("PASS actual DMA inventory callback");return 0;
 }

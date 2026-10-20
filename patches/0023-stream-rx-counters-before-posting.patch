@@ -1,0 +1,25 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -633,6 +633,12 @@ static int tbstream_dev_alloc_rx_buffers(struct tbstream_dev *sdev)
+ 	if (!sdev->rx_ring.frames)
+ 		return -ENOMEM;
+ 
++	/*
++	 * The paths and the ring are up already: a frame can complete as soon
++	 * as its descriptor is posted, and its callback counts it in prod.
++	 */
++	sdev->rx_ring.cons = 0;
++	sdev->rx_ring.prod = 0;
+ 	for (i = 0; i < ring_size; i++) {
+ 		struct device *dma_dev = tb_ring_dma_device(sdev->rx_ring.ring);
+ 		struct tbstream_frame *sf = &sdev->rx_ring.frames[i];
+@@ -657,8 +663,6 @@ static int tbstream_dev_alloc_rx_buffers(struct tbstream_dev *sdev)
+ 		tb_ring_rx(sdev->rx_ring.ring, &sf->frame);
+ 	}
+ 
+-	sdev->rx_ring.cons = 0;
+-	sdev->rx_ring.prod = 0;
+ 	return 0;
+ }
+ 

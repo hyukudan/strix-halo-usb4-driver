@@ -29,6 +29,8 @@ static void rcu_read_unlock(void) { assert(!pthread_rwlock_unlock(&test_rcu_lock
 static void test_kfree_rcu(void *p) { assert(!pthread_rwlock_wrlock(&test_rcu_lock)); free(p); assert(!pthread_rwlock_unlock(&test_rcu_lock)); }
 #define kfree_rcu(ptr, field) test_kfree_rcu(ptr)
 #define TB_DMA_DOMAIN_QUIESCING 1UL
+#define TB_DMA_DOMAIN_DMA_REVOKED 3UL
+#define TB_DMA_DOMAIN_ABANDONED 4UL
 #define TB_DMA_RESET_WITH_NETWORK 1U
 #define NOTIFY_DONE 0
 #define NOTIFY_OK 1
@@ -91,6 +93,12 @@ static int kstrtouint(const char *s, unsigned int base, unsigned int *out) {
     if (*end && *end!='\n') return -EINVAL;
     *out=v; return 0;
 }
+static int kstrtobool(const char *s, bool *out) {
+    if (!s || !*s) return -EINVAL;
+    if (*s=='1'||*s=='y'||*s=='Y') { *out=true; return 0; }
+    if (*s=='0'||*s=='n'||*s=='N') { *out=false; return 0; }
+    return -EINVAL;
+}
 static int alloc_fail_after=-1;
 static void (*allocation_hook)(void);
 static void *kzalloc(size_t n, int flags) {
@@ -122,7 +130,18 @@ static void mutex_init(struct mutex *m) { assert(!pthread_mutex_init(&m->m,NULL)
 static void mutex_lock(struct mutex *m) { assert(!pthread_mutex_lock(&m->m)); }
 static int mutex_lock_interruptible(struct mutex *m) { mutex_lock(m); return 0; }
 static void mutex_unlock(struct mutex *m) { assert(!pthread_mutex_unlock(&m->m)); }
-static bool mutex_trylock(struct mutex *m) { return !pthread_mutex_trylock(&m->m); }
+/* Fault injection: the trylock of trylock_fail fails once, after
+ * trylock_fail_skip successful ones (a holder appearing in between). */
+static struct mutex *trylock_fail;
+static int trylock_fail_skip;
+static bool mutex_trylock(struct mutex *m)
+{
+    if (m == trylock_fail && trylock_fail_skip-- == 0) {
+        trylock_fail = NULL;
+        return false;
+    }
+    return !pthread_mutex_trylock(&m->m);
+}
 typedef struct mutex spinlock_t;
 #define spin_lock_init mutex_init
 #define spin_lock_irqsave(l,f) do { (f)=0; mutex_lock(l); } while (0)
@@ -287,6 +306,24 @@ static void dma_sync_sgtable_for_device(struct device *d,struct sg_table *t,enum
 #define sg_dma_address(sg) ((sg)->address)
 #define sg_dma_is_swiotlb(sg) ((sg)->bounce)
 static u64 dma_get_mask(struct device *d) { (void)d;return U64_MAX; }
+/* Kernel pages for kernel-validated terminal frames. */
+#define __GFP_ZERO 0x100
+struct page { unsigned char data[4096]; };
+static int page_fail, live_pages, page_syncs;
+static struct page *alloc_page(int flags) {
+    assert(flags & __GFP_ZERO); assert(!signalling_depth);
+    if (page_fail) { page_fail=0; return NULL; }
+    ++live_pages; return calloc(1, sizeof(struct page));
+}
+static void __free_page(struct page *p) { assert(live_pages>0); --live_pages; free(p); }
+static void *page_address(struct page *p) { return p->data; }
+static dma_addr_t dma_map_page(struct device *d,struct page *p,size_t o,size_t n,enum dma_data_direction dir) { (void)d;(void)o;(void)n;(void)dir;return (dma_addr_t)(uintptr_t)p; }
+static int dma_mapping_error(struct device *d,dma_addr_t a) { (void)d;return !a; }
+static void dma_unmap_page(struct device *d,dma_addr_t a,size_t n,enum dma_data_direction dir) { (void)d;(void)a;(void)n;(void)dir; }
+static void dma_sync_single_for_cpu(struct device *d,dma_addr_t a,size_t n,enum dma_data_direction dir) { (void)d;(void)a;(void)n;(void)dir;++page_syncs; }
+static void dma_sync_single_for_device(struct device *d,dma_addr_t a,size_t n,enum dma_data_direction dir) { (void)d;(void)a;(void)n;(void)dir;++page_syncs; }
+static int terminal_warnings;
+#define pr_warn_ratelimited(...) (++terminal_warnings, (void)0)
 static bool dma_need_sync(struct device *d,dma_addr_t a) { (void)d;(void)a;return need_sync; }
 
 typedef struct { unsigned char b[16]; } uuid_t;
@@ -337,6 +374,8 @@ static int __tb_ring_enqueue_list(struct tb_ring *r,struct list_head *frames) {
 }
 struct tb_cm_ops { void *driver_ready; };
 struct tb { struct tb_nhi *nhi;struct tb_cm_ops *cm_ops;struct device dev; };
+static unsigned retained_reports;
+static void tb_domain_dma_retained(struct tb *tb) { (void)tb; ++retained_reports; }
 struct tb_xdomain { struct tb *tb;uuid_t *local_uuid,*remote_uuid;struct device dev;u64 route;bool is_unplugged; };
 struct tb_service { struct device dev;struct tb_xdomain *xd; };
 struct tbstream { struct tb_service *svc; };
@@ -347,6 +386,9 @@ static struct tbstream *tbstream_get(struct tbstream *s) { return s; }
 static void tbstream_put(struct tbstream *s) { (void)s; }
 static void tbstream_dev_get(struct tbstream_dev *s) { ++s->refs; }
 static void tbstream_dev_put(struct tbstream_dev *s) { assert(s->refs > 0); --s->refs; }
+static void tbstream_dev_irq_affinity(struct tbstream_dev *s) { (void)s; }
+static int affinity_restores;
+static void tbstream_dev_irq_affinity_restore(struct tbstream_dev *s) { (void)s; ++affinity_restores; }
 static int tbstream_dev_valid(struct tbstream_dev *s) { return (!s->stream||s->removed)?-ENODEV:0; }
 static struct tbstream_dev *to_tbstream_dev(void *p) { return p; }
 static int reset_error, reset_calls;

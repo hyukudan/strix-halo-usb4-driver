@@ -1,0 +1,218 @@
+diff --git a/drivers/thunderbolt/dma_path_query.h b/drivers/thunderbolt/dma_path_query.h
+--- a/drivers/thunderbolt/dma_path_query.h
++++ b/drivers/thunderbolt/dma_path_query.h
+@@ -28,4 +28,15 @@ static int tb_dma_paths_busy(struct tb *tb, int transmit_ring, int receive_ring)
+ 	}
+ 	return 0;
+ }
++
++/* Any tunnel at all, not only DMA ones: 1 when there is one, 0 when none. */
++static int tb_tunnels_active(struct tb *tb)
++{
++	struct tb_cm *tcm = tb_priv(tb);
++
++	lockdep_assert_held(&tb->lock);
++	if (!tb->root_switch)
++		return -ENODEV;
++	return !list_empty(&tcm->tunnel_list);
++}
+ #endif
+diff --git a/drivers/thunderbolt/dma_recovery.c b/drivers/thunderbolt/dma_recovery.c
+--- a/drivers/thunderbolt/dma_recovery.c
++++ b/drivers/thunderbolt/dma_recovery.c
+@@ -459,20 +459,28 @@ static void tb_domain_teardown_reset_work(struct work_struct *work)
+ }
+ 
+ /**
+- * tb_nhi_data_rings_idle() - Whether no data ring is allocated on @nhi
++ * tb_nhi_dma_exclusive_begin() - Keep @nhi free of data rings for a while
+  * @nhi: Host interface
+  *
+- * Return: %true when only the control ring is allocated.
++ * The admission of the DMA reset: when no data ring is allocated, sets
++ * dma_resetting, which makes ring allocation and ring start refuse new data
++ * rings until tb_nhi_dma_exclusive_end().
++ *
++ * Return: %0 on success, %-EBUSY when a data ring exists or a reset is in
++ * progress, %-ENODEV when the NHI is going away.
+  */
+-bool tb_nhi_data_rings_idle(struct tb_nhi *nhi)
++int tb_nhi_dma_exclusive_begin(struct tb_nhi *nhi)
+ {
+-	unsigned long flags;
+-	bool idle;
++	return nhi_dma_reset_group_begin(nhi, NULL, 0);
++}
+ 
+-	spin_lock_irqsave(&nhi->lock, flags);
+-	idle = nhi_data_rings_freed(nhi);
+-	spin_unlock_irqrestore(&nhi->lock, flags);
+-	return idle;
++/**
++ * tb_nhi_dma_exclusive_end() - Allow data rings on @nhi again
++ * @nhi: Host interface
++ */
++void tb_nhi_dma_exclusive_end(struct tb_nhi *nhi)
++{
++	nhi_dma_reset_end(nhi);
+ }
+ 
+ /**
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -3381,6 +3381,7 @@ static const struct tb_cm_ops tb_cm_ops = {
+ 	.approve_xdomain_paths = tb_approve_xdomain_paths,
+ 	.disconnect_xdomain_paths = tb_disconnect_xdomain_paths,
+ 	.dma_paths_busy = tb_dma_paths_busy,
++	.tunnels_active = tb_tunnels_active,
+ };
+ 
+ /*
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -512,6 +512,9 @@ struct tb_path {
+  * @dma_paths_busy: Optional DMA tunnel inventory: whether a DMA tunnel still
+  *		    uses the given rings (-1 for any), see
+  *		    tb_domain_dma_paths_busy()
++ * @tunnels_active: Optional, called with the domain lock held: whether the
++ *		    CM has any tunnel (PCIe, USB3, DP or DMA); negative when
++ *		    it cannot tell
+  */
+ struct tb_cm_ops {
+ 	int (*driver_ready)(struct tb *tb);
+@@ -548,6 +551,7 @@ struct tb_cm_ops {
+ 	/* Called with tb->lock held. 0 absent, 1 busy, negative unknown.
+ 	 * Matching either positive ring is sufficient; both -1 means any DMA. */
+ 	int (*dma_paths_busy)(struct tb *tb, int transmit_ring, int receive_ring);
++	int (*tunnels_active)(struct tb *tb);
+ 	int (*usb4_switch_op)(struct tb_switch *sw, u16 opcode, u32 *metadata,
+ 			      u8 *status, const void *tx_data, size_t tx_data_len,
+ 			      void *rx_data, size_t rx_data_len);
+@@ -791,7 +795,8 @@ void tb_domain_schedule_teardown_reset(struct tb *tb);
+ void tb_domain_teardown_reset_stop(struct tb *tb, bool removal);
+ void tb_domain_teardown_reset_resume(struct tb *tb);
+ void tb_nhi_ring_freed(struct tb_nhi *nhi);
+-bool tb_nhi_data_rings_idle(struct tb_nhi *nhi);
++int tb_nhi_dma_exclusive_begin(struct tb_nhi *nhi);
++void tb_nhi_dma_exclusive_end(struct tb_nhi *nhi);
+ int tb_domain_suspend_noirq(struct tb *tb);
+ int tb_domain_resume_noirq(struct tb *tb);
+ int tb_domain_suspend(struct tb *tb);
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -1489,33 +1489,31 @@ static int tb_xdomain_link_state_change(struct tb_xdomain *xd,
+ /*
+  * Opt-in Gen3 recovery for a new connection that trained below Gen3, run
+  * before its properties are read: no service of this XDomain exists yet.
+- * Only when the local lane adapter supports and targets Gen3 and the local
+- * port advertises Gen3 Support in LINK_CONF; without that bit the limit is
+- * the port or its retimers and a retrain cannot help. Never with a DMA
+- * tunnel in the domain or a data ring on the NHI, never waiting for the
+- * domain lock, at most gen3_retrain resets per port until it trains at
+- * Gen3. Returns -ECONNRESET after a port reset: the handshake starts over
+- * (or the unplug that follows removes the XDomain).
++ * Called with the domain lock held, which serializes the sideband mailbox
++ * (as debugfs does) and the CM tunnel inventory. Only when the local lane
++ * adapter supports and targets Gen3 and the local port advertises Gen3
++ * Support in LINK_CONF; without that bit the limit is the port or its
++ * retimers and a retrain cannot help. Never with any tunnel in the CM, and
++ * the NHI is kept free of data rings (the DMA reset admission) from the
++ * check until the reset is done. At most gen3_retrain resets per port until
++ * it trains at Gen3. Returns -ECONNRESET after a port reset: the handshake
++ * starts over (or the unplug that follows removes the XDomain).
+  */
+-static int tb_xdomain_maybe_retrain_gen3(struct tb_xdomain *xd)
++static int __tb_xdomain_maybe_retrain_gen3(struct tb_xdomain *xd, struct tb_port *port,
++					   unsigned int max)
+ {
+-	unsigned int max = min_t(unsigned int, READ_ONCE(gen3_retrain),
+-				 XDOMAIN_GEN3_RETRAIN_MAX);
+ 	struct tb *tb = xd->tb;
+-	struct tb_port *port;
+ 	u32 cs0, cs1, link_conf = 0;
+ 	int gen, ret;
+ 
+-	port = tb_xdomain_downstream_port(xd);
+-	if (!port || !port->cap_usb4 || !port->cap_phy)
+-		return 0;
++	lockdep_assert_held(&tb->lock);
+ 	gen = tb_port_get_link_generation(port);
+ 	if (gen < 0)
+ 		return 0;
+ 	if (gen >= 3) {
+ 		if (port->gen3_retrains) {
+ 			dev_info(&xd->dev, "link trained at Gen%d after %u Gen3 retrain(s)\n",
+-				 gen, min(port->gen3_retrains, max));
++				 gen, min(port->gen3_retrains, max ?: XDOMAIN_GEN3_RETRAIN_MAX));
+ 			port->gen3_retrains = 0;
+ 		}
+ 		return 0;
+@@ -1554,24 +1552,23 @@ static int tb_xdomain_maybe_retrain_gen3(struct tb_xdomain *xd)
+ 			 gen, link_conf);
+ 		return 0;
+ 	}
+-	/* The CM may be removing this XDomain under the lock: never wait */
+-	if (!mutex_trylock(&tb->lock)) {
+-		dev_info(&xd->dev, "link at Gen%d, domain lock busy, not retraining\n", gen);
++	/* Any tunnel, not only DMA ones; a CM that cannot tell is a veto */
++	if (!tb->cm_ops->tunnels_active || tb->cm_ops->tunnels_active(tb)) {
++		dev_info(&xd->dev, "link at Gen%d, tunnels in the domain, not retraining\n", gen);
+ 		return 0;
+ 	}
+-	/* The CM inventory under the lock held here: 0 is an affirmative idle */
+-	if (!tb->cm_ops->dma_paths_busy || tb->cm_ops->dma_paths_busy(tb, -1, -1) ||
+-	    !tb_nhi_data_rings_idle(tb->nhi)) {
+-		mutex_unlock(&tb->lock);
+-		dev_info(&xd->dev, "link at Gen%d, DMA tunnels or rings in use, not retraining\n",
+-			 gen);
++	/* From here to the end of the reset no data ring can be allocated or started */
++	ret = tb_nhi_dma_exclusive_begin(tb->nhi);
++	if (ret) {
++		dev_info(&xd->dev, "link at Gen%d, host interface rings in use (%d), not retraining\n",
++			 gen, ret);
+ 		return 0;
+ 	}
+ 	port->gen3_retrains++;
+ 	dev_info(&xd->dev, "link at Gen%d although both lane adapter and port advertise Gen3: port reset, retrain %u of %u\n",
+ 		 gen, port->gen3_retrains, max);
+ 	ret = usb4_port_reset(port);
+-	mutex_unlock(&tb->lock);
++	tb_nhi_dma_exclusive_end(tb->nhi);
+ 	if (ret) {
+ 		dev_warn(&xd->dev, "port reset for a Gen3 retrain failed (%d)\n", ret);
+ 		return 0;
+@@ -1579,6 +1576,31 @@ static int tb_xdomain_maybe_retrain_gen3(struct tb_xdomain *xd)
+ 	return -ECONNRESET;
+ }
+ 
++static int tb_xdomain_maybe_retrain_gen3(struct tb_xdomain *xd)
++{
++	unsigned int max = min_t(unsigned int, READ_ONCE(gen3_retrain),
++				 XDOMAIN_GEN3_RETRAIN_MAX);
++	struct tb *tb = xd->tb;
++	struct tb_port *port;
++	int ret;
++
++	port = tb_xdomain_downstream_port(xd);
++	if (!port || !port->cap_usb4 || !port->cap_phy)
++		return 0;
++	/* Off and nothing to report: no register access at all */
++	if (!max && !port->gen3_retrains)
++		return 0;
++	/* Before any port or sideband access. The CM may be removing this
++	 * XDomain under the lock while cancelling this work: never wait. */
++	if (!mutex_trylock(&tb->lock)) {
++		dev_info(&xd->dev, "domain lock busy, Gen3 retrain check skipped\n");
++		return 0;
++	}
++	ret = __tb_xdomain_maybe_retrain_gen3(xd, port, max);
++	mutex_unlock(&tb->lock);
++	return ret;
++}
++
+ /*
+  * Lower UUID side: bond the lanes. A failure is retried a bounded number of
+  * times (lane 1 may come up late), then reported; enumeration continues

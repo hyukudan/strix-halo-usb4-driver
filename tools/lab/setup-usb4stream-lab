@@ -1,0 +1,76 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Prepare two USB4STREAM channels per USB4 port and publish the layout.
+
+Run as root by usb4stream-lab.service. Configures the same configfs groups as
+the original lab script (services 0-2.0 and 1-2.0, streams data0/data1), then
+calls usb4stream-describe to write /run/usb4stream-layout.json (version 2:
+original per-stream keys plus link/remote/topology information). If describe
+is missing or fails, the version-1 layout is written so consumers keep working.
+"""
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
+ROOT = pathlib.Path('/sys/kernel/config/thunderbolt/stream')
+LAYOUT = pathlib.Path('/run/usb4stream-layout.json')
+SERVICES = ['0-2.0', '1-2.0']
+STREAMS = ('data0', 'data1')
+SETTINGS = [('ring_size', '1024'), ('throttling', '8192'), ('busy_poll', '0'),
+            ('gpu_direct', '0'), ('in_hopid', '-1'), ('out_hopid', '-1')]
+
+
+def find_describe():
+    here = pathlib.Path(__file__).resolve().parent
+    for candidate in (here / 'usb4stream-describe', here / 'usb4stream_describe.py'):
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which('usb4stream-describe')
+
+
+def write_atomic(path, text):
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def main():
+    subprocess.run(['modprobe', 'thunderbolt-stream'], check=True)
+    layout = {}
+    for name in STREAMS:
+        for service in SERVICES:
+            group = ROOT / service
+            group.mkdir(exist_ok=True)
+            stream = group / name
+            stream.mkdir(exist_ok=True)
+            for key, val in SETTINGS:
+                path = stream / key
+                # Keep hop IDs that were already negotiated with the peer.
+                if key.endswith('hopid') and path.read_text().strip() not in ('0', '-1'):
+                    continue
+                path.write_text(val + '\n')
+            layout[service + '/' + name] = {
+                'device': '/dev/tbstream' + (stream / 'index').read_text().strip(),
+                'configfs': str(stream)}
+
+    describe = find_describe()
+    if describe:
+        result = subprocess.run([sys.executable, describe, '--logs', '--output', str(LAYOUT),
+                                 '--summary'], text=True, capture_output=True)
+        if result.returncode == 0:
+            print(result.stdout, end='')
+            return 0
+        print(f'usb4stream-describe failed ({result.returncode}): {result.stderr.strip()}; '
+              'writing the version-1 layout', file=sys.stderr)
+    else:
+        print('usb4stream-describe not found; writing the version-1 layout', file=sys.stderr)
+    write_atomic(LAYOUT, json.dumps(layout, indent=2))
+    print(json.dumps(layout, indent=2))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

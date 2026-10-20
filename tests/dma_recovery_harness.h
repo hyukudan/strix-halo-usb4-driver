@@ -9,9 +9,12 @@
 #include <string.h>
 #include <pthread.h>
 typedef uint32_t u32;
+typedef uint16_t u16;
 #define TB_DMA_RESET_MAX_RINGS 32U
 #define TB_DMA_DOMAIN_QUIESCING 1UL
 #define TB_DMA_GROUP_RECOVERY 2UL
+#define TB_DMA_DOMAIN_DMA_REVOKED 3UL
+#define TB_DMA_DOMAIN_ABANDONED 4UL
 #define TB_DMA_RESET_WITH_NETWORK 1U
 struct notifier_block { int unused; };
 struct blocking_notifier_head { int unused; };
@@ -19,7 +22,15 @@ struct blocking_notifier_head { int unused; };
 static int blocking_notifier_chain_register(struct blocking_notifier_head *h, struct notifier_block *n) { (void)h;(void)n;return 0; }
 static int blocking_notifier_chain_unregister(struct blocking_notifier_head *h, struct notifier_block *n) { (void)h;(void)n;return 0; }
 static unsigned core_notify_calls;
-static int blocking_notifier_call_chain(struct blocking_notifier_head *h,unsigned long event, void *data) { (void)h;assert(event==TB_DMA_DOMAIN_QUIESCING || event==TB_DMA_GROUP_RECOVERY);assert(data);++core_notify_calls;return 0; }
+static unsigned long core_events[8];
+struct tb;
+static void (*teardown_consumer)(unsigned long event, struct tb *tb);
+static int blocking_notifier_call_chain(struct blocking_notifier_head *h,unsigned long event, void *data) {
+    (void)h;assert(event>=TB_DMA_DOMAIN_QUIESCING && event<=TB_DMA_DOMAIN_ABANDONED);assert(data);
+    assert(core_notify_calls<8);core_events[core_notify_calls++]=event;
+    if (teardown_consumer && event!=TB_DMA_GROUP_RECOVERY) teardown_consumer(event,data);
+    return 0;
+}
 #define BIT(n) (1U << (n))
 #define FIELD_GET(mask,v) (((v) & (mask)) >> __builtin_ctz(mask))
 #define REG_CAPS 0x39640
@@ -38,6 +49,51 @@ static int blocking_notifier_call_chain(struct blocking_notifier_head *h,unsigne
 #define PCI_DEVICE_ID_AMD_1AH_M70H_NHI0 10
 #define PCI_DEVICE_ID_AMD_1AH_M70H_NHI1 11
 #define READ_ONCE(x) (x)
+#define WRITE_ONCE(x,v) ((x)=(v))
+/* The last message of each level, so cases can check what dmesg would say. */
+static char last_info[256], last_warn[256], last_err[256];
+static int infos, warns, errs;
+#define dev_info(d, ...) ((void)(d), ++infos, snprintf(last_info, sizeof(last_info), __VA_ARGS__))
+#define dev_warn(d, ...) ((void)(d), ++warns, snprintf(last_warn, sizeof(last_warn), __VA_ARGS__))
+#define dev_err(d, ...) ((void)(d), ++errs, snprintf(last_err, sizeof(last_err), __VA_ARGS__))
+#define dev_dbg(d, ...) ((void)(d))
+#define module_param(name, type, perm)
+#define MODULE_PARM_DESC(name, desc)
+#define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+/* Delayed work: queued with a delay, run explicitly by the cases. */
+struct work_struct { int unused; };
+struct workqueue_struct { int unused; };
+struct delayed_work { struct work_struct work; void (*func)(struct work_struct *); bool pending; unsigned delay_ms; struct workqueue_struct *wq; };
+static unsigned queued_delays[32], nqueued;
+#define msecs_to_jiffies(ms) (ms)
+static struct delayed_work *to_delayed_work(struct work_struct *w) { return container_of(w, struct delayed_work, work); }
+static bool queue_delayed_work(struct workqueue_struct *wq, struct delayed_work *w, unsigned delay)
+{
+    if (w->pending) return false;
+    w->pending = true; w->delay_ms = delay; w->wq = wq;
+    assert(nqueued < 32); queued_delays[nqueued++] = delay;
+    return true;
+}
+static bool mod_delayed_work(struct workqueue_struct *wq, struct delayed_work *w, unsigned delay)
+{
+    bool was = w->pending;
+    w->pending = false;
+    queue_delayed_work(wq, w, delay);
+    return was;
+}
+static bool delayed_work_pending(struct delayed_work *w) { return w->pending; }
+static unsigned cancels;
+static bool cancel_delayed_work_sync(struct delayed_work *w) { bool was = w->pending; w->pending = false; ++cancels; return was; }
+/* Runs the work once if it is queued; returns whether it ran. */
+static bool run_delayed(struct delayed_work *w)
+{
+    if (!w->pending) return false;
+    w->pending = false;
+    w->func(&w->work);
+    return true;
+}
+#define PCI_COMMAND 0x04
+#define PCI_COMMAND_MASTER 0x4
 #define EXPORT_SYMBOL_GPL(x)
 struct mutex { pthread_mutex_t value; };
 typedef struct mutex spinlock_t;
@@ -53,26 +109,51 @@ struct list_head { struct list_head *next, *prev; };
 static void INIT_LIST_HEAD(struct list_head *l) { l->next=l->prev=l; }
 static bool list_empty(const struct list_head *l) { return l->next==l; }
 struct pci_dev;
-struct device { bool registered, pci; struct pci_dev *pdev; };
-struct pci_dev { unsigned vendor, device; bool present; struct device dev; };
+struct device { bool registered, pci; struct pci_dev *pdev; void *drvdata; };
+static void *dev_get_drvdata(const struct device *d) { return d->drvdata; }
+struct pci_dev { unsigned vendor, device; bool present, master, master_stuck, config_fail, relaxed, devctl_fail; struct device dev; };
 struct tb_nhi;
 struct tb_ring { spinlock_t lock; struct tb_nhi *nhi; bool is_tx, running; unsigned hop; struct list_head queue, in_flight; };
-struct tb_nhi { spinlock_t lock; struct device *dev; struct tb_ring *tx_rings[8], *rx_rings[8]; bool going_away, dma_resetting, dma_shutdown; unsigned hop_count; unsigned char *iobase; };
+struct tb_nhi { spinlock_t lock; struct device *dev; struct tb_ring *tx_rings[8], *rx_rings[8]; bool going_away, dma_resetting, dma_shutdown; unsigned dma_retained; bool dma_revoked, dma_abandoned, teardown_reset_pending, teardown_reset_parked, teardown_reset_slow, teardown_reset_suspended; unsigned teardown_reset_gen; unsigned hop_count; unsigned char *iobase; };
 struct tb_ctl { struct tb_nhi *nhi; };
 struct tb;
 struct tb_cm_ops { int (*dma_paths_busy)(struct tb *, int, int); };
-struct tb { struct tb_cm_ops *cm_ops; struct tb_nhi *nhi; struct mutex lock; struct device dev; struct tb_ctl *ctl; };
+struct tb { struct tb_cm_ops *cm_ops; struct tb_nhi *nhi; struct mutex lock; struct device dev; struct tb_ctl *ctl;
+            struct workqueue_struct *wq; struct delayed_work teardown_reset_work; unsigned int teardown_reset_attempts; };
 static bool dev_is_pci(struct device *d) { return d->pci; }
 static struct pci_dev *to_pci_dev(struct device *d) { return d->pdev; }
 static bool device_is_registered(struct device *d) { return d->registered; }
 static bool pci_device_is_present(struct pci_dev *p) { return p->present; }
+static void pci_clear_master(struct pci_dev *p) { if (!p->master_stuck) p->master=false; }
+#define PCI_EXP_DEVCTL 8
+#define PCI_EXP_DEVCTL_RELAX_EN 0x0010
+static int pcie_capability_read_word(struct pci_dev *p, int where, uint16_t *value) {
+    assert(where == PCI_EXP_DEVCTL);
+    if (p->devctl_fail) return -EIO;
+    *value = p->relaxed ? PCI_EXP_DEVCTL_RELAX_EN : 0;
+    return 0;
+}
+static int pci_read_config_word(struct pci_dev *p, int where, uint16_t *value) {
+    assert(where==PCI_COMMAND); if (p->config_fail) return -EIO; *value=p->master?PCI_COMMAND_MASTER:0; return 0;
+}
 static int pm_refs, pm_error, writes, reads, starts, stops;
 static bool broken_readback, broken_control;
 static unsigned char bar[0x40000];
 static u32 caps;
 static int pm_runtime_resume_and_get(struct device *d) { (void)d; if(pm_error)return pm_error; ++pm_refs;return 0; }
 static void pm_runtime_mark_last_busy(struct device *d) { (void)d; }
-static void pm_runtime_put_autosuspend(struct device *d) { (void)d;assert(pm_refs>0);--pm_refs; }
+/* Runs once at the end of the reset, after the domain lock was released:
+ * what another thread may do in that window. */
+static void (*pm_put_hook)(void);
+static void pm_runtime_put_autosuspend(struct device *d)
+{
+    void (*hook)(void) = pm_put_hook;
+
+    (void)d; assert(pm_refs > 0); --pm_refs;
+    pm_put_hook = NULL;
+    if (hook)
+        hook();
+}
 static u32 ioread32(void *address) { assert((unsigned char *)address==bar+REG_CAPS); ++reads;return writes&&broken_readback?~0U:caps; }
 static void iowrite32(u32 value,void *address) { assert(value==1 && (unsigned char *)address==bar+0x39858);++writes; }
 static void usleep_range(unsigned a,unsigned b) { assert(a==10000&&b==20000); }

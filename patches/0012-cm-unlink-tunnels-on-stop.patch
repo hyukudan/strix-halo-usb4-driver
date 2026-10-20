@@ -1,0 +1,34 @@
+diff --git a/drivers/thunderbolt/dma_path_query.h b/drivers/thunderbolt/dma_path_query.h
+--- a/drivers/thunderbolt/dma_path_query.h
++++ b/drivers/thunderbolt/dma_path_query.h
+@@ -8,6 +8,14 @@ static int tb_dma_paths_busy(struct tb *tb, int transmit_ring, int receive_ring)
+ 	struct tb_tunnel *tunnel;
+ 
+ 	lockdep_assert_held(&tb->lock);
++	/*
++	 * After tb_stop() the router tree is gone and every tunnel has been
++	 * unlinked (DMA ones deactivated). An empty inventory is then the
++	 * correct "no DMA path" answer. A non-empty one would be stale: never
++	 * dereference it, report that no proof is available instead.
++	 */
++	if (!tb->root_switch && !list_empty(&tcm->tunnel_list))
++		return -ENODEV;
+ 	list_for_each_entry(tunnel, &tcm->tunnel_list, list) {
+ 		if (!tb_tunnel_is_dma(tunnel))
+ 			continue;
+diff --git a/drivers/thunderbolt/tb.c b/drivers/thunderbolt/tb.c
+--- a/drivers/thunderbolt/tb.c
++++ b/drivers/thunderbolt/tb.c
+@@ -2958,6 +2958,12 @@ static void tb_stop(struct tb *tb)
+ 		 */
+ 		if (tb_tunnel_is_dma(tunnel))
+ 			tb_tunnel_deactivate(tunnel);
++		/*
++		 * The DMA inventory query (tb_dma_paths_busy()) walks this
++		 * list again after stop, from domain retirement. Never
++		 * leave a freed tunnel linked.
++		 */
++		list_del(&tunnel->list);
+ 		tb_tunnel_put(tunnel);
+ 	}
+ 	/*

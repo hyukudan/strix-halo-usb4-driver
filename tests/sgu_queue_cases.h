@@ -246,6 +246,62 @@ static void test_wait_concurrency(void) {
     dma_fence_signal(foreign);dma_fence_put(foreign);
     fixture_close(&f);assert(atomic_load(&module_refs)==0);
 }
+struct mutex_holder { struct mutex *m; atomic_int held; };
+static void *hold_mutex(void *data) {
+    struct mutex_holder *h=data;mutex_lock(h->m);atomic_store(&h->held,1);
+    usleep(200000);mutex_unlock(h->m);return NULL;
+}
+/* Audit A9: O_NONBLOCK SUBMIT/RX_REPOST slept on the device mutex. */
+static void test_nonblock_contended_mutex(void) {
+    struct fixture f;fixture_open(&f,2,64,true);
+    assert(prepare(&f,0,0,1,1,0,4096)==0);
+    struct mutex_holder h={.m=&f.sdev.lock};pthread_t holder;
+    assert(!pthread_create(&holder,NULL,hold_mutex,&h));
+    while(!atomic_load(&h.held))usleep(100);
+    f.file.f_flags=O_NONBLOCK;int before=dma_syncs;
+    assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==-EAGAIN);
+    assert(action(&f,SGU_IOC_RX_REPOST,1,2,1)==-EAGAIN);
+    assert(atomic_load(&h.held)&&dma_syncs==before);
+    assert(!pthread_join(holder,NULL));
+    assert(f.sdev.gpu_context->operations[0][0].fence==NULL);
+    /* Uncontended, the same call publishes. */
+    assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==0);
+    assert(f.sdev.gpu_context->operations[0][0].fence!=NULL);
+    fixture_close(&f);assert(atomic_load(&module_refs)==0);
+}
+/* Review of A9: O_NONBLOCK SUBMIT/RX_REPOST still slept on ctx->dma_lock,
+ * which the watchdog holds while it stops the rings and waits for them. Now
+ * EAGAIN, with no fence published, no operation changed and the fence
+ * sequence untouched. */
+static void test_nonblock_contended_dma_lock(void) {
+    struct fixture f;fixture_open(&f,1,256,true);
+    struct tbstream_gpu_context *ctx=f.sdev.gpu_context;
+    /* An RX slot ready for RX_REPOST, a TX slot ready for SUBMIT. */
+    assert(prepare(&f,0,0,1,1,0,4096)==0);
+    assert(prepare(&f,1,0,2,1,0,8192)==0);assert(action(&f,SGU_IOC_SUBMIT,1,2,1)==0);
+    complete_all(f.sdev.rx_ring.ring);consume_event(&f,1,2,3);
+    struct sgu_hw_operation *tx=&ctx->operations[0][0],*rx=&ctx->operations[1][0];
+    struct dma_fence *rx_fence=rx->fence;
+    u64 tx_seq=ctx->fence_sequence[0][0],rx_seq=ctx->fence_sequence[1][0];
+    struct mutex_holder h={.m=&ctx->dma_lock};pthread_t holder;
+    assert(!pthread_create(&holder,NULL,hold_mutex,&h));
+    while(!atomic_load(&h.held))usleep(100);
+    f.file.f_flags=O_NONBLOCK;int before=dma_syncs;
+    assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==-EAGAIN);
+    assert(action(&f,SGU_IOC_RX_REPOST,1,2,1)==-EAGAIN);
+    assert(atomic_load(&h.held)&&dma_syncs==before); /* returned while it was held */
+    assert(!pthread_join(holder,NULL));
+    assert(!tx->fence&&tx->phase==SGU_OP_PREPARED&&rx->fence==rx_fence&&rx->phase==SGU_OP_TAKEN);
+    assert(ctx->fence_sequence[0][0]==tx_seq&&ctx->fence_sequence[1][0]==rx_seq);
+    /* The publication itself finds it taken after SUBMIT's admission. */
+    trylock_fail=&ctx->dma_lock;trylock_fail_skip=1;
+    assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==-EAGAIN&&!trylock_fail);
+    assert(!tx->fence&&tx->phase==SGU_OP_PREPARED&&ctx->fence_sequence[0][0]==tx_seq&&dma_syncs==before);
+    /* Uncontended, both go through. */
+    assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==0&&tx->fence&&ctx->fence_sequence[0][0]==tx_seq+1);
+    assert(action(&f,SGU_IOC_RX_REPOST,1,2,1)==0&&rx->fence!=rx_fence);
+    fixture_close(&f);assert(atomic_load(&module_refs)==0);
+}
 static void test_wait_retry_and_order(void) {
     struct fixture f;fixture_open(&f,2,64,true);
     struct dma_fence *foreign=foreign_fence(&f.resv[0]);
@@ -341,13 +397,15 @@ static void test_max_queue_reuse(void) {
 #include "sgu_detached_cases.h"
 
 #include "sgu_group_cases.h"
+#include "sgu_teardown_cases.h"
+#include "sgu_terminal_cases.h"
 
 int main(int argc,char **argv) {
     assert(argc==2);
     struct { const char *name; void (*run)(void); } tests[]={
         {"geometry",test_geometry},{"queue",test_queue},{"failure_isolation",test_failure_isolation},
         {"events_legacy",test_events_and_legacy},{"timeout_recovery",test_timeout_recovery},
-        {"wait_concurrency",test_wait_concurrency},{"wait_retry_order",test_wait_retry_and_order},
+        {"wait_concurrency",test_wait_concurrency},{"nonblock_contended_mutex",test_nonblock_contended_mutex},{"nonblock_contended_dma_lock",test_nonblock_contended_dma_lock},{"wait_retry_order",test_wait_retry_and_order},
         {"export_lifetime",test_export_lifetime},{"admission_rollback",test_admission_and_rollback},
         {"watchdog_schedule",test_watchdog_schedule},{"max_queue_reuse",test_max_queue_reuse},
         {"group_success",test_group_success},{"group_rejections",test_group_rejections},
@@ -356,6 +414,12 @@ int main(int argc,char **argv) {
         {"domain_retirement_keeps_unproved_dma",test_domain_retirement_keeps_unproved_dma},
         {"domain_retirement_foreign_domain",test_domain_retirement_foreign_domain},
         {"domain_retirement_concurrent_poll",test_domain_retirement_concurrent_poll},
+        {"domain_revoked_releases_retained",test_domain_revoked_releases_retained},
+        {"domain_abandoned_leaks_safely",test_domain_abandoned_leaks_safely},
+        {"orphan_reaping_after_rmdir",test_orphan_reaping_after_rmdir},
+        {"terminal_header",test_terminal_header},
+        {"terminal_mismatches",test_terminal_mismatches},
+        {"terminal_standby_reuse",test_terminal_standby_reuse},
         {"watchdog_mutex_independence",test_watchdog_mutex_independence},
         {"fence_precedes_event",test_fence_precedes_event},
         {"stop_before_publication",test_stop_before_publication},

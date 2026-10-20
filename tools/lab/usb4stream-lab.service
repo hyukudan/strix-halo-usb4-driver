@@ -1,0 +1,17 @@
+[Unit]
+Description=Prepare two USB4STREAM channels per BOSGAME USB4 port
+After=systemd-modules-load.service
+# Lab kernels only: every build has its own LOCALVERSION under this prefix
+# (tools/check_kconfig.py enforces it). The stock/recovery kernel skips the
+# unit. To tie the lab profile to the one reviewed build, install the drop-in
+# written by tools/lab/reviewed-kernel-dropin <kernelrelease>.
+ConditionKernelVersion=7.3.0-rc5-strix-gpu-bosgame-*
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/setup-usb4stream-lab
+RemainAfterExit=yes
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

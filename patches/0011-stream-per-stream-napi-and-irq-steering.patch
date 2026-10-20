@@ -1,0 +1,186 @@
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -1034,6 +1034,7 @@ static int sgu_arm(struct tbstream_gpu_context *ctx)
+     tb_ring_throttling(ctx->sdev->rx_ring.ring, ctx->sdev->throttling);
+     tb_ring_start(ctx->sdev->tx_ring.ring);
+     tb_ring_start(ctx->sdev->rx_ring.ring);
++    tbstream_dev_irq_affinity(ctx->sdev);
+     WRITE_ONCE(ctx->started, true);
+     spin_lock_irqsave(&ctx->lock, flags);
+     ctx->lifetime.stop_confirmed = 0;
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -9,6 +9,7 @@
+ 
+ #define pr_fmt(fmt) "tbstream: " fmt
+ 
++#include <linux/interrupt.h>
+ #include <linux/delay.h>
+ #include <linux/configfs.h>
+ #include <linux/compat.h>
+@@ -161,6 +162,10 @@ struct tbstream_dev {
+ 	bool busy_poll;
+ 	bool rx_napi;
+ 	bool rx_poll_pending;
++	int cfg_rx_napi;
++	int cfg_spin_us;
++	unsigned int rx_spin_us;
++	int irq_cpu;
+ 	int users;
+ 	bool closed;
+ 	bool removed;
+@@ -329,7 +334,7 @@ static void tbstream_dev_napi_rx(struct tbstream_dev *sdev, bool spin)
+ 		return;
+ 
+ 	WRITE_ONCE(sdev->rx_poll_pending, false);
+-	end = ktime_add_us(ktime_get(), spin ? READ_ONCE(spin_us) : 0);
++	end = ktime_add_us(ktime_get(), spin ? sdev->rx_spin_us : 0);
+ 	for (;;) {
+ 		while ((frame = tb_ring_poll(ring)))
+ 			frame->callback(ring, frame, false);
+@@ -346,6 +351,24 @@ static void tbstream_dev_napi_rx(struct tbstream_dev *sdev, bool spin)
+ 		frame->callback(ring, frame, false);
+ }
+ 
++/*
++ * Ring vectors are requested when a stream is opened, so their CPU is
++ * chosen afresh every time. Keeping the completion interrupt next to the
++ * thread that consumes it avoids cross-CCD wake-ups, which dominate the
++ * latency tail on Strix Halo. Best effort: a failure only loses the hint.
++ */
++static void tbstream_dev_irq_affinity(struct tbstream_dev *sdev)
++{
++	int cpu = READ_ONCE(sdev->irq_cpu);
++
++	if (cpu < 0 || cpu >= nr_cpu_ids || !cpu_online(cpu))
++		return;
++	if (sdev->tx_ring.ring && sdev->tx_ring.ring->irq > 0)
++		irq_set_affinity(sdev->tx_ring.ring->irq, cpumask_of(cpu));
++	if (sdev->rx_ring.ring && sdev->rx_ring.ring->irq > 0)
++		irq_set_affinity(sdev->rx_ring.ring->irq, cpumask_of(cpu));
++}
++
+ static inline struct tb_xdomain *tbstream_dev_xdomain(struct tbstream_dev *sdev)
+ {
+ 	if (sdev->stream)
+@@ -656,7 +679,9 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 	if (sdev->busy_poll)
+ 		flags |= RING_FLAG_NO_INTERRUPT;
+ 
+-	sdev->rx_napi = READ_ONCE(rx_napi) && !sdev->busy_poll;
++	sdev->rx_napi = (sdev->cfg_rx_napi < 0 ? READ_ONCE(rx_napi) : sdev->cfg_rx_napi) &&
++			!sdev->busy_poll;
++	sdev->rx_spin_us = sdev->cfg_spin_us < 0 ? READ_ONCE(spin_us) : sdev->cfg_spin_us;
+ 	sdev->rx_poll_pending = false;
+ 	ring = tb_ring_alloc_tx(xd->tb->nhi, -1, sdev->ring_size, flags);
+ 	if (!ring)
+@@ -693,6 +718,7 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 
+ 	tb_ring_start(sdev->tx_ring.ring);
+ 	tb_ring_start(sdev->rx_ring.ring);
++	tbstream_dev_irq_affinity(sdev);
+ 
+ 	ret = tbstream_dev_alloc_rx_buffers(sdev);
+ 	if (ret)
+@@ -1231,6 +1257,79 @@ tbstream_dev_busy_poll_store(struct config_item *item, const char *buf,
+ }
+ CONFIGFS_ATTR(tbstream_dev_, busy_poll);
+ 
++#define TBSTREAM_DEV_MAX_SPIN_US	1000
++
++static ssize_t tbstream_dev_int_store(struct tbstream_dev *sdev, int *field,
++				      const char *buf, size_t count, int min, int max)
++{
++	int value, ret;
++
++	ret = kstrtoint(buf, 0, &value);
++	if (ret)
++		return ret;
++	if (value < min || value > max)
++		return -EINVAL;
++
++	guard(mutex)(&sdev->lock);
++	if (tbstream_dev_config_busy(sdev))
++		return -EBUSY;
++	*field = value;
++	return count;
++}
++
++static ssize_t tbstream_dev_rx_napi_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return sysfs_emit(buf, "%d\n", sdev->cfg_rx_napi);
++}
++
++/* -1 follows the rx_napi module parameter, 0 disables, 1 enables. */
++static ssize_t tbstream_dev_rx_napi_store(struct config_item *item,
++					  const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return tbstream_dev_int_store(sdev, &sdev->cfg_rx_napi, buf, count, -1, 1);
++}
++CONFIGFS_ATTR(tbstream_dev_, rx_napi);
++
++static ssize_t tbstream_dev_spin_us_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return sysfs_emit(buf, "%d\n", sdev->cfg_spin_us);
++}
++
++/* -1 follows the spin_us module parameter. */
++static ssize_t tbstream_dev_spin_us_store(struct config_item *item,
++					  const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return tbstream_dev_int_store(sdev, &sdev->cfg_spin_us, buf, count, -1,
++				      TBSTREAM_DEV_MAX_SPIN_US);
++}
++CONFIGFS_ATTR(tbstream_dev_, spin_us);
++
++static ssize_t tbstream_dev_irq_cpu_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return sysfs_emit(buf, "%d\n", sdev->irq_cpu);
++}
++
++/* -1 lets the kernel place the ring interrupts. */
++static ssize_t tbstream_dev_irq_cpu_store(struct config_item *item,
++					  const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return tbstream_dev_int_store(sdev, &sdev->irq_cpu, buf, count, -1,
++				      nr_cpu_ids - 1);
++}
++CONFIGFS_ATTR(tbstream_dev_, irq_cpu);
++
+ static ssize_t tbstream_dev_index_show(struct config_item *item, char *buf)
+ {
+ 	struct config_group *group = to_config_group(item);
+@@ -1570,6 +1669,9 @@ CONFIGFS_ATTR_WO(tbstream_dev_, gpu_recover);
+ 
+ static struct configfs_attribute *tbstream_dev_attrs[] = {
+ 	&tbstream_dev_attr_busy_poll,
++	&tbstream_dev_attr_irq_cpu,
++	&tbstream_dev_attr_rx_napi,
++	&tbstream_dev_attr_spin_us,
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+ 	&tbstream_dev_attr_gpu_direct,
+ 	&tbstream_dev_attr_gpu_quarantine,
+@@ -1739,6 +1841,9 @@ tbstream_dev_make_group(struct config_group *group, const char *name)
+ 	sdev->index = index;
+ 	sdev->ring_size = TBSTREAM_DEV_RING_SIZE;
+ 	sdev->throttling = TBSTREAM_DEV_THROTTLING;
++	sdev->cfg_rx_napi = -1;
++	sdev->cfg_spin_us = -1;
++	sdev->irq_cpu = -1;
+ 	mutex_init(&sdev->lock);
+ 	init_waitqueue_head(&sdev->wait);
+ 	INIT_LIST_HEAD(&sdev->list);

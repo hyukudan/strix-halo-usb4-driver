@@ -1,0 +1,38 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -1141,6 +1141,17 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 		sf = tbstream_dev_completed_rx(sdev);
+ 		if (!sf)
+ 			break;
++		/*
++		 * A damaged frame leaves a hole in the byte stream: deliver
++		 * what came before it, then fail every later read. Checked
++		 * before the PDF is trusted: a damaged CLOSE is no EOF.
++		 */
++		if (tbstream_frame_damaged(sf)) {
++			sdev->rx_failed = true;
++			if (!nbytes)
++				ret = -EIO;
++			break;
++		}
+ 		/*
+ 		 * CLOSE tunneled packet. If userspace already read
+ 		 * something then we stop processing now and return
+@@ -1154,16 +1165,6 @@ tbstream_dev_fops_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ 			}
+ 			break;
+ 		}
+-		/*
+-		 * A damaged frame leaves a hole in the byte stream: deliver
+-		 * what came before it, then fail every later read.
+-		 */
+-		if (tbstream_frame_damaged(sf)) {
+-			sdev->rx_failed = true;
+-			if (!nbytes)
+-				ret = -EIO;
+-			break;
+-		}
+ 
+ 		sf_size = tb_ring_frame_size(&sf->frame);
+ 		size = min(iov_iter_count(to), sf_size);

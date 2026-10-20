@@ -90,6 +90,8 @@ static void test_control_failure(void) {
 
 #include "dma_group_cases.h"
 
+#include "dma_teardown_cases.h"
+
 int main(int argc,char **argv) {
     assert(argc==2);
     if(!strcmp(argv[1],"admission"))test_admission();
@@ -102,6 +104,21 @@ int main(int argc,char **argv) {
     else if (!strcmp(argv[1], "group_inventory")) test_group_inventory();
     else if (!strcmp(argv[1], "group_reset")) test_group_reset();
     else if (!strcmp(argv[1], "core_notifier")) test_core_notifier();
+    else if (!strcmp(argv[1], "teardown_revoke")) test_teardown_revoke();
+    else if (!strcmp(argv[1], "teardown_reset_idle")) test_teardown_reset_idle();
+    else if (!strcmp(argv[1], "teardown_reset_other_stream")) test_teardown_reset_other_stream();
+    else if (!strcmp(argv[1], "teardown_reset_waits_for_owner")) test_teardown_reset_waits_for_owner();
+    else if (!strcmp(argv[1], "teardown_reset_lock_busy")) test_teardown_reset_lock_busy();
+    else if (!strcmp(argv[1], "teardown_reset_tunnel_veto")) test_teardown_reset_tunnel_veto();
+    else if (!strcmp(argv[1], "teardown_reset_gated")) test_teardown_reset_gated();
+    else if (!strcmp(argv[1], "teardown_reset_failure")) test_teardown_reset_failure();
+    else if (!strcmp(argv[1], "teardown_reset_budget_restarts")) test_teardown_reset_budget_restarts();
+    else if (!strcmp(argv[1], "teardown_reset_pending_until_owner_leaves")) test_teardown_reset_pending_until_owner_leaves();
+    else if (!strcmp(argv[1], "teardown_reset_rechecks_before_reset")) test_teardown_reset_rechecks_before_reset();
+    else if (!strcmp(argv[1], "teardown_reset_pending_at_removal")) test_teardown_reset_pending_at_removal();
+    else if (!strcmp(argv[1], "teardown_reset_pending_across_suspend")) test_teardown_reset_pending_across_suspend();
+    else if (!strcmp(argv[1], "teardown_reset_request_during_reset")) test_teardown_reset_request_during_reset();
+    else if (!strcmp(argv[1], "teardown_reset_ring_freed_during_attempt")) test_teardown_reset_ring_freed_during_attempt();
     else return 2;
     printf("PASS %s\n",argv[1]);return 0;
 }

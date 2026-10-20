@@ -1,0 +1,374 @@
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -6,6 +6,8 @@
+ #include <linux/dma-buf.h>
+ #include <linux/dma-fence.h>
+ #include <linux/dma-resv.h>
++#include <linux/dma-mapping.h>
++#include <linux/mm.h>
+ #include <linux/kdev_t.h>
+ #include <linux/random.h>
+ #include <linux/scatterlist.h>
+@@ -57,6 +59,7 @@ struct sgu_hw_frame {
+     struct tbstream_gpu_context *context;
+     struct sgu_hw_operation *operation;
+     struct sgu_frame_result result;
++    dma_addr_t window_phy; /* DMA-BUF address; a header-mode terminal uses a kernel page */
+     bool queued;
+ };
+ struct sgu_window {
+@@ -103,6 +106,9 @@ struct tbstream_gpu_context {
+     struct device *service_owner, *dma_owner, *xdomain_owner, *domain_owner;
+     u64 import_counter, last_epoch, last_handle, last_sequence[2], fence_context;
+     u64 fence_sequence[2][SGU_MAX_QUEUE_DEPTH], submitted_sequence[2];
++    /* Kernel terminal buffers for SGU_PREPARE_TERMINAL_HEADER, per slot. */
++    struct page *terminal_page[2][SGU_MAX_QUEUE_DEPTH];
++    dma_addr_t terminal_dma[2][SGU_MAX_QUEUE_DEPTH];
+     bool imported, started, armed, stopped, failed, rearming_rx, quarantined;
+     bool closing, requires_new_epoch;
+     bool path_check_required, detached_hopids;
+@@ -274,6 +280,29 @@ static bool sgu_finish_signal(struct tbstream_gpu_context *ctx,
+     return ready;
+ }
+ 
++/* Callback context, ctx->lock held. The controller wrote the RX terminal into
++ * the slot's kernel page; nothing else references it until the next enqueue. */
++static bool sgu_terminal_check(struct tbstream_gpu_context *ctx, struct sgu_hw_operation *op,
++                               struct sgu_hw_frame *f)
++{
++    u32 direction = op->request.direction, slot = sgu_operation_slot(ctx, op);
++    const struct sgu_terminal_header *h = page_address(ctx->terminal_page[direction][slot]);
++
++    dma_sync_single_for_cpu(ctx->windows[direction].device, ctx->terminal_dma[direction][slot],
++                            SGU_FRAME_BYTES, DMA_FROM_DEVICE);
++    if (sgu_terminal_valid(h, f->result.actual_bytes, ctx->identity.connection_epoch,
++                           op->request.sequence, op->request.payload_bytes, op->payload_frames, slot))
++        return true;
++    pr_warn_ratelimited("RX terminal mismatch, slot %u: expected sequence %llu, %llu bytes, epoch %llu; got %u bytes, magic %#x, sequence %llu, %llu bytes, epoch %llu\n",
++                        slot, (unsigned long long)op->request.sequence,
++                        (unsigned long long)op->request.payload_bytes,
++                        (unsigned long long)ctx->identity.connection_epoch, f->result.actual_bytes,
++                        sgu_from_le32(h->magic), (unsigned long long)sgu_from_le64(h->sequence),
++                        (unsigned long long)sgu_from_le64(h->payload_bytes),
++                        (unsigned long long)sgu_from_le64(h->connection_epoch));
++    return false;
++}
++
+ static void sgu_callback(struct tb_ring *ring, struct ring_frame *frame, bool canceled)
+ {
+     struct sgu_hw_frame *f = container_of(frame, struct sgu_hw_frame, frame);
+@@ -313,6 +342,10 @@ static void sgu_callback(struct tb_ring *ring, struct ring_frame *frame, bool ca
+                 f->result.error_flags |= SGU_FRAME_ERROR_PROTOCOL;
+             if (op->phase != SGU_OP_PENDING)
+                 f->result.error_flags |= SGU_FRAME_ERROR_STANDBY_ARRIVAL;
++            else if ((op->request.flags & SGU_PREPARE_TERMINAL_HEADER) &&
++                     f == sgu_frame_at(ctx, op, op->total_frames - 1) &&
++                     !sgu_terminal_check(ctx, op, f))
++                f->result.error_flags |= SGU_FRAME_ERROR_TERMINAL;
+         }
+         op->error_flags |= f->result.error_flags;
+         if (op->error_flags)
+@@ -425,6 +458,7 @@ static int sgu_window_map(struct tbstream_gpu_context *ctx, struct sgu_window *w
+             goto fail;
+         f->context = ctx;
+         f->frame.buffer_phy = dma;
++        f->window_phy = dma;
+         f->frame.callback = sgu_callback;
+         INIT_LIST_HEAD(&f->frame.list);
+         f->result.pool_offset = (u64)i * SGU_FRAME_BYTES;
+@@ -563,14 +597,31 @@ static int sgu_enqueue(struct tbstream_gpu_context *ctx, struct sgu_hw_operation
+     struct dma_fence *signal = NULL;
+     unsigned long flags;
+     LIST_HEAD(frames);
++    dma_addr_t terminal_phy = 0;
+     int ret, error = 0;
+     u32 i;
+-    bool cookie;
++    bool cookie, header;
+ 
+     ret = sgu_publish_fence(ctx, op, standby, dependency, &cookie);
+     if (ret)
+         return ret;
+     dma_sync_sgtable_for_device(w->device, w->mapping, w->direction);
++    header = op->request.flags & SGU_PREPARE_TERMINAL_HEADER;
++    if (header) {
++        u32 slot = sgu_operation_slot(ctx, op), direction = op->request.direction;
++        dma_addr_t dma = ctx->terminal_dma[direction][slot];
++
++        terminal_phy = dma;
++        if (direction == SGU_DIRECTION_TX) {
++            /* The kernel, not the GPU, writes what the peer validates. */
++            sgu_terminal_build(page_address(ctx->terminal_page[direction][slot]),
++                               ctx->identity.connection_epoch, op->request.sequence,
++                               op->request.payload_bytes, op->payload_frames, slot);
++            dma_sync_single_for_device(w->device, dma, SGU_TERMINAL_HEADER_BYTES, DMA_TO_DEVICE);
++        } else {
++            dma_sync_single_for_device(w->device, dma, SGU_FRAME_BYTES, DMA_FROM_DEVICE);
++        }
++    }
+     spin_lock_irqsave(&ctx->lock, flags);
+     op->submitted_ns = ktime_get_ns();
+     op->deadline_ns = op->submitted_ns + (u64)(standby ? READ_ONCE(gpu_standby_timeout_ms) :
+@@ -586,6 +637,7 @@ static int sgu_enqueue(struct tbstream_gpu_context *ctx, struct sgu_hw_operation
+ 
+         f->result.actual_bytes = 0;
+         f->result.error_flags = 0;
++        f->frame.buffer_phy = header && i == op->total_frames - 1 ? terminal_phy : f->window_phy;
+         f->frame.flags = 0;
+         f->frame.sof = TBSTREAM_FRAME_START;
+         f->frame.eof = TBSTREAM_DATA;
+@@ -927,6 +979,53 @@ static void sgu_release_detached_hopids(struct tbstream_gpu_context *ctx)
+     ctx->detached_hopids = false;
+ }
+ 
++static struct device *sgu_ring_device(struct tbstream_gpu_context *ctx, u32 direction)
++{
++    return tb_ring_dma_device(direction == SGU_DIRECTION_TX ? ctx->sdev->tx_ring.ring :
++                                                              ctx->sdev->rx_ring.ring);
++}
++
++/* A whole page even for a 64-byte header: on RX a misrouted payload frame of
++ * up to SGU_FRAME_BYTES may land here and must stay inside kernel memory. */
++static int sgu_terminal_alloc(struct tbstream_gpu_context *ctx, u32 direction, u32 slot)
++{
++    struct device *device = sgu_ring_device(ctx, direction);
++    struct page *page = alloc_page(GFP_KERNEL | __GFP_ZERO);
++    dma_addr_t dma;
++
++    if (!page)
++        return -ENOMEM;
++    dma = dma_map_page(device, page, 0, SGU_FRAME_BYTES,
++                       direction == SGU_DIRECTION_TX ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
++    if (dma_mapping_error(device, dma)) {
++        __free_page(page);
++        return -ENOMEM;
++    }
++    ctx->terminal_page[direction][slot] = page;
++    ctx->terminal_dma[direction][slot] = dma;
++    return 0;
++}
++
++/* Only after the rings stopped: no descriptor references these pages. */
++static void sgu_terminal_free_all(struct tbstream_gpu_context *ctx)
++{
++    u32 direction, slot;
++
++    for (direction = 0; direction < 2; ++direction) {
++        for (slot = 0; slot < SGU_MAX_QUEUE_DEPTH; ++slot) {
++            struct page *page = ctx->terminal_page[direction][slot];
++
++            if (!page)
++                continue;
++            dma_unmap_page(sgu_ring_device(ctx, direction), ctx->terminal_dma[direction][slot],
++                           SGU_FRAME_BYTES, direction == SGU_DIRECTION_TX ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
++            __free_page(page);
++            ctx->terminal_page[direction][slot] = NULL;
++            ctx->terminal_dma[direction][slot] = 0;
++        }
++    }
++}
++
+ static void sgu_release_windows(struct tbstream_gpu_context *ctx)
+ {
+     u32 direction, slot;
+@@ -935,6 +1034,7 @@ static void sgu_release_windows(struct tbstream_gpu_context *ctx)
+     for (direction = 0; direction < 2; ++direction)
+         for (slot = 0; slot < SGU_MAX_QUEUE_DEPTH; ++slot)
+             sgu_operation_clear(ctx, &ctx->operations[direction][slot]);
++    sgu_terminal_free_all(ctx);
+     sgu_window_free(&ctx->windows[SGU_DIRECTION_RX]);
+     sgu_window_free(&ctx->windows[SGU_DIRECTION_TX]);
+     ctx->imported = false;
+@@ -1087,6 +1187,12 @@ static int sgu_prepare_operation(struct tbstream_gpu_context *ctx,
+         !sgu_prepare_queue_valid(request, ctx->sdev->ring_size, ctx->queue_depth, &payload_frames) ||
+         request->handle <= ctx->last_handle || request->sequence <= ctx->last_sequence[request->direction])
+         return -EINVAL;
++    if ((request->flags & SGU_PREPARE_TERMINAL_HEADER) &&
++        !ctx->terminal_page[request->direction][slot]) {
++        ret = sgu_terminal_alloc(ctx, request->direction, slot);
++        if (ret)
++            return ret;
++    }
+     op = &ctx->operations[request->direction][slot];
+     spin_lock_irqsave(&ctx->lock, flags);
+     if (READ_ONCE(ctx->failed) || READ_ONCE(ctx->stopped)) {
+@@ -1104,7 +1210,8 @@ static int sgu_prepare_operation(struct tbstream_gpu_context *ctx,
+          * strand the peer TX ring on the tested AMD NHI. A changed slot count
+          * or offset needs a new two-host import, not a unilateral ring reset.
+          */
+-        if (request->pool_offset != op->request.pool_offset || payload_frames != op->payload_frames) {
++        if (request->pool_offset != op->request.pool_offset || payload_frames != op->payload_frames ||
++            request->flags != op->request.flags) { /* the posted terminal buffer is fixed too */
+             spin_unlock_irqrestore(&ctx->lock, flags);
+             return -EOPNOTSUPP;
+         }
+@@ -1603,7 +1710,8 @@ static int sgu_queue_ioctl(struct tbstream_gpu_context *ctx, void __user *user)
+     q.depth = depth;
+     q.maximum_depth = SGU_MAX_QUEUE_DEPTH;
+     q.features = SGU_CAP_MULTI_OP | SGU_CAP_NONBLOCK_SUBMIT | SGU_CAP_SYNC_FILE |
+-                 SGU_CAP_SESSION_RECOVERY | SGU_CAP_DMA_TIMEOUT | SGU_CAP_STATS | SGU_CAP_IDLE_RESET | SGU_CAP_GROUP_RESET;
++                 SGU_CAP_SESSION_RECOVERY | SGU_CAP_DMA_TIMEOUT | SGU_CAP_STATS | SGU_CAP_IDLE_RESET | SGU_CAP_GROUP_RESET |
++                 SGU_CAP_TERMINAL_HEADER;
+     if (copy_to_user(user, &q, sizeof(q)))
+         return -EFAULT;
+     spin_lock_irqsave(&ctx->lock, flags);
+diff --git a/drivers/thunderbolt/gpu_stream_logic.h b/drivers/thunderbolt/gpu_stream_logic.h
+--- a/drivers/thunderbolt/gpu_stream_logic.h
++++ b/drivers/thunderbolt/gpu_stream_logic.h
+@@ -5,11 +5,27 @@
+ #ifdef __KERNEL__
+ #include <uapi/linux/strix_gpu_stream.h>
+ #include <linux/string.h>
++#include <asm/byteorder.h>
++#define sgu_le16(x) cpu_to_le16(x)
++#define sgu_le32(x) cpu_to_le32(x)
++#define sgu_le64(x) cpu_to_le64(x)
++#define sgu_from_le16(x) le16_to_cpu(x)
++#define sgu_from_le32(x) le32_to_cpu(x)
++#define sgu_from_le64(x) le64_to_cpu(x)
+ #else
+ #include <linux/strix_gpu_stream.h>
++#include <endian.h>
+ #include <string.h>
++#define sgu_le16(x) htole16(x)
++#define sgu_le32(x) htole32(x)
++#define sgu_le64(x) htole64(x)
++#define sgu_from_le16(x) le16toh(x)
++#define sgu_from_le32(x) le32toh(x)
++#define sgu_from_le64(x) le64toh(x)
+ #endif
+ 
++#define SGU_PREPARE_KNOWN_FLAGS SGU_PREPARE_TERMINAL_HEADER
++
+ /* A frame fitting one 256-byte USB4 packet carries only its EOF PDF.
+  * Strix Halo reports SOF=0 for that case. Multi-packet frames must retain
+  * the START PDF, and every DATA frame still requires EOF=DATA.
+@@ -93,7 +109,9 @@ static inline int sgu_prepare_valid(const struct sgu_prepare *p, __u32 frames, _
+     __u64 count;
+ 
+     if (!p || !payload_frames || frames < 32 || frames > SGU_MAX_FRAMES || !p->handle || !p->sequence || p->direction > SGU_DIRECTION_RX ||
+-        p->reserved || !p->payload_bytes || !p->terminal_bytes || p->terminal_bytes > SGU_FRAME_BYTES ||
++        (p->flags & ~SGU_PREPARE_KNOWN_FLAGS) ||
++        ((p->flags & SGU_PREPARE_TERMINAL_HEADER) && p->terminal_bytes != SGU_TERMINAL_HEADER_BYTES) ||
++        !p->payload_bytes || !p->terminal_bytes || p->terminal_bytes > SGU_FRAME_BYTES ||
+         p->pool_offset % SGU_FRAME_BYTES || p->pool_offset >= terminal || p->payload_bytes > terminal - p->pool_offset)
+         return 0;
+     count = (p->payload_bytes - 1U) / SGU_FRAME_BYTES + 1U;
+@@ -116,6 +134,41 @@ static inline int sgu_prepare_queue_valid(const struct sgu_prepare *p, __u32 fra
+     return p->pool_offset < terminal && p->payload_bytes <= terminal - p->pool_offset;
+ }
+ 
++/* Terminal header sent by TX for SGU_PREPARE_TERMINAL_HEADER operations. */
++static inline void sgu_terminal_build(struct sgu_terminal_header *h, __u64 epoch, __u64 sequence,
++                                      __u64 payload_bytes, __u32 payload_frames, __u32 slot)
++{
++    memset(h, 0, sizeof(*h));
++    h->magic = sgu_le32(SGU_TERMINAL_MAGIC);
++    h->version = sgu_le16(SGU_TERMINAL_VERSION);
++    h->header_bytes = sgu_le16(SGU_TERMINAL_HEADER_BYTES);
++    h->connection_epoch = sgu_le64(epoch);
++    h->sequence = sgu_le64(sequence);
++    h->payload_bytes = sgu_le64(payload_bytes);
++    h->payload_frames = sgu_le32(payload_frames);
++    h->slot = sgu_le32(slot);
++}
++
++/* RX check of a received terminal frame against the local operation.
++ * actual_bytes is what the controller wrote: a payload frame that landed in
++ * the terminal slot fails on length or magic, a shifted or reordered
++ * operation on sequence/size, a stale peer on epoch. Returns 1 if valid. */
++static inline int sgu_terminal_valid(const struct sgu_terminal_header *h, __u32 actual_bytes,
++                                     __u64 epoch, __u64 sequence, __u64 payload_bytes,
++                                     __u32 payload_frames, __u32 slot)
++{
++    return actual_bytes == SGU_TERMINAL_HEADER_BYTES &&
++        sgu_from_le32(h->magic) == SGU_TERMINAL_MAGIC &&
++        sgu_from_le16(h->version) == SGU_TERMINAL_VERSION &&
++        sgu_from_le16(h->header_bytes) == SGU_TERMINAL_HEADER_BYTES &&
++        sgu_from_le64(h->connection_epoch) == epoch &&
++        sgu_from_le64(h->sequence) == sequence &&
++        sgu_from_le64(h->payload_bytes) == payload_bytes &&
++        sgu_from_le32(h->payload_frames) == payload_frames &&
++        sgu_from_le32(h->slot) == slot &&
++        !h->reserved[0] && !h->reserved[1] && !h->reserved[2];
++}
++
+ static inline int sgu_frame_ranges_overlap(__u64 a, __u32 na, __u64 b, __u32 nb)
+ {
+     if (!na || !nb)
+diff --git a/include/uapi/linux/strix_gpu_stream.h b/include/uapi/linux/strix_gpu_stream.h
+--- a/include/uapi/linux/strix_gpu_stream.h
++++ b/include/uapi/linux/strix_gpu_stream.h
+@@ -103,7 +103,9 @@ struct sgu_import {
+ /* PREPARE reserves one C1 operation per direction. Its start offset is frame-aligned;
+  * the final payload frame may be partial and has an exact expected wire size.
+  * contiguous and cannot overlap the dedicated last-frame terminal region.
+- * terminal_bytes is wire metadata size, 1..4096; the kernel never parses it. */
++ * terminal_bytes is wire metadata size, 1..4096. Without flags the kernel never
++ * parses it. flags (formerly reserved, zero = legacy behaviour) may hold
++ * SGU_PREPARE_TERMINAL_HEADER, see struct sgu_terminal_header below. */
+ struct sgu_prepare {
+     struct sgu_fence fence;
+     __aligned_u64 handle;
+@@ -112,7 +114,10 @@ struct sgu_prepare {
+     __aligned_u64 payload_bytes;
+     __u32 terminal_bytes;
+     __u32 direction;
+-    __aligned_u64 reserved;
++    union {
++        __aligned_u64 reserved;
++        __aligned_u64 flags;
++    };
+ };
+ 
+ /* ARM/STOP/RELEASE use zero handle/sequence/direction. Other actions identify
+@@ -291,4 +296,48 @@ struct sgu_reset_group {
+ };
+ #define SGU_IOC_RESET_GROUP _IOWR(0xb7, 0x51, struct sgu_reset_group)
+ 
++/* Kernel-validated terminal frame (optional, additive extension).
++ *
++ * Without it, RX frames land in descriptor posting order and the kernel only
++ * checks each frame's length: if the peers disagree on payload_bytes or on
++ * SUBMIT order and the sizes happen to match, data shifts silently.
++ *
++ * With SGU_PREPARE_TERMINAL_HEADER in sgu_prepare.flags (terminal_bytes must
++ * then be SGU_TERMINAL_HEADER_BYTES), the terminal frame no longer uses the
++ * DMA-BUF terminal slot. On TX the kernel itself sends this header, built from
++ * the operation. On RX the terminal lands in kernel memory and is checked
++ * against the local operation: length, magic, version, the import's
++ * connection_epoch, sequence, payload_bytes, payload frame count and slot. A
++ * mismatch sets SGU_FRAME_ERROR_TERMINAL on that frame, EVENT reports
++ * SGU_EVENT_FAILED and the session fails (RECOVER with a fresh epoch).
++ *
++ * Contract: both peers set the flag on matching operations, and an RX
++ * operation uses the same sequence number as the peer's TX operation it
++ * receives. The kernel validates framing, not payload integrity (link CRC
++ * only); an end-to-end payload checksum remains the application's job.
++ *
++ * Discovery: SGU_IOC_QUEUE reports SGU_CAP_TERMINAL_HEADER. Kernels without
++ * it reject a non-zero flags field with EINVAL. ABI versioning: abi_minor is
++ * part of every identity and QUERY requires an exact match, so additive
++ * extensions are advertised as capability bits and abi_minor stays 0; it will
++ * only change together with an exact-match-free QUERY. */
++#define SGU_CAP_TERMINAL_HEADER 256U
++#define SGU_PREPARE_TERMINAL_HEADER 1ULL
++#define SGU_FRAME_ERROR_TERMINAL 128U
++#define SGU_TERMINAL_MAGIC 0x54554753U /* "SGUT" as little-endian bytes */
++#define SGU_TERMINAL_VERSION 1U
++#define SGU_TERMINAL_HEADER_BYTES 64U
++/* Little-endian on the wire. */
++struct sgu_terminal_header {
++    __le32 magic;
++    __le16 version;
++    __le16 header_bytes;
++    __le64 connection_epoch;
++    __le64 sequence;
++    __le64 payload_bytes;
++    __le32 payload_frames;
++    __le32 slot;
++    __le64 reserved[3];
++};
++
+ #endif

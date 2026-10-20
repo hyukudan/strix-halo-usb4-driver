@@ -1,0 +1,559 @@
+diff --git a/drivers/thunderbolt/dma_recovery.c b/drivers/thunderbolt/dma_recovery.c
+--- a/drivers/thunderbolt/dma_recovery.c
++++ b/drivers/thunderbolt/dma_recovery.c
+@@ -319,13 +319,84 @@ int tb_unregister_dma_lifecycle_notifier(struct notifier_block *notifier)
+ }
+ EXPORT_SYMBOL_GPL(tb_unregister_dma_lifecycle_notifier);
+ 
++/**
++ * tb_domain_dma_retained() - Report one DMA owner still retained at teardown
++ * @tb: Domain being removed
++ *
++ * Only valid from a lifecycle notifier callback for QUIESCING or DMA_REVOKED,
++ * which run sequentially in the thread removing the domain.
++ */
++void tb_domain_dma_retained(struct tb *tb)
++{
++    WRITE_ONCE(tb->nhi->dma_retained, tb->nhi->dma_retained + 1);
++}
++EXPORT_SYMBOL_GPL(tb_domain_dma_retained);
++
++/* Revoke and verify PCI bus mastering. Clearing Bus Master Enable forbids
++ * the function from issuing new memory requests (descriptor/data DMA and
++ * MSI-X). The non-posted reads that follow cannot complete ahead of posted
++ * writes the function issued earlier (PCIe ordering, Relaxed Ordering off),
++ * so once they return no earlier DMA write is still in flight either.
++ * Consistent with the series' rule, a function that does not answer is no
++ * proof: the caller then abandons the retained owners instead. */
++static int tb_dma_revoke_bus_master(struct tb_nhi *nhi)
++{
++    struct pci_dev *pdev;
++    u16 command;
++
++    if (!dev_is_pci(nhi->dev))
++        return -EOPNOTSUPP;
++    pdev = to_pci_dev(nhi->dev);
++    if (!pci_device_is_present(pdev))
++        return -ENODEV;
++    pci_clear_master(pdev);
++    if (pci_read_config_word(pdev, PCI_COMMAND, &command) ||
++        (command & PCI_COMMAND_MASTER))
++        return -EIO;
++    (void)ioread32(nhi->iobase + REG_CAPS);
++    return 0;
++}
++
+ /* Called by domain.c after CM stop and queued removal work have completed,
+  * outside tb->lock, before deinit/unregister can discard the inventory. The
+- * parent's remove path still owns its MMIO/devres while domain refs exist. */
++ * parent's remove path still owns its MMIO/devres while domain refs exist.
++ *
++ * A consumer that cannot prove its DMA stopped keeps its domain reference,
++ * and the parent would then wait for domain release forever. The removal
++ * itself offers a stronger proof than any per-ring one: after this point the
++ * controller is no longer needed, so revoke its bus mastering and let the
++ * retained owners release. Without that proof they are abandoned instead:
++ * they leak their DMA resources and never touch the controller again, and the
++ * parent's wait for the domain is bounded (see tb_domain_wait_released()). */
+ static void tb_dma_retire_domain_clients(struct tb *tb)
+ {
++    struct tb_nhi *nhi = tb->nhi;
++    unsigned int retained;
++    int ret;
++
++    WRITE_ONCE(nhi->dma_retained, 0);
+     blocking_notifier_call_chain(&tb_dma_lifecycle_notifiers,
+                                 TB_DMA_DOMAIN_QUIESCING, tb);
++    retained = READ_ONCE(nhi->dma_retained);
++    if (!retained)
++        return;
++    ret = tb_dma_revoke_bus_master(nhi);
++    if (!ret) {
++        WRITE_ONCE(nhi->dma_revoked, true);
++        dev_warn(&tb->dev, "%u DMA owner(s) retained at teardown: bus mastering revoked, releasing them\n",
++                 retained);
++        WRITE_ONCE(nhi->dma_retained, 0);
++        blocking_notifier_call_chain(&tb_dma_lifecycle_notifiers,
++                                    TB_DMA_DOMAIN_DMA_REVOKED, tb);
++        retained = READ_ONCE(nhi->dma_retained);
++        if (!retained)
++            return;
++    }
++    WRITE_ONCE(nhi->dma_abandoned, true);
++    dev_err(&tb->dev, "%u DMA owner(s) retained without a DMA stop proof (revoke: %d): abandoning them, their memory stays pinned until reboot\n",
++            retained, ret);
++    blocking_notifier_call_chain(&tb_dma_lifecycle_notifiers,
++                                TB_DMA_DOMAIN_ABANDONED, tb);
+ }
+ 
+ 
+diff --git a/drivers/thunderbolt/domain.c b/drivers/thunderbolt/domain.c
+--- a/drivers/thunderbolt/domain.c
++++ b/drivers/thunderbolt/domain.c
+@@ -315,18 +315,85 @@ const struct bus_type tb_bus_type = {
+ 	.shutdown = tb_service_shutdown,
+ };
+ 
++/*
++ * Serializes the final domain release against tb_domain_wait_released()
++ * abandoning it. An abandoned domain no longer owns its NHI or control
++ * channel (both NULL), so a late release touches neither.
++ */
++static DEFINE_MUTEX(tb_domain_release_lock);
++
+ static void tb_domain_release(struct device *dev)
+ {
+ 	struct tb *tb = container_of(dev, struct tb, dev);
+-	struct tb_nhi *nhi = tb->nhi;
++	struct tb_nhi *nhi;
+ 
+-	tb_ctl_free(tb->ctl);
++	mutex_lock(&tb_domain_release_lock);
++	nhi = tb->nhi;
++	if (tb->ctl)
++		tb_ctl_free(tb->ctl);
+ 	destroy_workqueue(tb->wq);
+ 	ida_free(&tb_domain_ida, tb->index);
+ 	mutex_destroy(&tb->lock);
+ 	kfree(tb);
+ 
+-	complete(&nhi->domain_released);
++	if (nhi)
++		complete(&nhi->domain_released);
++	mutex_unlock(&tb_domain_release_lock);
++}
++
++#define TB_DOMAIN_RELEASE_WARN_MS	10000
++#define TB_DOMAIN_RELEASE_TIMEOUT_MS	30000
++
++/**
++ * tb_domain_wait_released() - Bounded wait for the last domain reference
++ * @tb: Domain passed to tb_domain_remove(); may already have been freed
++ * @nhi: Its host interface, still owned by the caller
++ *
++ * Upstream waits forever. A DMA owner that cannot prove its transfers
++ * stopped deliberately keeps its domain reference, which used to hang
++ * reboot and NHI unbind. tb_domain_remove() now revokes bus mastering and
++ * lets such owners release, or abandons them. This bounds the remaining
++ * cases: if the domain is still referenced after the timeout (immediately
++ * when owners were abandoned), it is detached from @nhi and its control
++ * channel is freed now, while @nhi still exists. Whatever still holds the
++ * domain keeps a valid object; nothing reaches @nhi through it again.
++ *
++ * Return: %true if the domain was released, %false if it was abandoned.
++ */
++bool tb_domain_wait_released(struct tb *tb, struct tb_nhi *nhi)
++{
++	unsigned long warn = msecs_to_jiffies(TB_DOMAIN_RELEASE_WARN_MS);
++	unsigned long timeout = msecs_to_jiffies(TB_DOMAIN_RELEASE_TIMEOUT_MS);
++	struct tb_ctl *ctl;
++
++	if (READ_ONCE(nhi->dma_abandoned)) {
++		timeout = 0;
++	} else if (!wait_for_completion_timeout(&nhi->domain_released, warn)) {
++		dev_warn(nhi->dev, "domain still referenced after %u ms, waiting up to %u ms\n",
++			 TB_DOMAIN_RELEASE_WARN_MS, TB_DOMAIN_RELEASE_TIMEOUT_MS);
++		timeout -= warn;
++	} else {
++		return true;
++	}
++	if (timeout && wait_for_completion_timeout(&nhi->domain_released, timeout))
++		return true;
++
++	mutex_lock(&tb_domain_release_lock);
++	/* Not completed under the lock: the release has not run, @tb is alive. */
++	if (completion_done(&nhi->domain_released)) {
++		mutex_unlock(&tb_domain_release_lock);
++		return true;
++	}
++	ctl = tb->ctl;
++	tb->ctl = NULL;
++	tb->nhi = NULL;
++	WRITE_ONCE(nhi->dma_abandoned, true);
++	mutex_unlock(&tb_domain_release_lock);
++	/* Stopped by tb_domain_remove(); nothing uses it after removal. */
++	if (ctl)
++		tb_ctl_free(ctl);
++	dev_err(nhi->dev, "domain still referenced, abandoning it: its memory is leaked until reboot\n");
++	return false;
+ }
+ 
+ const struct device_type tb_domain_type = {
+diff --git a/drivers/thunderbolt/gpu_group_reset.h b/drivers/thunderbolt/gpu_group_reset.h
+--- a/drivers/thunderbolt/gpu_group_reset.h
++++ b/drivers/thunderbolt/gpu_group_reset.h
+@@ -85,7 +85,7 @@ static long sgu_reset_group_ioctl(struct file *caller, void __user *user)
+         }
+         owners[i].locked = true;
+         ctx = sdev->gpu_context;
+-        if (!sdev->gpu_direct || sdev->users <= 0 || !ctx ||
++        if (!sdev->gpu_direct || sdev->users <= 0 || !ctx || ctx->abandoned ||
+             tbstream_dev_valid(sdev) || sdev->stream != ctx->stream_owner) {
+             ret = -ENODEV;
+             goto unlock;
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -106,6 +106,12 @@ struct tbstream_gpu_context {
+     bool imported, started, armed, stopped, failed, rearming_rx, quarantined;
+     bool closing, requires_new_epoch;
+     bool path_check_required, detached_hopids;
++    /* Domain teardown could not prove DMA stopped and abandoned this context:
++     * it leaks everything and never touches the controller again. */
++    bool abandoned;
++    /* Domain teardown revoked the controller's bus mastering: no path table
++     * can make it reach memory any more. */
++    bool dma_revoked;
+ };
+ 
+ /* Registry entries exist only while their contexts hold the original domain.
+@@ -764,7 +770,7 @@ static void tbstream_gpu_stop(struct tbstream_dev *sdev)
+     unsigned long flags;
+     bool cookie;
+ 
+-    if (!ctx)
++    if (!ctx || ctx->abandoned)
+         return;
+     cookie = dma_fence_begin_signalling();
+     mutex_lock(&ctx->dma_lock);
+@@ -774,6 +780,13 @@ static void tbstream_gpu_stop(struct tbstream_dev *sdev)
+     /* The worker never takes sdev->lock, so cancellation here cannot deadlock
+      * against user access or an exporter holding a reservation mutex. */
+     cancel_delayed_work_sync(&ctx->watchdog);
++    if (ctx->dma_revoked) {
++        spin_lock_irqsave(&ctx->lock, flags);
++        ctx->armed = false;
++        ctx->lifetime.paths_removed = 1;
++        spin_unlock_irqrestore(&ctx->lock, flags);
++        return;
++    }
+     xd = sgu_original_xdomain(ctx);
+     if (READ_ONCE(xd->is_unplugged) || sdev->stream != ctx->stream_owner)
+         ctx->path_check_required = true;
+@@ -936,8 +949,8 @@ static void tbstream_gpu_close(struct tbstream_dev *sdev)
+ 
+     bool quarantined;
+ 
+-    if (!ctx)
+-        return;
++    if (!ctx || ctx->abandoned)
++        return; /* abandoned: retained (leaked) until reboot */
+     WRITE_ONCE(ctx->closing, true);
+     cancel_delayed_work_sync(&ctx->watchdog);
+     tbstream_gpu_stop(sdev);
+@@ -1229,7 +1242,7 @@ static int sgu_reset_controller(struct tbstream_gpu_context *ctx)
+  * trylock avoids ABBA with a remove callback that already holds device_lock
+  * and is waiting for sdev->lock. The device gets a temporary independent ref
+  * because successful close destroys ctx and releases its dma_owner ref. */
+-static int tbstream_gpu_reap(struct tbstream_dev *sdev, bool reset)
++static int __tbstream_gpu_reap(struct tbstream_dev *sdev, bool reset, bool orphan)
+ {
+     struct tbstream_gpu_context *ctx = sdev->gpu_context;
+     struct tb_xdomain *xd = tbstream_dev_xdomain(sdev);
+@@ -1242,7 +1255,10 @@ static int tbstream_gpu_reap(struct tbstream_dev *sdev, bool reset)
+         return -EPERM;
+     if (sdev->users)
+         return -EBUSY;
+-    if (sdev->removed)
++    /* After rmdir only the orphan sweep (never a reset) can reap. */
++    if (sdev->removed && (!orphan || reset))
++        return -ENODEV;
++    if (ctx && ctx->abandoned)
+         return -ENODEV;
+     if (!ctx) {
+         if (!xd || tbstream_dev_valid(sdev))
+@@ -1284,6 +1300,66 @@ unlock:
+     return ret;
+ }
+ 
++static int tbstream_gpu_reap(struct tbstream_dev *sdev, bool reset)
++{
++    return __tbstream_gpu_reap(sdev, reset, false);
++}
++
++/* configfs rmdir removes the gpu_recover attribute of a quarantined context,
++ * but the context stays on the client registry. Reap those orphans here:
++ * same proofs as gpu_recover "reap", never a controller reset. */
++static int sgu_reap_orphans(void)
++{
++    u64 cursor = 0;
++    unsigned int remaining = 0;
++
++    if (!capable(CAP_SYS_ADMIN))
++        return -EPERM;
++    for (;;) {
++        struct tbstream_gpu_context *entry, *ctx;
++        struct tbstream_dev *sdev = NULL;
++        u64 id = 0;
++
++        mutex_lock(&sgu_clients_lock);
++        list_for_each_entry(entry, &sgu_clients, client_node) {
++            if (entry->client_id > cursor) {
++                sdev = entry->sdev;
++                id = entry->client_id;
++                tbstream_dev_get(sdev);
++                break;
++            }
++        }
++        mutex_unlock(&sgu_clients_lock);
++        if (!sdev)
++            break;
++        cursor = id;
++        mutex_lock(&sdev->lock);
++        ctx = sdev->gpu_context;
++        if (ctx && ctx->client_id == id && sdev->removed && ctx->quarantined &&
++            __tbstream_gpu_reap(sdev, false, true))
++            ++remaining;
++        mutex_unlock(&sdev->lock);
++        tbstream_dev_put(sdev);
++    }
++    return remaining ? -EBUSY : 0;
++}
++
++static int sgu_reap_orphans_set(const char *value, const struct kernel_param *kp)
++{
++    bool reap;
++    int ret = kstrtobool(value, &reap);
++
++    if (ret)
++        return ret;
++    return reap ? sgu_reap_orphans() : 0;
++}
++
++static const struct kernel_param_ops sgu_reap_orphans_ops = {
++    .set = sgu_reap_orphans_set,
++};
++module_param_cb(gpu_reap_orphans, &sgu_reap_orphans_ops, NULL, 0200);
++MODULE_PARM_DESC(gpu_reap_orphans, "Write 1 to reap quarantined GPU contexts whose configfs stream was removed (CAP_SYS_ADMIN)");
++
+ static bool tbstream_gpu_quarantined(struct tbstream_dev *sdev)
+ {
+     lockdep_assert_held(&sdev->lock);
+@@ -1626,6 +1702,10 @@ static long tbstream_gpu_ioctl(struct file *file, unsigned int command, unsigned
+         ret = -ENXIO;
+         goto unlock;
+     }
++    if (ctx->abandoned) {
++        ret = -ENODEV; /* the controller is gone; only close() remains */
++        goto unlock;
++    }
+     if (command == SGU_IOC_QUERY) {
+         struct sgu_query query;
+ 
+@@ -1745,6 +1825,72 @@ static __poll_t tbstream_gpu_poll(struct file *file, poll_table *wait)
+  * old FD becomes an error-only handle; sdev->users still prevents re-opening
+  * a replacement context until that FD is released. Exported fences own their
+  * own references and remain usable. No GPU completion is inferred here. */
++/* Only after the controller lost bus mastering: complete what can no longer
++ * complete. This is not faked success; waiters see -ENODEV. */
++static void sgu_fail_unsignaled_fences(struct tbstream_gpu_context *ctx, int error)
++{
++    u32 direction, slot;
++
++    for (direction = 0; direction < 2; ++direction) {
++        for (slot = 0; slot < SGU_MAX_QUEUE_DEPTH; ++slot) {
++            struct dma_fence *fence;
++            unsigned long flags;
++
++            spin_lock_irqsave(&ctx->lock, flags);
++            fence = dma_fence_get(ctx->operations[direction][slot].fence);
++            spin_unlock_irqrestore(&ctx->lock, flags);
++            if (fence && !dma_fence_is_signaled(fence)) {
++                dma_fence_set_error(fence, error);
++                dma_fence_signal(fence);
++            }
++            dma_fence_put(fence);
++        }
++    }
++}
++
++/* TB_DMA_DOMAIN_DMA_REVOKED: the NHI can no longer access memory, a stronger
++ * proof than ring/callback/path quiescence. Stop and join the local rings so
++ * that no callback can run any more, fail the fences that will never complete
++ * and release. A ring whose software state still runs (stop skipped a vanished
++ * controller) keeps the context retained. Called with sdev->lock held. */
++static void sgu_release_revoked(struct tbstream_dev *sdev)
++{
++    struct tbstream_gpu_context *ctx = sdev->gpu_context;
++    unsigned long flags;
++
++    WRITE_ONCE(ctx->closing, true);
++    cancel_delayed_work_sync(&ctx->watchdog);
++    tbstream_gpu_stop(sdev);
++    if (sgu_ring_running(sdev->tx_ring.ring) || sgu_ring_running(sdev->rx_ring.ring))
++        return;
++    sgu_fail_unsignaled_fences(ctx, -ENODEV);
++    spin_lock_irqsave(&ctx->lock, flags);
++    ctx->dma_revoked = true;
++    /* Stopped and flushed rings never call back for frames they dropped. */
++    ctx->lifetime.pending_callbacks = 0;
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    tbstream_gpu_close(sdev);
++}
++
++/* TB_DMA_DOMAIN_ABANDONED: no hardware proof. Leak every DMA resource (pages,
++ * dma-buf mappings, rings, references) and never touch the controller again;
++ * close() keeps it. GPU memory stays pinned until reboot, which is safe,
++ * unlike freeing memory that a controller might still write. */
++static void sgu_abandon(struct tbstream_dev *sdev)
++{
++    struct tbstream_gpu_context *ctx = sdev->gpu_context;
++
++    WRITE_ONCE(ctx->failed, true);
++    WRITE_ONCE(ctx->closing, true);
++    cancel_delayed_work_sync(&ctx->watchdog);
++    if (!ctx->quarantined) {
++        tbstream_dev_get(sdev);
++        __module_get(THIS_MODULE);
++        ctx->quarantined = true;
++    }
++    ctx->abandoned = true;
++}
++
+ static int sgu_domain_quiescing(struct notifier_block *notifier,
+                                unsigned long event, void *data)
+ {
+@@ -1752,7 +1898,8 @@ static int sgu_domain_quiescing(struct notifier_block *notifier,
+     u64 cursor = 0;
+     unsigned int retained = 0;
+ 
+-    if (event != TB_DMA_DOMAIN_QUIESCING)
++    if (event != TB_DMA_DOMAIN_QUIESCING && event != TB_DMA_DOMAIN_DMA_REVOKED &&
++        event != TB_DMA_DOMAIN_ABANDONED)
+         return NOTIFY_DONE;
+     if (!READ_ONCE(tb->nhi->dma_shutdown))
+         return NOTIFY_BAD;
+@@ -1776,12 +1923,19 @@ static int sgu_domain_quiescing(struct notifier_block *notifier,
+         cursor = id;
+         mutex_lock(&sdev->lock);
+         ctx = sdev->gpu_context;
+-        if (ctx && ctx->client_id == id && ctx->domain_owner == &tb->dev) {
++        if (ctx && ctx->client_id == id && ctx->domain_owner == &tb->dev && !ctx->abandoned) {
+             WRITE_ONCE(ctx->failed, true);
+             ctx->path_check_required = true;
+-            tbstream_gpu_close(sdev);
+-            if (sdev->gpu_context)
++            if (event == TB_DMA_DOMAIN_ABANDONED)
++                sgu_abandon(sdev);
++            else if (event == TB_DMA_DOMAIN_DMA_REVOKED)
++                sgu_release_revoked(sdev);
++            else
++                tbstream_gpu_close(sdev);
++            if (sdev->gpu_context && event != TB_DMA_DOMAIN_ABANDONED) {
+                 ++retained;
++                tb_domain_dma_retained(tb);
++            }
+             wake_up_interruptible_poll(&sdev->wait, EPOLLHUP | EPOLLERR);
+         }
+         mutex_unlock(&sdev->lock);
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -1198,6 +1198,12 @@ void nhi_shutdown(struct tb_nhi *nhi)
+ 	dev_dbg(nhi->dev, "shutdown\n");
+ 
+ 	for (i = 0; i < nhi->hop_count; i++) {
++		/* Rings of abandoned DMA owners are leaked on purpose. */
++		if (nhi->dma_abandoned) {
++			if (nhi->tx_rings[i] || nhi->rx_rings[i])
++				dev_err(nhi->dev, "ring %d leaked by an abandoned DMA owner\n", i);
++			continue;
++		}
+ 		if (nhi->tx_rings[i])
+ 			dev_WARN(nhi->dev,
+ 				 "TX ring %d is still active\n", i);
+diff --git a/drivers/thunderbolt/pci.c b/drivers/thunderbolt/pci.c
+--- a/drivers/thunderbolt/pci.c
++++ b/drivers/thunderbolt/pci.c
+@@ -496,7 +496,8 @@ static void nhi_pci_do_remove(struct pci_dev *pdev, bool reset)
+ 	pm_runtime_forbid(&pdev->dev);
+ 
+ 	tb_domain_remove(tb);
+-	wait_for_completion(&nhi->domain_released);
++	/* Bounded: a retained DMA owner must not hang reboot or unbind. */
++	tb_domain_wait_released(tb, nhi);
+ 	nhi_shutdown(nhi);
+ }
+ 
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -1886,8 +1886,20 @@ tbstream_dev_drop_item(struct config_group *group, struct config_item *item)
+ 	/* Removing configfs must not leave a live GPU DMA lease behind. */
+ 	scoped_guard(mutex, &sdev->lock) {
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+-		if (sdev->gpu_context)
++		if (sdev->gpu_context) {
+ 			tbstream_gpu_disconnect(sdev);
++			/*
++			 * gpu_recover disappears with this item: try to reap
++			 * a quarantined context now. What remains can be
++			 * reaped through the gpu_reap_orphans parameter, and
++			 * is released by NHI removal.
++			 */
++			if (!sdev->users && tbstream_gpu_quarantined(sdev))
++				tbstream_gpu_reap(sdev, false);
++			if (tbstream_gpu_quarantined(sdev))
++				pr_warn("%s: GPU context still quarantined after rmdir, retry with /sys/module/thunderbolt_stream/parameters/gpu_reap_orphans\n",
++					sdev->misc.name);
++		}
+ #endif
+ 		WRITE_ONCE(sdev->removed, true);
+ 	}
+diff --git a/drivers/thunderbolt/tb.h b/drivers/thunderbolt/tb.h
+--- a/drivers/thunderbolt/tb.h
++++ b/drivers/thunderbolt/tb.h
+@@ -776,6 +776,7 @@ void tb_xdomain_exit(void);
+ struct tb *tb_domain_alloc(struct tb_nhi *nhi, int timeout_msec, size_t privsize);
+ int tb_domain_add(struct tb *tb, bool reset);
+ void tb_domain_remove(struct tb *tb);
++bool tb_domain_wait_released(struct tb *tb, struct tb_nhi *nhi);
+ int tb_domain_suspend_noirq(struct tb *tb);
+ int tb_domain_resume_noirq(struct tb *tb);
+ int tb_domain_suspend(struct tb *tb);
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -519,6 +519,9 @@ void tb_service_properties_changed(struct tb_service *svc);
+  *		this flag is set, avoid touching the hardware anymore.
+  * @dma_resetting: Blocks new data-ring allocation/start during explicit reset
+  * @dma_shutdown: Blocks new data rings after domain teardown begins
++ * @dma_retained: DMA owners still retained during domain teardown
++ * @dma_revoked: Bus mastering was revoked during domain teardown
++ * @dma_abandoned: The domain was abandoned with leaked DMA owners
+  * @dma_wq: Reclaim-capable workqueue for DMA completion and cancellation
+  * @iommu_dma_protection: An IOMMU will isolate external-facing ports.
+  * @interrupt_work: Work scheduled to handle ring interrupt when no
+@@ -543,6 +546,10 @@ struct tb_nhi {
+ 	/* Protected by lock: explicit reset and domain teardown admission gates. */
+ 	bool dma_resetting;
+ 	bool dma_shutdown;
++	/* Domain teardown only: written by the removing thread. */
++	unsigned int dma_retained;
++	bool dma_revoked;
++	bool dma_abandoned;
+ 	bool iommu_dma_protection;
+ 	struct work_struct interrupt_work;
+ 	struct workqueue_struct *dma_wq;
+@@ -766,10 +773,21 @@ void tb_configfs_unregister_group(struct config_group *group);
+ #define TB_DMA_RESET_MAX_RINGS 32U
+ #define TB_DMA_DOMAIN_QUIESCING 1UL
+ #define TB_DMA_GROUP_RECOVERY 2UL
++/* Lifecycle chain, domain teardown only (data = struct tb *), sent after
++ * QUIESCING when a consumer reported retained DMA ownership:
++ * DMA_REVOKED: bus mastering of the NHI was revoked and verified, so the
++ *   controller can no longer access memory. Retained owners may now release.
++ * ABANDONED: no hardware proof was available. Retained owners must never touch
++ *   the controller again and must leak (never free) their DMA resources. */
++#define TB_DMA_DOMAIN_DMA_REVOKED 3UL
++#define TB_DMA_DOMAIN_ABANDONED 4UL
+ #define TB_DMA_RESET_WITH_NETWORK 1U
+ struct notifier_block;
+ int tb_register_dma_lifecycle_notifier(struct notifier_block *notifier);
+ int tb_unregister_dma_lifecycle_notifier(struct notifier_block *notifier);
++/* Only from a TB_DMA_DOMAIN_QUIESCING/DMA_REVOKED callback: one call per DMA
++ * owner that is still retained (still holds a domain reference). */
++void tb_domain_dma_retained(struct tb *tb);
+ /* Separate chain: do not register per-stream teardown consumers here. */
+ int tb_register_dma_recovery_notifier(struct notifier_block *notifier);
+ int tb_unregister_dma_recovery_notifier(struct notifier_block *notifier);

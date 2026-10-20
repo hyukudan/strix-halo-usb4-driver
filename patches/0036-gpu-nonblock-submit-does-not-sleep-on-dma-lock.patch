@@ -1,0 +1,142 @@
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -495,8 +495,19 @@ static void sgu_operation_clear(struct tbstream_gpu_context *ctx, struct sgu_hw_
+     dma_fence_put(wait_fence);
+ }
+ 
++/* dma_lock is held by the watchdog while it stops the rings and waits for
++ * their work: SGU_CAP_NONBLOCK_SUBMIT callers only try it. */
++static bool sgu_dma_lock(struct tbstream_gpu_context *ctx, bool nowait)
++{
++    if (nowait)
++        return mutex_trylock(&ctx->dma_lock);
++    mutex_lock(&ctx->dma_lock);
++    return true;
++}
++
+ static int sgu_publish_fence(struct tbstream_gpu_context *ctx, struct sgu_hw_operation *op,
+-                             bool standby, struct dma_fence **dependency, bool *cookie)
++                             bool standby, struct dma_fence **dependency, bool *cookie,
++                             bool nowait)
+ {
+     struct dma_resv *resv = ctx->windows[op->request.direction].buffer->resv;
+     struct sgu_dma_fence *f;
+@@ -553,18 +564,26 @@ static int sgu_publish_fence(struct tbstream_gpu_context *ctx, struct sgu_hw_ope
+         ret = -ENOMEM;
+         goto unlock;
+     }
+-    spin_lock_init(&f->lock);
+-    __module_get(THIS_MODULE);
+-    dma_fence_init(&f->base, &sgu_fence_ops, &f->lock,
+-        ctx->fence_context + op->request.direction * SGU_MAX_QUEUE_DEPTH + slot, ++*sequence);
+     ret = dma_resv_reserve_fences(resv, 1);
+-    if (ret)
+-        goto put;
++    if (ret) {
++        kfree(f);
++        goto unlock;
++    }
+ 
+     /* All potentially reclaiming allocation is over. Reserve publication and
+      * the complete descriptor enqueue against watchdog STOP as one transaction.
+-     * No completion path acquires resv or sdev->lock in the reverse direction. */
+-    mutex_lock(&ctx->dma_lock);
++     * No completion path acquires resv or sdev->lock in the reverse direction.
++     * Taken before the fence exists: a non-blocking caller that finds it held
++     * returns -EAGAIN with nothing published and the fence sequence unchanged. */
++    if (!sgu_dma_lock(ctx, nowait)) {
++        kfree(f);
++        ret = -EAGAIN;
++        goto unlock;
++    }
++    spin_lock_init(&f->lock);
++    __module_get(THIS_MODULE);
++    dma_fence_init(&f->base, &sgu_fence_ops, &f->lock,
++        ctx->fence_context + op->request.direction * SGU_MAX_QUEUE_DEPTH + slot, ++*sequence);
+     spin_lock_irqsave(&ctx->lock, flags);
+     if (READ_ONCE(ctx->failed) || ctx->stopped || !ctx->started || !ctx->armed ||
+         READ_ONCE(ctx->closing) || op->remaining ||
+@@ -590,7 +609,7 @@ unlock:
+ }
+ 
+ static int sgu_enqueue(struct tbstream_gpu_context *ctx, struct sgu_hw_operation *op,
+-                       bool standby, struct dma_fence **dependency)
++                       bool standby, struct dma_fence **dependency, bool nowait)
+ {
+     struct sgu_window *w = &ctx->windows[op->request.direction];
+     struct tb_ring *ring = op->request.direction == SGU_DIRECTION_TX ? ctx->sdev->tx_ring.ring : ctx->sdev->rx_ring.ring;
+@@ -602,7 +621,7 @@ static int sgu_enqueue(struct tbstream_gpu_context *ctx, struct sgu_hw_operation
+     u32 i;
+     bool cookie, header;
+ 
+-    ret = sgu_publish_fence(ctx, op, standby, dependency, &cookie);
++    ret = sgu_publish_fence(ctx, op, standby, dependency, &cookie, nowait);
+     if (ret)
+         return ret;
+     dma_sync_sgtable_for_device(w->device, w->mapping, w->direction);
+@@ -1475,7 +1494,8 @@ static bool tbstream_gpu_quarantined(struct tbstream_dev *sdev)
+ }
+ 
+ static int sgu_action_execute(struct tbstream_gpu_context *ctx, unsigned int command,
+-                              struct sgu_action *a, struct dma_fence **dependency)
++                              struct sgu_action *a, struct dma_fence **dependency,
++                              bool nowait)
+ {
+     struct sgu_hw_operation *op;
+     unsigned long flags;
+@@ -1538,7 +1558,8 @@ static int sgu_action_execute(struct tbstream_gpu_context *ctx, unsigned int com
+     case SGU_IOC_SUBMIT:
+         if (a->sequence <= ctx->submitted_sequence[a->direction])
+             return -ESTALE;
+-        mutex_lock(&ctx->dma_lock);
++        if (!sgu_dma_lock(ctx, nowait))
++            return -EAGAIN;
+         spin_lock_irqsave(&ctx->lock, flags);
+         allowed = ctx->armed && !ctx->stopped && !READ_ONCE(ctx->failed) && op->phase == SGU_OP_PREPARED;
+         if (!allowed) {
+@@ -1563,7 +1584,7 @@ static int sgu_action_execute(struct tbstream_gpu_context *ctx, unsigned int com
+         }
+         spin_unlock_irqrestore(&ctx->lock, flags);
+         mutex_unlock(&ctx->dma_lock);
+-        ret = sgu_enqueue(ctx, op, false, dependency);
++        ret = sgu_enqueue(ctx, op, false, dependency, nowait);
+         if (!ret) {
+             ctx->submitted_sequence[a->direction] = a->sequence;
+             a->queued_frames = op->total_frames;
+@@ -1587,7 +1608,7 @@ static int sgu_action_execute(struct tbstream_gpu_context *ctx, unsigned int com
+         spin_unlock_irqrestore(&ctx->lock, flags);
+         if (!allowed)
+             return -EINVAL;
+-        ret = sgu_enqueue(ctx, op, true, dependency);
++        ret = sgu_enqueue(ctx, op, true, dependency, nowait);
+         if (!ret) {
+             a->result = SGU_RESULT_RX_REPOSTED;
+             a->queued_frames = op->total_frames;
+@@ -1636,7 +1657,8 @@ static int sgu_action_wait(struct file *file, struct tbstream_dev *sdev,
+ 
+         if (!ctx)
+             return -ENXIO;
+-        ret = sgu_action_execute(ctx, command, action, &dependency);
++        ret = sgu_action_execute(ctx, command, action, &dependency,
++                                 file->f_flags & O_NONBLOCK);
+         if (ret == -EAGAIN) {
+             unsigned long flags;
+ 
+diff --git a/include/uapi/linux/strix_gpu_stream.h b/include/uapi/linux/strix_gpu_stream.h
+--- a/include/uapi/linux/strix_gpu_stream.h
++++ b/include/uapi/linux/strix_gpu_stream.h
+@@ -212,9 +212,10 @@ struct sgu_sync_file {
+  * mandatory. It does NOT reset the NHI, retrain the cable, or certify the peer.
+  * Success returns the unimported identity in fence and SESSION_RECOVERED.
+  * Blocking SUBMIT/RX_REPOST waits for foreign fences without holding the
+- * device mutex; O_NONBLOCK returns EAGAIN without publishing/enqueuing, both
+- * for an unsignalled dependency and for a contended device mutex. It still
+- * takes the short internal context and reservation locks. */
++ * device mutex; O_NONBLOCK returns EAGAIN without publishing/enqueuing, for an
++ * unsignalled dependency and for a contended device, reservation or DMA
++ * submission mutex (held by the watchdog while it stops the rings). Only the
++ * context spinlock is still taken. */
+ 
+ /* Experimental numbers local to this opt-in device mode, not allocated stock
+  * USB4STREAM ioctls. Exact command/size is checked; unknown commands fail. */
