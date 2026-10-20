@@ -148,8 +148,13 @@ class RunnerEndToEndTests(unittest.TestCase):
         self.ssh.chmod(0o755)
 
     def run_bench(self, bench_path, pairs, *extra):
+        log = self.root / 'kernel.log'
+        log.write_text('')
+        proc = self.root / 'proc'
+        proc.mkdir(exist_ok=True)
         args = ['--peer', 'peer', '--out', str(self.root / 'out'), '--bench', str(bench_path),
-                '--ssh', str(self.ssh), *extra]
+                '--ssh', str(self.ssh),
+                '--diagnose-args', f'--kernel-log {log} --proc-root {proc}', *extra]
         for pair in pairs:
             args += ['--pair', pair]
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -201,6 +206,15 @@ class RunnerEndToEndTests(unittest.TestCase):
         status, result = self.run_bench(Path('/bin/true'), ['/dev/null:/dev/null:0:0'])
         self.assertEqual((status, result['status'], result['valid']), (1, 'refused', False))
         self.assertIn('peer: ring budget check failed', result['reason'])
+
+    def test_preflight_is_fail_closed_with_logs(self):
+        src = (REPO / 'tools/lab/run_stream_bench.py').read_text()
+        self.assertIn("'--require-budget', '--logs'", src)
+        # An unreadable kernel log on the peer refuses the run.
+        status, result = self.run_bench(Path('/bin/true'), ['/dev/null:/dev/null:0:0'],
+                                        '--diagnose-args', f'--kernel-log {self.root}/missing.log')
+        self.assertEqual((status, result['status']), (1, 'refused'))
+        self.assertIn('kernel log unavailable', result['reason'])
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
