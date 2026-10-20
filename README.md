@@ -73,6 +73,14 @@ the current driver on its own.
 > and suspend, and Gen3 retrain locking and exclusion. 0032 adds missing
 > kernel-doc lines:
 > [docs/AUDIT-FIXES-2026-10-19.md](docs/AUDIT-FIXES-2026-10-19.md).
+>
+> **0040–0042 (2026-10-20), offline-tested and compile-tested only:** the
+> GPU completion path after idle gaps. 0040 times every stage from SUBMIT to
+> EVENT, plus the ring interrupts and worker runs (configfs `gpu_timing`).
+> 0041 lets a GPU session complete by polling from `SGU_IOC_EVENT`, without
+> interrupt or worker (`gpu_poll`, off by default). 0042 holds a CPU latency
+> QoS request while a stream's rings run (`latency_qos_us`, off by default):
+> [docs/GPU-COMPLETION-POLLING.md](docs/GPU-COMPLETION-POLLING.md).
 
 ## Contents
 
@@ -342,6 +350,9 @@ How to reproduce and record both benchmarks:
 | `0037-stream-damaged-close-is-an-error` | A CLOSE frame with a CRC error or overrun gives `EIO` instead of end of file. |
 | `0038-teardown-reset-pending-survives-requests-contention-suspend` | The pending teardown reset has request generations, so a finishing reset never clears a newer request. A busy domain lock with no consumer is retried every 2 s instead of parking. Nothing queues it during suspend; resume re-arms it. |
 | `0039-gen3-retrain-serialized-and-exclusive` | The Gen3 retrain takes the domain lock before any sideband access, keeps the NHI free of data rings (the DMA reset admission) until the port reset is done, and is vetoed by any tunnel (new CM op `tunnels_active`). |
+| `0040-completion-path-timing` | NHI rings stamp the interrupt, the worker's start and each reap, and count interrupts and collections. GPU operations are timed from SUBMIT through doorbell, reap, callback and fence to EVENT, per direction, with histograms and the last four operations. Read and reset through configfs `gpu_timing`. No behaviour change. |
+| `0041-gpu-opt-in-polled-completion` | With `gpu_poll`, a GPU session's rings run without interrupts: `SGU_IOC_EVENT` and a 1 ms watchdog fallback collect completed descriptors with the new `tb_ring_collect()` (bounded, refills the ring, same callbacks and 0016 chain). Interrupt mode stays the default. |
+| `0042-stream-opt-in-cpu-latency-qos` | With `latency_qos_us`, a host stream (from open to close) or a GPU session (from ARM to STOP, close, failure or abandonment) holds a `cpu_latency_qos` request. Off by default. |
 
 Design rule throughout: a timeout, process exit, failed MMIO read or missing
 PCI device is **never** treated as proof that DMA has stopped. Memory the
@@ -373,12 +384,12 @@ Before these fixes the series could not be built:
 
 | Check | Result |
 |---|---|
-| Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 39 patches (0012–0039: checked offline in WSL and on cluster1, 2026-10-20) |
+| Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 42 patches (0012–0039: checked offline in WSL and on cluster1, 2026-10-20; 0040–0042: offline in WSL and on cluster1, 2026-10-20) |
 | `prepare_overlay.py` vs applying the series to the kernel | ✅ byte-identical (22 files) |
-| Offline unit tests (`unittest discover`) | ✅ 261 run, OK (1 bundle-only skip) with 0001–0039 (kernel and tools suites merged); every patch 0020–0039 also passes on its own |
-| Modules with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` (0001–0017, 0001–0018 and 0001–0019: full `vmlinux modules` builds with modpost on cluster1, 2026-10-19; 0001–0032, 0001–0035 and 0001–0039: `vmlinux modules` with GPU on, then all modules relinked with GPU off, modpost both times, no kernel-doc warnings left; `tools/check_build_log.py` makes any diagnostic in this series' files fatal in CI) |
+| Offline unit tests (`unittest discover`) | ✅ 274 run, OK (1 bundle-only skip) with 0001–0042 (kernel and tools suites merged); every patch 0020–0042 also passes on its own |
+| Modules with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` (0001–0017, 0001–0018 and 0001–0019: full `vmlinux modules` builds with modpost on cluster1, 2026-10-19; 0001–0032, 0001–0035, 0001–0039 and 0001–0042: `vmlinux modules` with GPU on, then all modules relinked with GPU off, modpost both times, no kernel-doc warnings left; `tools/check_build_log.py` makes any diagnostic in this series' files fatal in CI) |
 | Link negotiation Gen3 × 2 on both cables | ✅ sysfs and lane registers; kept across every module reload and controller reset |
-| Complete 0001–0010 series loaded on hardware (0011 measured separately; 0012–0039 not yet) | ✅ both machines, modules built against the running kernel (exact vermagic and CRCs) |
+| Complete 0001–0010 series loaded on hardware (0011 measured separately; 0012–0042 not yet) | ✅ both machines, modules built against the running kernel (exact vermagic and CRCs) |
 | Host-memory bandwidth, integrity, latency (series) | ✅ 41.0–41.5 Gb/s with 4 streams, zero bad chunks; latency as above |
 | Stream open/close stress (series) | ✅ 80 cycles across all 4 streams and both directions (40 with `rx_napi`), zero failures, zero kernel warnings |
 | GPU-to-GPU, one-way (`strix-gpu-queue-visibility`, depth 8) | ✅ 4 windows, 32 operations, 131 104 bytes verified on the GPU |
@@ -536,6 +547,9 @@ Streams are created in configfs under
 | `rx_napi` | -1 | 0011: per-stream override of the module parameter (-1/0/1); ignored on `gpu_direct` streams |
 | `spin_us` | -1 | 0011: per-stream RX polling time, 0..1000 µs. Since 0015 the spin does not hold the device mutex: a writer or `poll()` on the same stream is not delayed by it |
 | `irq_cpu` | -1 | 0011: CPU for the stream's TX/RX ring interrupts; restored on close since 0015. irqbalance can move them again: ban these IRQs in irqbalance if the placement must hold |
+| `latency_qos_us` | -1 | 0042: CPU latency limit held while the stream's rings run, 0..100000 µs; -1 follows the module parameter (default none) |
+| `gpu_poll` | -1 | 0041: GPU sessions complete by polling from `SGU_IOC_EVENT` (1) or by interrupts (0); -1 follows the module parameter |
+| `gpu_timing` | — | 0040: completion-path timing of the GPU session; write anything to reset ([docs/GPU-COMPLETION-POLLING.md](docs/GPU-COMPLETION-POLLING.md)) |
 | `open_timeout_ms` | -1 | 0019: how long a blocking `open()` waits for the peer's stream service while its XDomain is connected, 0..600000 ms; -1 follows the module parameter, 0 does not wait |
 | `gpu_quarantine` (RO) / `gpu_recover` (WO) | — | quarantined GPU context; write `reap` or `reset` (CAP_SYS_ADMIN, no open FD) |
 
@@ -548,6 +562,9 @@ Module parameters:
 | `thunderbolt_stream.spin_us` | 0 | 0010: polling time before re-arming the RX interrupt; 25 is the measured sweet spot (10 is too short for 4 KiB round trips); at most 1000 (0030) |
 | `thunderbolt_stream.gpu_dma_timeout_ms` / `gpu_standby_timeout_ms` | 30000 / 300000 | GPU DMA deadlines |
 | `thunderbolt_stream.open_timeout_ms` | 30000 | 0019: default wait of a blocking `open()` for the peer (at most 600000); without the domain or XDomain `open()` fails at once |
+| `thunderbolt_stream.gpu_poll` | off | 0041: polled completion for GPU sessions opened afterwards |
+| `thunderbolt_stream.gpu_poll_budget` / `gpu_poll_fallback_ms` | 64 / 1 | 0041: frames per ring per collection (1..4096); watchdog collection period while polling (1..100 ms) |
+| `thunderbolt_stream.latency_qos_us` | -1 | 0042: CPU latency QoS while rings run, clamped to 100000 µs; -1 none |
 | `thunderbolt.teardown_reset` | on | 0018: reset an idle AMD v1 host interface after a DMA path teardown; 0029: stays pending until the NHI is free |
 | `thunderbolt.gen3_retrain` | 0 | 0035: port resets allowed to bring a new XDomain link from Gen2 to Gen3 (at most 3); only with the lane adapter and the port (LINK_CONF Gen3 Support) advertising Gen3 and no DMA tunnel or data ring; every decision is logged |
 | `thunderbolt_stream.gpu_reap_orphans` | — | 0013, write-only: `1` reaps quarantined GPU contexts whose configfs stream was removed (`rmdir`); `EBUSY` if some still lack a stop proof |
@@ -631,6 +648,9 @@ Reports describe the state at their own patch level:
 9. [Stream detach and domain teardown](docs/DETACH-FIXES-2026-10-19.md), patches
    0017–0019: the RAM-ring detach bug, the reboot vmcore, the NHI wedge
    analysis, the idle-only teardown reset and the hardware checks still pending.
+10. [Audit fixes](docs/AUDIT-FIXES-2026-10-19.md), patches 0020–0039.
+11. [GPU completion path](docs/GPU-COMPLETION-POLLING.md), patches 0040–0042:
+    timing, opt-in polling and CPU latency QoS.
 
 The matching engine is `hyukudan/strix-halo-engine-lab`; its multi-slot entry
 point is `strix-gpu-queue-visibility` (`lab/gpu_queue`, `--queue-depth 2..8`).
