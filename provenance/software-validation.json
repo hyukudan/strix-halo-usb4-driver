@@ -3,7 +3,7 @@
   "kernel": "72d3fcf802c45d00b300f25b848a93c3a2bd7c7e",
   "patch_count": 43,
   "last_patch": "0043-gpu-tx-progress-stall-detector.patch",
-  "series_sha256": "d50bb79502e287e399efdd5837fb634468a0553b19162c616a2e40c0d5757199",
+  "series_sha256": "42cd628014770f8e07b0a4323e5a092af7dceddda3451876cb6ea6f21f22a2e0",
   "materialized_files": {
     "drivers/net/thunderbolt/dma_recovery.h": "1fb352bbee0ba4802b03ba0a24317f6849cacb8fb8810866e030c62cdca1bcb0",
     "drivers/net/thunderbolt/main.c": "a4bbc4bc58aab75c79a4606c04d5eefd57f1e1d682a35b13a674d25c89394944",
@@ -12,7 +12,7 @@
     "drivers/thunderbolt/dma_recovery.c": "842c361f124c558d4bb3f8bfc833b6056937f9776ba27a5642da6bf9de75f353",
     "drivers/thunderbolt/domain.c": "0c0e0dc833e1eff02e597f1e267c9ea19a41e7c6618512707985ae06cd40b7c7",
     "drivers/thunderbolt/gpu_group_reset.h": "4c43b4d72a6464b53924b678b40166ffd5dce85f4c7339a1bde5d42b775ba384",
-    "drivers/thunderbolt/gpu_stream.c": "289f4b52331c2b385fbeae9d8f6fd730c1d9a054c431718df49673fff3919f26",
+    "drivers/thunderbolt/gpu_stream.c": "2fdd5c4f9aa5156ba35c0b8e5cfa62782a566c7dce4ce2ac55446faf9f66d9c0",
     "drivers/thunderbolt/gpu_stream.h": "448060afa783610f4669d0cd33ee98129bb083d105f779a8a6510f7c98cc9ea1",
     "drivers/thunderbolt/gpu_stream_logic.h": "e4731512930e9d53fc966961afa8aa400be8d4464369053229909d0ac9dc0299",
     "drivers/thunderbolt/nhi.c": "2dff5bc353802d8c4ec1843ec4a2547d86e9223045af15e630ddeb924166c359",

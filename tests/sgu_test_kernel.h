@@ -178,7 +178,16 @@ static bool list_empty(const struct list_head *l) { return l->next==l; }
 static void list_add_tail(struct list_head *n,struct list_head *h) { n->prev=h->prev;n->next=h;h->prev->next=n;h->prev=n; }
 static void list_del_init(struct list_head *n) { n->prev->next=n->next;n->next->prev=n->prev;INIT_LIST_HEAD(n); }
 
-static u64 ktime_get_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);return (u64)t.tv_sec*1000000000ULL+t.tv_nsec; }
+/* The monotonic clock; a test may drive it instead (fake_clock): then it
+ * moves 1 ns per read and by clock_advance_ms(), never by descheduling. */
+static bool fake_clock;
+static u64 fake_clock_ns;
+static u64 ktime_get_ns(void) {
+    if(__atomic_load_n(&fake_clock,__ATOMIC_SEQ_CST))return __atomic_add_fetch(&fake_clock_ns,1,__ATOMIC_SEQ_CST);
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);return (u64)t.tv_sec*1000000000ULL+t.tv_nsec;
+}
+static void clock_advance_ms(u64 ms) { __atomic_add_fetch(&fake_clock_ns,ms*NSEC_PER_MSEC,__ATOMIC_SEQ_CST); }
+static void clock_fake(bool on) { if(on)fake_clock_ns=ktime_get_ns(); __atomic_store_n(&fake_clock,on,__ATOMIC_SEQ_CST); }
 #define jiffies ((unsigned long)(ktime_get_ns()/NSEC_PER_MSEC))
 #define msecs_to_jiffies(x) ((unsigned long)(x))
 #define time_after_eq(a,b) ((long)((a)-(b))>=0)
@@ -397,9 +406,10 @@ static unsigned tb_ring_collect(struct tb_ring *r,unsigned budget) {
     if(collect_requires)assert(pthread_mutex_trylock(&collect_requires->m));
     ++collect_calls;++r->polls;
     if(!r->running)return 0;
+    /* As tb_ring_collect(): one set of stamps for the whole batch. */
+    if(!list_empty(&r->done)){r->cb_stamps.irq_ns=0;r->cb_stamps.start_ns=ktime_get_ns();r->cb_stamps.reap_ns=ktime_get_ns();}
     while(n<budget&&!list_empty(&r->done)) {
         struct ring_frame *f=container_of(r->done.next,struct ring_frame,list);
-        r->cb_stamps.irq_ns=0;r->cb_stamps.start_ns=ktime_get_ns();r->cb_stamps.reap_ns=ktime_get_ns();
         list_del_init(&f->list);f->callback(r,f,false);++n;
     }
     if(n)++r->collections;
@@ -411,6 +421,7 @@ static unsigned tb_ring_collect(struct tb_ring *r,unsigned budget) {
 struct tb_ring_snapshot { u32 head, tail, queued; bool front_completed, running; };
 static spinlock_t *snapshot_forbids;
 static int snapshot_calls;
+static void (*snapshot_hook)(struct tb_ring *); /* runs between the read and its store */
 static void tb_ring_snapshot(struct tb_ring *r,struct tb_ring_snapshot *s) {
     struct list_head *p;u32 posted=0,done=0;
     if(snapshot_forbids){assert(!pthread_mutex_trylock(&snapshot_forbids->m));pthread_mutex_unlock(&snapshot_forbids->m);}
@@ -418,6 +429,7 @@ static void tb_ring_snapshot(struct tb_ring *r,struct tb_ring_snapshot *s) {
     for(p=r->done.next;p!=&r->done;p=p->next)++done;
     s->head=posted+done;s->tail=0;s->queued=0;s->front_completed=done>0;s->running=r->running;
     ++snapshot_calls;
+    if(snapshot_hook)snapshot_hook(r);
 }
 static bool flush_work(struct work_struct *work) {
     struct tb_ring *ring = container_of(work, struct tb_ring, work);

@@ -26,8 +26,8 @@ diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
 + * operation of the direction is pending and no frame completed on its ring
 + * for more than gpu_stall_ms. It is counted once, when a collection point
 + * (the EVENT collection, the watchdog) first sees it, or, if none looked
-+ * meanwhile, by the completion that ends it. It ends at the next frame
-+ * completed on that ring, or at its cancellation. The record keeps the last
++ * meanwhile, by the completion or cancellation that ends it. It ends at
++ * the next frame completed on that ring, or at its cancellation. The record keeps the last
 + * episode: the oldest pending operation, the pending operations of both
 + * directions and, if a collection point saw it, the ring then.
 + */
@@ -44,19 +44,20 @@ diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
  
  struct tbstream_gpu_context {
      struct tbstream_dev *sdev;
-@@ -142,6 +171,11 @@ struct tbstream_gpu_context {
+@@ -142,6 +171,12 @@ struct tbstream_gpu_context {
      struct workqueue_struct *watchdog_wq;
      struct sgu_stats stats;
      struct sgu_timing timing[2]; /* under @lock */
 +    struct sgu_stall stall[2]; /* under @lock, reset with the timing */
 +    /* Stall detector progress, under @lock and kept across resets: the last
-+     * frame completed per ring (its reap), the last effective collection
-+     * (polled mode) and the longest interval between collections since. */
++     * frame completed (its reap) or canceled per ring, the last effective
++     * collection (polled mode) and the longest interval between collections
++     * since. */
 +    u64 progress_ns[2], collected_ns, collect_gap_ns[2];
      struct sgu_fence identity;
      struct sgu_window windows[2];
      struct sgu_hw_operation operations[2][SGU_MAX_QUEUE_DEPTH];
-@@ -355,6 +389,155 @@ static bool sgu_terminal_check(struct tbstream_gpu_context *ctx, struct sgu_hw_o
+@@ -355,6 +390,169 @@ static bool sgu_terminal_check(struct tbstream_gpu_context *ctx, struct sgu_hw_o
      return false;
  }
  
@@ -113,34 +114,48 @@ diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
 +}
 +
 +/*
++ * ctx->lock held, polled mode: the longest interval between effective
++ * collections during the episode @r of @direction, up to @at. It includes
++ * the time since the last effective collection (from the episode's start if
++ * that is later), so collections that stopped are never hidden.
++ */
++static u64 sgu_stall_gap(const struct tbstream_gpu_context *ctx, u32 direction,
++                         const struct sgu_stall_record *r, u64 at)
++{
++    u64 from = max(ctx->collected_ns, r->start_ns);
++
++    return max(ctx->collect_gap_ns[direction], at > from ? at - from : 0);
++}
++
++/*
 + * Callback context, ctx->lock held, before the frame's operation counts it:
-+ * a frame of @direction was completed (reaped at @reap_ns) or canceled. It
-+ * ends the open episode. A completion after more than gpu_stall_ms without
-+ * progress that no collection point saw is counted here instead, once.
++ * a frame of @direction was completed (reaped at @reap_ns) or canceled. Both
++ * end the interval without progress, and so the open episode. An interval
++ * longer than gpu_stall_ms that no collection point saw is counted here
++ * instead, once, also when it ends by cancellation.
 + */
 +static void sgu_stall_progress(struct tbstream_gpu_context *ctx, u32 direction,
 +                               bool canceled, u64 reap_ns)
 +{
-+    u64 threshold = (u64)READ_ONCE(gpu_stall_ms) * NSEC_PER_MSEC, since, end, ns;
++    u64 threshold = (u64)READ_ONCE(gpu_stall_ms) * NSEC_PER_MSEC, since, end, ns, at;
 +    struct sgu_stall *s = &ctx->stall[direction];
 +    struct sgu_stall_record *r = &s->last;
 +    struct sgu_hw_operation *oldest;
 +
-+    if (!canceled && !reap_ns)
-+        reap_ns = ktime_get_ns(); /* every collection stamps its batch */
++    /* Every collection stamps its batch; a cancellation has no reap. */
++    at = canceled || !reap_ns ? ktime_get_ns() : reap_ns;
 +    /* The interval starts at the last completion or later: most frames
 +     * need no scan of the operations. */
-+    if (!canceled && !s->open && threshold && reap_ns - ctx->progress_ns[direction] > threshold) {
++    if (!s->open && threshold && at - ctx->progress_ns[direction] > threshold) {
 +        since = sgu_stall_since(ctx, direction, &oldest);
-+        if (since && reap_ns > since && reap_ns - since > threshold)
-+            sgu_stall_open(ctx, direction, oldest, since, reap_ns);
++        if (since && at > since && at - since > threshold)
++            sgu_stall_open(ctx, direction, oldest, since, at);
 +    }
 +    if (s->open) {
 +        /* A collection point may have seen it while this batch was reaped. */
-+        end = canceled ? ktime_get_ns() : max(reap_ns, r->seen_ns);
-+        if (!canceled && ctx->polled)
-+            ctx->collect_gap_ns[direction] = max(ctx->collect_gap_ns[direction],
-+                                                 end - min(end, max(ctx->collected_ns, r->start_ns)));
++        end = max(at, r->seen_ns);
++        if (ctx->polled)
++            ctx->collect_gap_ns[direction] = sgu_stall_gap(ctx, direction, r, end);
 +        ns = end > r->start_ns ? end - r->start_ns : 0;
 +        s->open = false;
 +        s->total_ns += ns;
@@ -150,8 +165,8 @@ diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
 +        r->canceled = canceled;
 +        r->collect_gap_ns = ctx->collect_gap_ns[direction];
 +    }
-+    if (!canceled)
-+        ctx->progress_ns[direction] = reap_ns;
++    /* Later frames of a canceled batch start a new interval: no recount. */
++    ctx->progress_ns[direction] = at;
 +    ctx->collect_gap_ns[direction] = 0;
 +}
 +
@@ -212,7 +227,7 @@ diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
  static void sgu_callback(struct tb_ring *ring, struct ring_frame *frame, bool canceled)
  {
      struct sgu_hw_frame *f = container_of(frame, struct sgu_hw_frame, frame);
-@@ -371,6 +554,7 @@ static void sgu_callback(struct tb_ring *ring, struct ring_frame *frame, bool ca
+@@ -371,6 +569,7 @@ static void sgu_callback(struct tb_ring *ring, struct ring_frame *frame, bool ca
          goto unlock;
      }
      f->queued = false;
@@ -220,7 +235,7 @@ diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
      --op->remaining;
      if (canceled) {
          f->result.actual_bytes = 0;
-@@ -891,6 +1075,7 @@ static unsigned int sgu_collect_locked(struct tbstream_gpu_context *ctx)
+@@ -891,6 +1090,7 @@ static unsigned int sgu_collect_locked(struct tbstream_gpu_context *ctx)
      dma_fence_end_signalling(cookie);
      ++ctx->polls;
      ctx->polled_frames += n;
@@ -228,7 +243,7 @@ diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
      return n;
  }
  
-@@ -1025,6 +1210,9 @@ static void sgu_watchdog(struct work_struct *work)
+@@ -1025,6 +1225,9 @@ static void sgu_watchdog(struct work_struct *work)
          goto unlock;
      /* Fallback progress for waiters that do not call EVENT */
      sgu_collect_locked(ctx);
@@ -238,31 +253,65 @@ diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
      now = ktime_get_ns();
      spin_lock_irqsave(&ctx->lock, flags);
      for (direction = 0; direction < 2; ++direction) {
-@@ -1464,6 +1652,7 @@ static ssize_t sgu_timing_show(struct tbstream_gpu_context *ctx, char *buf)
+@@ -1456,14 +1659,30 @@ static void sgu_ring_counters(struct tb_ring *ring, u64 *irqs, u64 *collections,
+     spin_unlock_irqrestore(&ring->lock, flags);
+ }
+ 
+-/* The gpu_timing configfs attribute. Caller holds sdev->lock. */
++/*
++ * The line that started at @start was cut by the end of the page: drop it,
++ * so the read-out holds whole lines only. A line that ends exactly at the
++ * last usable byte cannot be told from a cut one and is dropped too.
++ */
++static bool sgu_line_fits(char *buf, ssize_t *len, ssize_t start)
++{
++    if (*len < (ssize_t)PAGE_SIZE - 1)
++        return true;
++    *len = start;
++    buf[start] = '\0';
++    return false;
++}
++
++/* The gpu_timing configfs attribute: whole lines, at most a page. Caller
++ * holds sdev->lock. */
+ static ssize_t sgu_timing_show(struct tbstream_gpu_context *ctx, char *buf)
+ {
+     static const char *const dirs[2] = { "tx", "rx" };
+     struct sgu_timing *t;
      unsigned long flags;
-     ssize_t len = 0;
+-    ssize_t len = 0;
++    ssize_t len = 0, start;
      u32 d, s, b, i;
 +    u64 now;
  
      len += scnprintf(buf + len, PAGE_SIZE - len,
                       "mode %s polls %llu polled_frames %llu qos_us %d\n",
-@@ -1480,7 +1669,32 @@ static ssize_t sgu_timing_show(struct tbstream_gpu_context *ctx, char *buf)
+@@ -1480,29 +1699,77 @@ static ssize_t sgu_timing_show(struct tbstream_gpu_context *ctx, char *buf)
                           dirs[d], irqs, collections,
                           collections ? div64_u64(total, collections) : 0, max);
      }
++    /* The lines above are short and always fit; from here on a line is
++     * kept only whole. */
++    start = len;
 +    len += scnprintf(buf + len, PAGE_SIZE - len, "stall threshold_ms %u\n", READ_ONCE(gpu_stall_ms));
++    if (!sgu_line_fits(buf, &len, start))
++        return len;
      spin_lock_irqsave(&ctx->lock, flags);
-+    /* Before the stage tables, so a full page never cuts these lines. */
++    /* Before the stage tables, so a full page never drops these lines. */
 +    now = ktime_get_ns();
 +    for (d = 0; d < 2; ++d) {
 +        const struct sgu_stall *st = &ctx->stall[d];
 +        const struct sgu_stall_record *r = &st->last;
 +        u64 end = st->open ? now : r->end_ns;
 +
++        start = len;
 +        len += scnprintf(buf + len, PAGE_SIZE - len, "stall %s episodes %llu total_ns %llu max_ns %llu open %d\n",
 +                         dirs[d], st->episodes, st->total_ns, st->max_ns, st->open);
++        if (!sgu_line_fits(buf, &len, start))
++            goto unlock;
 +        if (!st->episodes)
 +            continue;
++        start = len;
 +        len += scnprintf(buf + len, PAGE_SIZE - len,
 +                         "stall %s last seq %llu slot %u state %s duration_ns %llu seen_ns %llu pending_tx %u pending_rx %u",
 +                         dirs[d], r->sequence, r->slot, st->open ? "open" : r->canceled ? "canceled" : "ended",
@@ -273,13 +322,49 @@ diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
 +                             r->head, r->tail, r->queued, r->front_completed);
 +        else
 +            len += scnprintf(buf + len, PAGE_SIZE - len, " head -1 tail -1 queued -1 front_completed -1");
++        /* While open, up to now: collections that stopped show here. */
 +        len += scnprintf(buf + len, PAGE_SIZE - len, " collect_gap_ns %lld\n",
-+                         !ctx->polled ? -1LL : (s64)(st->open ? ctx->collect_gap_ns[d] : r->collect_gap_ns));
++                         !ctx->polled ? -1LL :
++                         (s64)(st->open ? sgu_stall_gap(ctx, d, r, now) : r->collect_gap_ns));
++        if (!sgu_line_fits(buf, &len, start))
++            goto unlock;
 +    }
      for (d = 0; d < 2; ++d) {
          t = &ctx->timing[d];
++        start = len;
          len += scnprintf(buf + len, PAGE_SIZE - len, "%s ops %llu\n", dirs[d], t->ops);
-@@ -1513,6 +1727,8 @@ static void sgu_timing_reset(struct tbstream_gpu_context *ctx)
++        if (!sgu_line_fits(buf, &len, start))
++            goto unlock;
+         for (s = 0; s < SGU_T_STAGES; ++s) {
++            start = len;
+             len += scnprintf(buf + len, PAGE_SIZE - len, "%s %s n %llu mean_ns %llu max_ns %llu hist_us",
+                              dirs[d], sgu_timing_stage_names[s], t->count[s],
+                              t->count[s] ? div64_u64(t->sum_ns[s], t->count[s]) : 0, t->max_ns[s]);
+             for (b = 0; b < SGU_T_BUCKETS; ++b)
+                 len += scnprintf(buf + len, PAGE_SIZE - len, " %u", t->hist[s][b]);
+             len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
++            if (!sgu_line_fits(buf, &len, start))
++                goto unlock;
+         }
+         for (i = 0; i < SGU_T_RECORDS && i < t->ops; ++i) {
+             const struct sgu_timing_record *r = &t->last[(t->next - 1 - i) % SGU_T_RECORDS];
+ 
++            start = len;
+             len += scnprintf(buf + len, PAGE_SIZE - len, "%s last seq %llu slot %u ns", dirs[d],
+                              r->sequence, r->slot);
+             for (s = 0; s < ARRAY_SIZE(r->at); ++s)
+                 len += scnprintf(buf + len, PAGE_SIZE - len, " %lld",
+                                  r->at[s] ? (s64)(r->at[s] - r->submit_ns) : -1LL);
+             len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
++            if (!sgu_line_fits(buf, &len, start))
++                goto unlock;
+         }
+     }
++unlock:
+     spin_unlock_irqrestore(&ctx->lock, flags);
+     return len;
+ }
+@@ -1513,6 +1780,8 @@ static void sgu_timing_reset(struct tbstream_gpu_context *ctx)
  
      spin_lock_irqsave(&ctx->lock, flags);
      memset(ctx->timing, 0, sizeof(ctx->timing));
