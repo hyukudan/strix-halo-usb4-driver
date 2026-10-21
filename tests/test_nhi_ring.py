@@ -2,7 +2,7 @@
 """Run the actual ring completion path of the patched nhi.c under ASan/UBSan.
 
 ring_write_descriptors(), ring_work(), tb_ring_poll() and __ring_interrupt()
-(and, with 0041, the polling collector) are extracted from nhi.c; the ring,
+(and, with 0041, the polling collector; with 0043, the diagnostic snapshot) are extracted from nhi.c; the ring,
 frame and descriptor layouts from the patched headers. MMIO, the workqueue
 and the clock are doubles (the clock is deterministic, so the completion
 path timing of 0040 is checked exactly).
@@ -18,9 +18,10 @@ import unittest
 ROOT = Path(__file__).resolve().parent
 CASES = ('irq_is_stamped', 'irq_is_stamped_with_start_poll', 'work_collection_is_stamped',
          'cancel_is_not_a_collection', 'collect_in_order_with_budget_and_refill',
-         'collect_refuses_interrupt_ring', 'collect_then_stop_exactly_once', 'collect_rx_fields')
+         'collect_refuses_interrupt_ring', 'collect_then_stop_exactly_once', 'collect_rx_fields',
+         'snapshot_reads_without_changing')
 FUNCTIONS = ('ring_full', 'ring_empty', 'ring_write_descriptors', 'ring_work', 'tb_ring_poll',
-             '__ring_interrupt', 'tb_ring_collect')
+             '__ring_interrupt', 'tb_ring_collect', 'tb_ring_snapshot')
 
 
 def extract(text, name):
@@ -56,6 +57,7 @@ class NhiRingTests(unittest.TestCase):
                  block(header, 'enum ring_desc_flags {'),
                  'struct tb_nhi;\nstruct ring_frame;\n',
                  block(header, 'struct tb_ring_stamps {'),
+                 block(header, 'struct tb_ring_snapshot {'),
                  block(header, 'struct tb_ring {'),
                  defines(header, 'RING_FLAG_'),
                  'typedef void (*ring_cb)(struct tb_ring *, struct ring_frame *, bool canceled);\n',

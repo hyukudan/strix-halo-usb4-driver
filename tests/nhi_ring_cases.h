@@ -242,6 +242,35 @@ static void collect_rx_fields(void)
     assert(f.frames[1].size == 100 && f.frames[1].eof == 3 && (f.frames[1].flags & RING_DESC_CRC_ERROR));
 }
 
+/* 0043: the diagnostic snapshot reads head, tail, the queue and whether the
+ * front descriptor completed, and changes nothing (no reap, refill,
+ * doorbell or callback). */
+static void snapshot_reads_without_changing(void)
+{
+    struct tb_ring_snapshot s;
+    struct fixture f;
+
+    fixture_init(&f, true);
+    post(&f, 0, 10);
+    tb_ring_snapshot(&f.ring, &s);
+    assert(s.head == 7 && s.tail == 0 && s.queued == 3 && !s.front_completed && s.running);
+    hw_complete(&f, 2);
+    tb_ring_snapshot(&f.ring, &s);
+    assert(s.front_completed && s.head == 7 && s.tail == 0 && s.queued == 3);
+    assert(!calls && doorbells == 1 && in_flight(&f) == 7 && !f.ring.lock.held);
+    ring_work(&f.ring.work);
+    tb_ring_snapshot(&f.ring, &s);
+    assert(calls == 2 && s.tail == 2 && s.head == 1 && s.queued == 1 && !s.front_completed);
+    /* An empty ring has no front descriptor, even a stale completed one. */
+    fixture_init(&f, false);
+    f.desc[0].flags = RING_DESC_COMPLETED;
+    tb_ring_snapshot(&f.ring, &s);
+    assert(!s.head && !s.tail && !s.queued && !s.front_completed);
+    f.ring.running = false;
+    tb_ring_snapshot(&f.ring, &s);
+    assert(!s.running && !calls && !doorbells);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -257,6 +286,8 @@ int main(int argc, char **argv)
         collect_in_order_with_budget_and_refill();
     else if (!strcmp(argv[1], "collect_refuses_interrupt_ring"))
         collect_refuses_interrupt_ring();
+    else if (!strcmp(argv[1], "snapshot_reads_without_changing"))
+        snapshot_reads_without_changing();
     else if (!strcmp(argv[1], "collect_then_stop_exactly_once"))
         collect_then_stop_exactly_once();
     else if (!strcmp(argv[1], "collect_rx_fields"))

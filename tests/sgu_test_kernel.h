@@ -405,6 +405,20 @@ static unsigned tb_ring_collect(struct tb_ring *r,unsigned budget) {
     if(n)++r->collections;
     return n;
 }
+/* The ring model for the stall detector: r->queue is posted and not
+ * finished, r->done finished and not collected (the front). A test may
+ * require a lock (ctx->lock) not to be held by the caller. */
+struct tb_ring_snapshot { u32 head, tail, queued; bool front_completed, running; };
+static spinlock_t *snapshot_forbids;
+static int snapshot_calls;
+static void tb_ring_snapshot(struct tb_ring *r,struct tb_ring_snapshot *s) {
+    struct list_head *p;u32 posted=0,done=0;
+    if(snapshot_forbids){assert(!pthread_mutex_trylock(&snapshot_forbids->m));pthread_mutex_unlock(&snapshot_forbids->m);}
+    for(p=r->queue.next;p!=&r->queue;p=p->next)++posted;
+    for(p=r->done.next;p!=&r->done;p=p->next)++done;
+    s->head=posted+done;s->tail=0;s->queued=0;s->front_completed=done>0;s->running=r->running;
+    ++snapshot_calls;
+}
 static bool flush_work(struct work_struct *work) {
     struct tb_ring *ring = container_of(work, struct tb_ring, work);
     if (!ring->running && !stop_fails)

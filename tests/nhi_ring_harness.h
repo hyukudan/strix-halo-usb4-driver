@@ -39,6 +39,14 @@ static void list_splice_tail_init(struct list_head *l, struct list_head *h)
     while (!list_empty(l))
         list_move_tail(l->next, h);
 }
+static size_t list_count_nodes(const struct list_head *h)
+{
+    size_t n = 0;
+
+    for (const struct list_head *p = h->next; p != h; p = p->next)
+        ++n;
+    return n;
+}
 #define LIST_HEAD(n) struct list_head n = { &(n), &(n) }
 #define list_first_entry(h, t, m) container_of((h)->next, t, m)
 #define list_for_each_entry_safe(pos, n, head, member) \

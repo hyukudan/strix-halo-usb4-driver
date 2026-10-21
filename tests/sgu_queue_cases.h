@@ -356,7 +356,9 @@ static void test_completion_timing(void) {
     for(unsigned d=0;d<2;++d){ctx->timing[d].ops=~0ULL>>1;ctx->timing[d].next=SGU_T_RECORDS;
         for(unsigned s=0;s<SGU_T_STAGES;++s){ctx->timing[d].count[s]=~0ULL>>1;ctx->timing[d].max_ns[s]=~0ULL>>1;
             for(unsigned b=0;b<SGU_T_BUCKETS;++b)ctx->timing[d].hist[s][b]=0xffffffffU;}}
-    len=sgu_timing_show(ctx,buf);assert((size_t)len<PAGE_SIZE&&strstr(buf,"rx last seq"));
+    /* Every stage table fits; at these extremes (19-digit counters) the page
+     * ends within the last records, after the 0043 stall lines. */
+    len=sgu_timing_show(ctx,buf);assert((size_t)len<PAGE_SIZE&&strstr(buf,"rx submit_event n "));
     free(buf);
     /* Reset through the attribute's path. */
     assert(tbstream_gpu_timing_reset(&f.sdev)==0&&!ctx->timing[0].ops&&!ctx->timing[1].count[SGU_T_TOTAL]);
@@ -498,6 +500,207 @@ static void test_polled_completion(void) {
     assert(collect_calls==calls);
     fixture_close(&f);assert(atomic_load(&module_refs)==0);
 }
+/* 0043: stall episodes, diagnostics only. A submitted operation pending with
+ * no frame completed on its ring for more than gpu_stall_ms is one episode,
+ * seen by the watchdog or the EVENT collection (or by the completion that
+ * ends it) and ended by the next completion; nothing about traffic changes. */
+static void stall_sleep_ms(unsigned ms) { usleep(ms*1000U); }
+static void test_stall_episode_once(void) {
+    struct fixture f;fixture_open(&f,1,256,true);
+    struct tbstream_gpu_context *ctx=f.sdev.gpu_context;
+    struct sgu_hw_operation *op=&ctx->operations[0][0];
+    struct sgu_stall *st=&ctx->stall[0];
+    char *buf=calloc(1,PAGE_SIZE);assert(buf);
+    gpu_stall_ms=20;snapshot_forbids=&ctx->lock;snapshot_calls=0;
+    assert(prepare(&f,0,0,1,1,0,4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==0);
+    u64 deadline=op->deadline_ns;
+    /* Within the threshold the watchdog sees nothing. */
+    run_delayed_work(&ctx->watchdog);
+    assert(!st->episodes&&!st->open&&!snapshot_calls);
+    stall_sleep_ms(30);run_delayed_work(&ctx->watchdog);
+    assert(st->episodes==1&&st->open&&snapshot_calls==1&&!ctx->stall[1].episodes);
+    assert(st->last.sequence==1&&st->last.slot==0&&st->last.pending[0]==1&&st->last.pending[1]==0);
+    assert(st->last.snapshot&&st->last.head==2&&st->last.tail==0&&!st->last.queued&&!st->last.front_completed);
+    assert(st->last.start_ns==op->submitted_ns&&st->last.seen_ns-st->last.start_ns>20*NSEC_PER_MSEC);
+    /* Seen again while it lasts: still one episode, the ring read once. */
+    stall_sleep_ms(5);run_delayed_work(&ctx->watchdog);
+    assert(st->episodes==1&&st->open&&snapshot_calls==1&&!st->total_ns);
+    /* Diagnostics only: the operation, its deadline and the session are untouched. */
+    assert(op->deadline_ns==deadline&&!op->error_flags&&!op->canceled&&op->phase==SGU_OP_PENDING&&op->remaining==2);
+    assert(!ctx->failed&&!ctx->stopped&&!ctx->stats.timeouts&&atomic_load(&ctx->watchdog.scheduled));
+    sgu_timing_show(ctx,buf);
+    assert(strstr(buf,"stall threshold_ms 20\n")&&strstr(buf,"stall tx episodes 1 total_ns 0 max_ns 0 open 1\n"));
+    assert(strstr(buf,"stall tx last seq 1 slot 0 state open duration_ns "));
+    assert(strstr(buf," pending_tx 1 pending_rx 0 head 2 tail 0 queued 0 front_completed 0 collect_gap_ns -1\n"));
+    assert(strstr(buf,"stall rx episodes 0 total_ns 0 max_ns 0 open 0\n")&&!strstr(buf,"stall rx last"));
+    /* The next completion on the ring ends it, counted once. */
+    complete_one(f.sdev.tx_ring.ring);
+    assert(!st->open&&st->episodes==1&&st->total_ns==st->max_ns&&st->max_ns>=35*NSEC_PER_MSEC);
+    assert(st->last.end_ns>=st->last.seen_ns&&!st->last.canceled);
+    complete_one(f.sdev.tx_ring.ring);consume_event(&f,0,1,2);
+    assert(action(&f,SGU_IOC_RETIRE,0,1,1)==0);
+    assert(st->episodes==1&&ctx->timing[0].ops==1);
+    sgu_timing_show(ctx,buf);
+    assert(strstr(buf,"stall tx episodes 1 total_ns ")&&strstr(buf,"stall tx last seq 1 slot 0 state ended duration_ns "));
+    /* After an idle gap, a new operation is measured from its SUBMIT. */
+    stall_sleep_ms(30);
+    assert(prepare(&f,0,0,2,2,0,4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,2,2)==0);
+    run_delayed_work(&ctx->watchdog);complete_all(f.sdev.tx_ring.ring);consume_event(&f,0,2,2);
+    assert(action(&f,SGU_IOC_RETIRE,0,2,2)==0);
+    assert(st->episodes==1&&snapshot_calls==1);
+    /* Nobody looked: the completion that ends it counts it, without a ring read. */
+    assert(prepare(&f,0,0,3,3,0,4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,3,3)==0);
+    stall_sleep_ms(30);complete_one(f.sdev.tx_ring.ring);
+    assert(st->episodes==2&&!st->open&&!st->last.snapshot&&st->last.seen_ns==st->last.end_ns&&snapshot_calls==1);
+    assert(st->last.sequence==3&&st->last.end_ns-st->last.start_ns>20*NSEC_PER_MSEC);
+    sgu_timing_show(ctx,buf);
+    assert(strstr(buf,"stall tx last seq 3 slot 0 state ended ")&&strstr(buf," head -1 tail -1 queued -1 front_completed -1 collect_gap_ns -1\n"));
+    complete_one(f.sdev.tx_ring.ring);consume_event(&f,0,3,2);assert(st->episodes==2);
+    /* Filled to the maximum, the stall lines still come before the stage tables. */
+    for(unsigned d=0;d<2;++d){ctx->timing[d].ops=~0ULL>>1;ctx->timing[d].next=SGU_T_RECORDS;
+        ctx->stall[d].episodes=ctx->stall[d].total_ns=ctx->stall[d].max_ns=~0ULL>>1;ctx->stall[d].last.sequence=~0ULL;
+        for(unsigned s=0;s<SGU_T_STAGES;++s){ctx->timing[d].count[s]=~0ULL>>1;ctx->timing[d].max_ns[s]=~0ULL>>1;
+            for(unsigned b=0;b<SGU_T_BUCKETS;++b)ctx->timing[d].hist[s][b]=0xffffffffU;}}
+    ssize_t len=sgu_timing_show(ctx,buf);
+    assert((size_t)len<PAGE_SIZE&&strstr(buf,"stall rx last seq 18446744073709551615 ")&&strstr(buf," collect_gap_ns -1\ntx ops "));
+    /* Reset clears the counts. */
+    assert(tbstream_gpu_timing_reset(&f.sdev)==0&&!ctx->stall[0].episodes&&!ctx->stall[1].max_ns&&!ctx->stall[0].last.sequence);
+    snapshot_forbids=NULL;gpu_stall_ms=10;free(buf);
+    fixture_close(&f);assert(atomic_load(&module_refs)==0);
+}
+/* Reset keeps the progress: an operation that keeps completing frames is
+ * not a stall afterwards; an open episode is counted again once seen. */
+static void test_stall_reset_keeps_progress(void) {
+    struct fixture f;fixture_open(&f,1,256,true);
+    struct tbstream_gpu_context *ctx=f.sdev.gpu_context;
+    struct sgu_stall *st=&ctx->stall[0];
+    gpu_stall_ms=60;
+    assert(prepare(&f,0,0,1,1,0,3*4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==0);
+    stall_sleep_ms(40);complete_one(f.sdev.tx_ring.ring);
+    assert(!st->episodes);
+    assert(tbstream_gpu_timing_reset(&f.sdev)==0);
+    stall_sleep_ms(30);run_delayed_work(&ctx->watchdog); /* 30 ms since the frame, 70 since SUBMIT */
+    assert(!st->episodes&&!st->open);
+    stall_sleep_ms(40);run_delayed_work(&ctx->watchdog);
+    assert(st->episodes==1&&st->open);
+    u64 start=st->last.start_ns;
+    assert(start==ctx->progress_ns[0]&&start>ctx->operations[0][0].submitted_ns);
+    assert(tbstream_gpu_timing_reset(&f.sdev)==0&&!st->episodes&&!st->open);
+    run_delayed_work(&ctx->watchdog);
+    assert(st->episodes==1&&st->open&&st->last.start_ns==start);
+    complete_all(f.sdev.tx_ring.ring);
+    assert(st->episodes==1&&!st->open&&st->max_ns>=70*NSEC_PER_MSEC);
+    consume_event(&f,0,1,4);
+    gpu_stall_ms=10;
+    fixture_close(&f);assert(atomic_load(&module_refs)==0);
+}
+/* Polled mode, nobody calls EVENT: the watchdog's collection sees and ends
+ * the episode. The longest interval between collections separates "nobody
+ * looked" from "no progress"; a held DMA lock is no collection; the EVENT
+ * collection is one. */
+static void test_stall_polled_without_event(void) {
+    struct fixture f;
+    fixture_gpu_poll=1;fixture_open(&f,1,256,true);fixture_gpu_poll=0;
+    struct tbstream_gpu_context *ctx=f.sdev.gpu_context;
+    struct sgu_stall *st=&ctx->stall[0];
+    char *buf=calloc(1,PAGE_SIZE);assert(buf);
+    gpu_stall_ms=20;snapshot_forbids=&ctx->lock;
+    assert(prepare(&f,0,0,1,1,0,4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==0);
+    stall_sleep_ms(30);run_delayed_work(&ctx->watchdog);
+    assert(st->episodes==1&&st->open&&st->last.snapshot&&st->last.head==2&&!st->last.front_completed);
+    assert(ctx->collect_gap_ns[0]>=30*NSEC_PER_MSEC); /* nobody looked for 30 ms */
+    sgu_timing_show(ctx,buf);assert(strstr(buf,"mode poll ")&&!strstr(buf,"collect_gap_ns -1"));
+    hw_complete_all(f.sdev.tx_ring.ring);
+    assert(st->open); /* finished, not collected */
+    run_delayed_work(&ctx->watchdog);
+    assert(!st->open&&st->episodes==1&&st->last.collect_gap_ns>=30*NSEC_PER_MSEC&&ctx->operations[0][0].event_pending);
+    consume_event(&f,0,1,2);assert(action(&f,SGU_IOC_RETIRE,0,1,1)==0);
+    /* Collected every millisecond: no progress, and somebody looked. */
+    assert(prepare(&f,0,0,2,2,0,4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,2,2)==0);
+    for(int i=0;i<40;++i){stall_sleep_ms(1);run_delayed_work(&ctx->watchdog);}
+    assert(st->episodes==2&&st->open&&st->last.sequence==2);
+    hw_complete_one(f.sdev.tx_ring.ring);run_delayed_work(&ctx->watchdog);
+    assert(!st->open&&st->episodes==2&&st->last.collect_gap_ns>0&&st->last.collect_gap_ns<15*NSEC_PER_MSEC);
+    hw_complete_all(f.sdev.tx_ring.ring);consume_event(&f,0,2,2);assert(action(&f,SGU_IOC_RETIRE,0,2,2)==0);
+    /* EVENT that cannot take the DMA lock collects nothing and sees nothing. */
+    assert(prepare(&f,0,0,3,3,0,4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,3,3)==0);
+    stall_sleep_ms(30);
+    struct mutex_holder h={.m=&ctx->dma_lock};pthread_t holder;
+    assert(!pthread_create(&holder,NULL,hold_mutex,&h));while(!atomic_load(&h.held))usleep(100);
+    u64 collected=ctx->collected_ns;
+    {struct sgu_event e={.fence=ctx->identity};
+     assert(tbstream_gpu_ioctl(&f.file,SGU_IOC_EVENT,(unsigned long)&e)==-EAGAIN);}
+    assert(st->episodes==2&&ctx->collected_ns==collected);
+    assert(!pthread_join(holder,NULL));
+    {struct sgu_event e={.fence=ctx->identity};
+     assert(tbstream_gpu_ioctl(&f.file,SGU_IOC_EVENT,(unsigned long)&e)==-EAGAIN);}
+    assert(st->episodes==3&&st->open&&ctx->collected_ns>collected);
+    hw_complete_all(f.sdev.tx_ring.ring);consume_event(&f,0,3,2);
+    assert(!st->open&&st->episodes==3&&st->last.collect_gap_ns>=200*NSEC_PER_MSEC);
+    snapshot_forbids=NULL;gpu_stall_ms=10;free(buf);
+    fixture_close(&f);assert(atomic_load(&module_refs)==0);
+}
+/* RX is detected on its own; a standby RX is not pending; a reused RX is
+ * measured from its SUBMIT; STOP cancels once and ends the episode. */
+static void test_stall_rx_standby_and_stop(void) {
+    struct fixture f;fixture_open(&f,1,256,true);
+    struct tbstream_gpu_context *ctx=f.sdev.gpu_context;
+    struct sgu_stall *st=&ctx->stall[1];
+    char *buf=calloc(1,PAGE_SIZE);assert(buf);
+    gpu_stall_ms=20;
+    assert(prepare(&f,1,0,2,1,0,8192)==0);assert(action(&f,SGU_IOC_SUBMIT,1,2,1)==0);
+    complete_all(f.sdev.rx_ring.ring);consume_event(&f,1,2,3);
+    assert(action(&f,SGU_IOC_RX_REPOST,1,2,1)==0);assert(action(&f,SGU_IOC_RETIRE,1,2,1)==0);
+    stall_sleep_ms(30);run_delayed_work(&ctx->watchdog);
+    assert(!st->episodes&&!ctx->stall[0].episodes); /* posted, not expected */
+    assert(prepare(&f,1,0,3,2,0,8191)==0);assert(action(&f,SGU_IOC_SUBMIT,1,3,2)==0);
+    run_delayed_work(&ctx->watchdog);assert(!st->episodes);
+    stall_sleep_ms(30);run_delayed_work(&ctx->watchdog);
+    assert(st->episodes==1&&st->open&&!ctx->stall[0].episodes);
+    assert(st->last.start_ns==ctx->operations[1][0].submitted_ns&&st->last.sequence==2);
+    assert(st->last.pending[0]==0&&st->last.pending[1]==1&&st->last.head==3);
+    /* STOP: every frame canceled once, the episode ends canceled. */
+    assert(action(&f,SGU_IOC_STOP,0,0,0)==0);
+    assert(ctx->lifetime.pending_callbacks==0&&ctx->operations[1][0].canceled);
+    assert(!st->open&&st->last.canceled&&st->episodes==1&&st->max_ns>=30*NSEC_PER_MSEC);
+    sgu_timing_show(ctx,buf);assert(strstr(buf,"stall rx last seq 2 slot 0 state canceled duration_ns "));
+    gpu_stall_ms=10;free(buf);
+    fixture_close(&f);assert(atomic_load(&module_refs)==0);
+}
+/* gpu_stall_ms 0: no episode, no ring read, no collection bookkeeping; an
+ * episode already open still ends at its completion. */
+static void test_stall_threshold_zero(void) {
+    struct fixture f;fixture_open(&f,1,256,true);
+    struct tbstream_gpu_context *ctx=f.sdev.gpu_context;
+    char *buf=calloc(1,PAGE_SIZE);assert(buf);
+    gpu_stall_ms=0;snapshot_calls=0;
+    assert(prepare(&f,0,0,1,1,0,4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==0);
+    assert(prepare(&f,1,0,2,1,0,8192)==0);assert(action(&f,SGU_IOC_SUBMIT,1,2,1)==0);
+    stall_sleep_ms(30);run_delayed_work(&ctx->watchdog);
+    complete_all(f.sdev.tx_ring.ring);complete_all(f.sdev.rx_ring.ring);
+    assert(!ctx->stall[0].episodes&&!ctx->stall[1].episodes&&!snapshot_calls);
+    consume_event(&f,0,1,2);consume_event(&f,1,2,3);
+    sgu_timing_show(ctx,buf);
+    assert(strstr(buf,"stall threshold_ms 0\nstall tx episodes 0 total_ns 0 max_ns 0 open 0\nstall rx episodes 0 "));
+    assert(action(&f,SGU_IOC_RETIRE,0,1,1)==0);
+    gpu_stall_ms=20;
+    assert(prepare(&f,0,0,3,2,0,4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,3,2)==0);
+    stall_sleep_ms(30);run_delayed_work(&ctx->watchdog);
+    assert(ctx->stall[0].open&&ctx->stall[0].episodes==1);
+    gpu_stall_ms=0;complete_one(f.sdev.tx_ring.ring);
+    assert(!ctx->stall[0].open&&ctx->stall[0].episodes==1&&ctx->stall[0].max_ns>=30*NSEC_PER_MSEC);
+    complete_one(f.sdev.tx_ring.ring);consume_event(&f,0,3,2);
+    /* Polled: no collection bookkeeping while off. */
+    fixture_close(&f);assert(atomic_load(&module_refs)==0);
+    fixture_gpu_poll=1;fixture_open(&f,1,256,true);fixture_gpu_poll=0;ctx=f.sdev.gpu_context;
+    assert(prepare(&f,0,0,1,1,0,4096)==0);assert(action(&f,SGU_IOC_SUBMIT,0,1,1)==0);
+    stall_sleep_ms(30);run_delayed_work(&ctx->watchdog);
+    assert(!ctx->collected_ns&&!ctx->collect_gap_ns[0]&&!ctx->stall[0].episodes&&ctx->polls==1);
+    hw_complete_all(f.sdev.tx_ring.ring);consume_event(&f,0,1,2);
+    assert(!ctx->stall[0].episodes);
+    gpu_stall_ms=10;free(buf);
+    fixture_close(&f);assert(atomic_load(&module_refs)==0);
+}
 static void test_wait_retry_and_order(void) {
     struct fixture f;fixture_open(&f,2,64,true);
     struct dma_fence *foreign=foreign_fence(&f.resv[0]);
@@ -601,7 +804,10 @@ int main(int argc,char **argv) {
     struct { const char *name; void (*run)(void); } tests[]={
         {"geometry",test_geometry},{"queue",test_queue},{"failure_isolation",test_failure_isolation},
         {"events_legacy",test_events_and_legacy},{"timeout_recovery",test_timeout_recovery},
-        {"wait_concurrency",test_wait_concurrency},{"nonblock_contended_mutex",test_nonblock_contended_mutex},{"nonblock_contended_dma_lock",test_nonblock_contended_dma_lock},{"completion_timing",test_completion_timing},{"polled_completion",test_polled_completion},{"session_latency_qos",test_session_latency_qos},{"wait_retry_order",test_wait_retry_and_order},
+        {"wait_concurrency",test_wait_concurrency},{"nonblock_contended_mutex",test_nonblock_contended_mutex},{"nonblock_contended_dma_lock",test_nonblock_contended_dma_lock},{"completion_timing",test_completion_timing},{"polled_completion",test_polled_completion},{"session_latency_qos",test_session_latency_qos},
+        {"stall_episode_once",test_stall_episode_once},{"stall_reset_keeps_progress",test_stall_reset_keeps_progress},
+        {"stall_polled_without_event",test_stall_polled_without_event},{"stall_rx_standby_and_stop",test_stall_rx_standby_and_stop},
+        {"stall_threshold_zero",test_stall_threshold_zero},{"wait_retry_order",test_wait_retry_and_order},
         {"export_lifetime",test_export_lifetime},{"admission_rollback",test_admission_and_rollback},
         {"watchdog_schedule",test_watchdog_schedule},{"max_queue_reuse",test_max_queue_reuse},
         {"group_success",test_group_success},{"group_rejections",test_group_rejections},

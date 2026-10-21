@@ -39,3 +39,4 @@
 0040-completion-path-timing.patch
 0041-gpu-opt-in-polled-completion.patch
 0042-stream-opt-in-cpu-latency-qos.patch
+0043-gpu-tx-progress-stall-detector.patch
