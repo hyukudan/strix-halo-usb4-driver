@@ -86,10 +86,11 @@ the current driver on its own.
 > diagnostics-only stall detector for GPU sessions. A direction with a
 > submitted operation pending and no frame completed on its ring for more
 > than `gpu_stall_ms` (10 ms) is counted as one episode in `gpu_timing`,
-> with the ring state when it was seen. It explains the ~100–200 ms TX
-> stalls measured when a TX starts while the peer's GPU RX ring is empty;
-> user space avoids them by posting exchange k+1's RX before its TX of
-> exchange k: [docs/GPU-COMPLETION-POLLING.md](docs/GPU-COMPLETION-POLLING.md#0043-txrx-progress-stall-detector).
+> with the ring state when it was seen. It measures the ~100–200 ms TX
+> stalls observed together with an empty or just re-posted GPU RX ring on
+> the peer. Posting exchange k+1's RX before the TX of exchange k removed
+> them in the measurements (9–15 per 3000 exchanges before, 0 in 18 000
+> after); the mechanism is not yet demonstrated: [docs/GPU-COMPLETION-POLLING.md](docs/GPU-COMPLETION-POLLING.md#0043-txrx-progress-stall-detector).
 
 ## Contents
 
@@ -362,7 +363,7 @@ How to reproduce and record both benchmarks:
 | `0040-completion-path-timing` | NHI rings stamp the interrupt, the worker's start and each reap, and count interrupts and collections. GPU operations are timed from SUBMIT through doorbell, reap, callback and fence to EVENT, per direction, with histograms and the last four operations. Read and reset through configfs `gpu_timing`. No behaviour change. |
 | `0041-gpu-opt-in-polled-completion` | With `gpu_poll`, a GPU session's rings run without interrupts: `SGU_IOC_EVENT` and a 1 ms watchdog fallback collect completed descriptors with the new `tb_ring_collect()` (bounded, refills the ring, same callbacks and 0016 chain). Interrupt mode stays the default. |
 | `0042-stream-opt-in-cpu-latency-qos` | With `latency_qos_us`, a host stream (from open to close) or a GPU session (from ARM to STOP, close, failure or abandonment) holds a `cpu_latency_qos` request. Off by default. |
-| `0043-gpu-tx-progress-stall-detector` | Diagnostics only: per GPU session and direction, a submitted operation pending with no frame completed on its ring for more than `gpu_stall_ms` is one stall episode, seen at the EVENT collection or the watchdog (or by the completion that ends it). `gpu_timing` shows count, total, maximum and the last episode with the ring read by the new `tb_ring_snapshot()`. No traffic, deadline or callback changes. |
+| `0043-gpu-tx-progress-stall-detector` | Diagnostics only: per GPU session and direction, a submitted operation pending with no frame completed on its ring for more than `gpu_stall_ms` is one stall episode, seen at the EVENT collection or the watchdog (or by the completion or cancellation that ends it). `gpu_timing` shows count, total, maximum and the last episode with the ring read by the new `tb_ring_snapshot()`. No traffic, deadline or callback changes. |
 
 Design rule throughout: a timeout, process exit, failed MMIO read or missing
 PCI device is **never** treated as proof that DMA has stopped. Memory the
@@ -394,10 +395,10 @@ Before these fixes the series could not be built:
 
 | Check | Result |
 |---|---|
-| Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 43 patches (0012–0039: checked offline in WSL and on cluster1, 2026-10-20; 0040–0042: offline in WSL and on cluster1, 2026-10-20; 0043: `tools/apply-series.sh` on cluster1, 2026-10-21) |
+| Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 43 patches (0012–0039: checked offline in WSL and on cluster1, 2026-10-20; 0040–0042: offline in WSL and on cluster1, 2026-10-20; 0043: `tools/apply-series.sh` on cluster1, 2026-10-22) |
 | `prepare_overlay.py` vs applying the series to the kernel | ✅ byte-identical (22 files) |
-| Offline unit tests (`unittest discover`) | ✅ 280 run, OK (1 bundle-only skip) with 0001–0043 (kernel and tools suites merged); every patch 0020–0042 also passes on its own |
-| Modules with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` (0001–0017, 0001–0018 and 0001–0019: full `vmlinux modules` builds with modpost on cluster1, 2026-10-19; 0001–0032, 0001–0035, 0001–0039 and 0001–0042: `vmlinux modules` with GPU on, then all modules relinked with GPU off, modpost both times, no kernel-doc warnings left; 0001–0043: `W=1` objects of `drivers/thunderbolt/` and `drivers/net/thunderbolt/` after `modules_prepare`, GPU on and off, on cluster1, 2026-10-21, not linked; `tools/check_build_log.py` makes any diagnostic in this series' files fatal in CI) |
+| Offline unit tests (`unittest discover`) | ✅ 282 run, OK (1 bundle-only skip) with 0001–0043 (kernel and tools suites merged); every patch 0020–0042 also passes on its own |
+| Modules with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` (0001–0017, 0001–0018 and 0001–0019: full `vmlinux modules` builds with modpost on cluster1, 2026-10-19; 0001–0032, 0001–0035, 0001–0039 and 0001–0042: `vmlinux modules` with GPU on, then all modules relinked with GPU off, modpost both times, no kernel-doc warnings left; 0001–0043: `W=1` objects of `drivers/thunderbolt/` and `drivers/net/thunderbolt/` after `modules_prepare`, GPU on and off, on cluster1, 2026-10-22, not linked; `tools/check_build_log.py` makes any diagnostic in this series' files fatal in CI) |
 | Link negotiation Gen3 × 2 on both cables | ✅ sysfs and lane registers; kept across every module reload and controller reset |
 | Complete 0001–0010 series loaded on hardware (0011 measured separately; 0012–0043 not yet) | ✅ both machines, modules built against the running kernel (exact vermagic and CRCs) |
 | Host-memory bandwidth, integrity, latency (series) | ✅ 41.0–41.5 Gb/s with 4 streams, zero bad chunks; latency as above |

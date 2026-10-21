@@ -157,35 +157,38 @@ stream, `/dev/cpu_dma_latency` shows the system-wide value.
 
 ## 0043: TX/RX progress stall detector
 
-### What was seen
+### What was observed
 
-On these AMD USB4 host interfaces, GPU-direct sessions (rings with
-`RING_FLAG_E2E`) sometimes stop completing TX descriptors, and the matching
-RX descriptors on the peer, for about 100–200 ms. Measured on 2026-10-21:
+Measured on 2026-10-21 on these AMD USB4 host interfaces, with GPU-direct
+sessions (rings with `RING_FLAG_E2E`):
 
-- It happens when a TX starts while the peer's GPU RX ring has no posted
-  descriptors. A GPU RX ring only gets descriptors per RX SUBMIT; host
-  streams keep their RX ring always posted and never showed it.
-- Without any change in user space: 9–15 such stalls per 3000 exchanges.
-- With user space posting the next exchange's RX before the current TX:
-  0 stalls in 18 000 exchanges.
-
-The mechanism is **inferred, not proven**: it fits a TX that, finding no
-end-to-end flow control credits at the peer, waits until the controllers
-grant or resynchronize them, and that wait takes ~100–200 ms. No register
-or trace shows the credit state directly.
+- **Observation.** TX descriptors sometimes went without completing for
+  about 100–200 ms, and the matching RX descriptors on the peer did too.
+- **Association.** These stalls were seen in runs where a TX could start
+  while the peer's GPU RX ring had no posted descriptors, or had them only
+  just re-posted. A GPU RX ring gets descriptors only per RX SUBMIT; host
+  streams keep their RX ring always posted and showed no such stall.
+- **Measured improvement.** Without any change in user space: 9–15 stalls
+  per 3000 exchanges. With user space posting the next exchange's RX
+  before the current TX: 0 stalls in 18 000 exchanges.
+- **Mechanism: not demonstrated.** One explanation that fits is a TX
+  waiting for end-to-end flow control credits from the peer until the
+  controllers grant or resynchronize them. No register, trace or
+  experiment has shown the credit state, so this remains a hypothesis.
 
 0040's `gpu_timing` shows such a stall only as a long `doorbell_reap` stage.
 That stage ends at the operation's *last* frame, so it does not show whether
 the ring made no progress at all or merely progressed slowly. 0043 measures
-the lack of progress itself.
+the interval without progress itself.
 
 ### The rule for user space
 
 **Post the receive of an exchange before the peer can transmit it.** In
-practice: post exchange k+1's RX before your TX of exchange k. A TX that
-starts while the peer's GPU receive ring is empty can wait ~100–200 ms for
-E2E credits on these controllers.
+practice: post exchange k+1's RX before your TX of exchange k. On these
+controllers, a TX that started while the peer's GPU receive ring was empty
+was observed to wait ~100–200 ms; that this is a wait for E2E credits is
+the hypothesis above, not a demonstrated fact. Posting early is what
+removed the stalls in the measurements.
 
 ### What it detects
 
@@ -203,12 +206,14 @@ is later (an idle ring is not a stall). A standby RX (posted by
   (polled mode) and the watchdog, which runs while operations are pending
   (every `gpu_poll_fallback_ms` polled, every 100 ms with interrupts) and
   collects before it checks deadlines. So it works in both modes, when TX is
-  reaped lazily and when nothing calls EVENT. A completion that ends an
-  interval longer than the threshold that no collection point saw is
-  counted by that completion instead.
+  reaped lazily and when nothing calls EVENT. A completion or cancellation
+  that ends an interval longer than the threshold that no collection point
+  saw counts it instead (for example STOP 50 ms after a SUBMIT in interrupt
+  mode, before the 100 ms watchdog ran): a cancellation never erases it.
 - An **episode** is counted once, when it is first seen. It ends at the next
   completed frame on that ring, or when its frames are canceled (STOP,
-  close, failure).
+  close, failure); a cancellation also ends the interval, so the remaining
+  canceled frames do not count it again.
 - **Diagnostics only.** Nothing is canceled, timed out, reset or re-armed
   because of an episode, and no deadline changes. The callbacks still run
   exactly once, the 0016 terminal check, FINISHING → fence → EVENT and STOP
@@ -220,14 +225,20 @@ is later (an idle ring is not a stall). A standby RX (posted by
 |---|---|---|
 | `thunderbolt_stream.gpu_stall_ms` | module parameter: threshold in ms, 0 off | 10 |
 
-An RX episode only means that the peer did not deliver for that long: with
-exchange k+1's RX posted early, waiting for the peer's next TX is normal and
-is counted too. Read RX episodes together with the peer's TX episodes.
+An RX episode measures only that no RX frame was reaped for that long. It
+does not show why: the peer may not have sent, or frames may have been
+delivered but not completed or not collected. With exchange k+1's RX posted
+early, waiting for the peer's next TX is normal and is counted too. Read RX
+episodes together with the peer's TX episodes.
 
 ### How to read it
 
 The lines come right after the `ring` lines of `gpu_timing`, before the
-stage tables, so a full page never cuts them. The write that resets
+stage tables. Since 0043 the read-out holds whole lines only: a line that
+does not fit the page is left out entirely. A heavy session (10^6
+operations, 150 ms maxima, full records) fits with room to spare; only
+synthetic 19-digit counters fill the page, and then the last lines of the
+stage tables or records are left out, never these. The write that resets
 `gpu_timing` also resets them. An episode still open at a reset is counted
 again when a collection point sees it; the progress times are kept.
 
@@ -251,11 +262,13 @@ stall rx episodes 0 total_ns 0 max_ns 0 open 0
 | `pending_tx`, `pending_rx` | Pending submitted operations per direction when seen. |
 | `head`, `tail`, `queued` | The ring when a collection point saw it: next descriptor to post, next to complete, frames waiting in the software queue for a free descriptor. -1 when no collection point saw it. |
 | `front_completed` | 1: the controller had completed the descriptor at `tail` but nobody had collected it (a software delay). 0: the controller had not completed it. |
-| `collect_gap_ns` | Polled mode: the longest interval between effective collections during the episode. Small (about `gpu_poll_fallback_ms`) means the rings were looked at and made no progress; close to `duration_ns` means nobody looked. An EVENT that could not take the DMA lock is no collection. -1 in interrupt mode, where the ring's interrupt does the collecting. |
+| `collect_gap_ns` | Polled mode: the longest interval between effective collections during the episode, including the time since the last one (while open, up to the read; when canceled, up to the cancellation). Small (about `gpu_poll_fallback_ms`) means the rings were looked at and made no progress; close to `duration_ns` means nobody looked. An EVENT that could not take the DMA lock is no collection. -1 in interrupt mode, where the ring's interrupt does the collecting. |
 
-A real controller stall reads as a TX episode with `front_completed 0`,
-`head` ahead of `tail` and, in polled mode, a small `collect_gap_ns`, and
-on the peer as an RX episode of about the same length.
+A TX episode with `front_completed 0`, `head` ahead of `tail`, in polled
+mode a small `collect_gap_ns`, and on the peer an RX episode of about the
+same length is compatible with a stall on the controller side. It is not
+conclusive: it shows that software looked and found nothing completed, not
+what the controller or the link was doing.
 
 ## A/B recipe
 
