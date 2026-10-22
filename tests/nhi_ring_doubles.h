@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* After the header extracts: the NHI and its MMIO as doubles. */
+#define trace_tb_latency(...) ((void)0)
 struct tb_nhi { spinlock_t lock; struct workqueue_struct *dma_wq; struct workqueue_struct *dma_hi_wq; };
 static bool dma_wq_percpu; /* 0044: the module parameter */
 

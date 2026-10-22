@@ -192,6 +192,7 @@ static unsigned int doorbells, barriers;
 static uintptr_t write_addr, read_addr;
 static u32 write_value;
 #define dma_wmb() (++barriers)
+#define trace_tb_latency(...) ((void)0)
 static void ring_iowrite_prod(struct tb_ring *r,u16 h) { assert(barriers); assert(r->head==h); doorbells++; }
 static void ring_iowrite_cons(struct tb_ring *r,u16 h) { ring_iowrite_prod(r,h); }
 static int ring_interrupt_index(const struct tb_ring *r) { return r->hop+(r->is_tx ? 0 : r->nhi->hop_count); }

@@ -5,6 +5,7 @@
  * memory allocation are deterministic models with failure injection. */
 #ifndef STREAM_HARNESS_H
 #define STREAM_HARNESS_H
+#define trace_tb_latency(...) ((void)0)
 #define _GNU_SOURCE
 #include <assert.h>
 #include <errno.h>

@@ -1,0 +1,178 @@
+diff --git a/include/trace/events/thunderbolt_latency.h b/include/trace/events/thunderbolt_latency.h
+new file mode 100644
+--- /dev/null
++++ b/include/trace/events/thunderbolt_latency.h
+@@ -0,0 +1,43 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM thunderbolt
++
++#if !defined(_TRACE_THUNDERBOLT_LATENCY_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_THUNDERBOLT_LATENCY_H
++#include <linux/tracepoint.h>
++#include <linux/thunderbolt.h>
++
++/* stage: 1 IRQ, 2 worker entry, 3 reap, 4 worker end, 5 NAPI entry,
++ * 6 NAPI frame, 7 waitqueue wake, 8 descriptor publish, 9 RX ready,
++ * 10 TX credit. CPU/TID/time come from the trace event header.
++ * No per-packet timestamps or extra locks while this tracepoint is disabled.
++ */
++TRACE_EVENT(tb_latency,
++    TP_PROTO(const struct tb_ring *ring, const void *frame, unsigned int stage, u64 value),
++    TP_ARGS(ring, frame, stage, value),
++    TP_STRUCT__entry(
++        __field(unsigned long, ring)
++        __field(unsigned long, nhi)
++        __field(unsigned long, frame)
++        __field(unsigned int, stage)
++        __field(int, hop)
++        __field(bool, tx)
++        __field(u64, value)
++    ),
++    TP_fast_assign(
++        __entry->ring = (unsigned long)ring;
++        __entry->nhi = (unsigned long)ring->nhi;
++        __entry->frame = (unsigned long)frame;
++        __entry->stage = stage;
++        __entry->hop = ring->hop;
++        __entry->tx = ring->is_tx;
++        __entry->value = value;
++    ),
++    TP_printk("ring=%lx nhi=%lx frame=%lx stage=%u hop=%d tx=%d value=%llu",
++        __entry->ring, __entry->nhi, __entry->frame, __entry->stage,
++        __entry->hop, __entry->tx, (unsigned long long)__entry->value)
++);
++#endif
++#undef TRACE_INCLUDE_FILE
++#define TRACE_INCLUDE_FILE thunderbolt_latency
++#include <trace/define_trace.h>
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -25,6 +25,10 @@
+ #include "nhi.h"
+ #include "nhi_regs.h"
+ #include "tb.h"
++
++#define CREATE_TRACE_POINTS
++#include <trace/events/thunderbolt_latency.h>
++EXPORT_TRACEPOINT_SYMBOL_GPL(tb_latency);
+ 
+ #define RING_TYPE(ring) ((ring)->is_tx ? "TX ring" : "RX ring")
+ 
+@@ -300,6 +304,7 @@
+ 		ring_iowrite_prod(ring, ring->head);
+ 	else
+ 		ring_iowrite_cons(ring, ring->head);
++	trace_tb_latency(ring, NULL, 8, ring->head);
+ }
+ 
+ /*
+@@ -323,6 +328,7 @@
+ 	unsigned long flags;
+ 	LIST_HEAD(done);
+ 
++	trace_tb_latency(ring, NULL, 2, 0);
+ 	spin_lock_irqsave(&ring->lock, flags);
+ 
+ 	if (!ring->running) {
+@@ -353,6 +359,7 @@
+ 		ring->cb_stamps.irq_ns = ring->last_irq_ns;
+ 		ring->cb_stamps.start_ns = start;
+ 		ring->cb_stamps.reap_ns = ktime_get_ns();
++		trace_tb_latency(ring, NULL, 3, ring->tail);
+ 	}
+ 	ring_write_descriptors(ring);
+ 
+@@ -380,6 +387,7 @@
+ 		spin_unlock_irqrestore(&ring->lock, flags);
+ 	}
+ 
++	trace_tb_latency(ring, NULL, 4, 0);
+ 	wake_up(&ring->wait);
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+ 	dma_fence_end_signalling(cookie);
+@@ -519,6 +527,7 @@
+ 		ring->cb_stamps.irq_ns = 0;
+ 		ring->cb_stamps.start_ns = start;
+ 		ring->cb_stamps.reap_ns = ktime_get_ns();
++		trace_tb_latency(ring, NULL, 3, ring->tail);
+ 	}
+ 	ring_write_descriptors(ring);
+ 	spin_unlock_irqrestore(&ring->lock, flags);
+@@ -586,6 +595,7 @@
+ /* Both @nhi->lock and @ring->lock should be held */
+ static void __ring_interrupt(struct tb_ring *ring)
+ {
++	trace_tb_latency(ring, NULL, 1, 0);
+ 	if (!ring->running)
+ 		return;
+ 
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -29,6 +29,7 @@
+ #include <linux/uio.h>
+ #include <linux/uuid.h>
+ #include <linux/wait.h>
++#include <trace/events/thunderbolt_latency.h>
+ 
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+ #include "gpu_stream.h"
+@@ -510,6 +511,7 @@
+ 	struct tbstream_dev *sdev = data;
+ 
+ 	WRITE_ONCE(sdev->rx_poll_pending, true);
++	trace_tb_latency(sdev->rx_ring.ring, NULL, 7, EPOLLIN);
+ 	wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLRDNORM);
+ }
+ 
+@@ -532,11 +534,14 @@
+ 	if (!sdev->rx_napi || !ring)
+ 		return;
+ 
++	trace_tb_latency(ring, NULL, 5, spin);
+ 	WRITE_ONCE(sdev->rx_poll_pending, false);
+ 	end = ktime_add_us(ktime_get(), spin ? sdev->rx_spin_us : 0);
+ 	for (;;) {
+-		while ((frame = tb_ring_poll(ring)))
++		while ((frame = tb_ring_poll(ring))) {
++			trace_tb_latency(ring, frame, 6, frame->size);
+ 			frame->callback(ring, frame, false);
++		}
+ 		if (tbstream_ring_available(&sdev->rx_ring))
+ 			return;
+ 		if (!spin || need_resched() || signal_pending(current) ||
+@@ -546,8 +551,10 @@
+ 	}
+ 
+ 	tb_ring_poll_complete(ring);
+-	while ((frame = tb_ring_poll(ring)))
++	while ((frame = tb_ring_poll(ring))) {
++		trace_tb_latency(ring, frame, 6, frame->size);
+ 		frame->callback(ring, frame, false);
++	}
+ }
+ 
+ /*
+@@ -742,6 +749,7 @@
+ 
+ 	sf->completed = true;
+ 	sdev->rx_ring.prod++;
++	trace_tb_latency(ring, frame, 9, sf->frame.size);
+ 
+ 	/* read() fails the stream when it reaches this frame */
+ 	if (sf->frame.flags & (RING_DESC_CRC_ERROR | RING_DESC_BUFFER_OVERRUN)) {
+@@ -864,8 +872,11 @@
+ 		return;
+ 
+ 	sdev->tx_ring.prod++;
+-	if (sf->frame.eof == TBSTREAM_DATA)
++	trace_tb_latency(ring, frame, 10, 0);
++	if (sf->frame.eof == TBSTREAM_DATA) {
++		trace_tb_latency(ring, frame, 7, EPOLLOUT);
+ 		wake_up_interruptible_poll(&sdev->wait, EPOLLOUT | EPOLLWRNORM);
++	}
+ }
+ 
+ static int tbstream_dev_alloc_tx_buffers(struct tbstream_dev *sdev)
