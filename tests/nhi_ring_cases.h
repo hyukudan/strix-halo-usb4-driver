@@ -271,6 +271,46 @@ static void snapshot_reads_without_changing(void)
     assert(!s.running && !calls && !doorbells);
 }
 
+/* 0044: a ring's completion workqueue comes from dma_wq_percpu when it starts. */
+static void wq_chosen_at_start_by_param(void)
+{
+    struct workqueue_struct unbound, percpu;
+    struct tb_nhi nhi = { .dma_wq = &unbound, .dma_hi_wq = &percpu };
+
+    dma_wq_percpu = false;
+    assert(ring_select_wq(&nhi) == &unbound);
+    dma_wq_percpu = true;
+    assert(ring_select_wq(&nhi) == &percpu);
+    /* Without the per-CPU workqueue, the unbound one. */
+    nhi.dma_hi_wq = NULL;
+    assert(ring_select_wq(&nhi) == &unbound);
+    dma_wq_percpu = false;
+}
+
+/* 0044: the interrupt queues the work on the ring's own workqueue, even if the parameter changed since the
+ * ring started (one work item never goes to two workqueues). */
+static void irq_queues_on_the_ring_wq(void)
+{
+    struct workqueue_struct unbound, percpu;
+    struct fixture f;
+
+    fixture_init(&f, false);
+    f.nhi.dma_wq = &unbound;
+    f.nhi.dma_hi_wq = &percpu;
+    dma_wq_percpu = true;
+    f.ring.wq = ring_select_wq(&f.nhi);
+    dma_wq_percpu = false;
+    spin_lock(&f.ring.lock);
+    __ring_interrupt(&f.ring);
+    spin_unlock(&f.ring.lock);
+    assert(works_queued == 1 && last_wq == &percpu);
+    f.ring.wq = ring_select_wq(&f.nhi); /* the next start */
+    spin_lock(&f.ring.lock);
+    __ring_interrupt(&f.ring);
+    spin_unlock(&f.ring.lock);
+    assert(works_queued == 2 && last_wq == &unbound);
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -292,6 +332,10 @@ int main(int argc, char **argv)
         collect_then_stop_exactly_once();
     else if (!strcmp(argv[1], "collect_rx_fields"))
         collect_rx_fields();
+    else if (!strcmp(argv[1], "wq_chosen_at_start_by_param"))
+        wq_chosen_at_start_by_param();
+    else if (!strcmp(argv[1], "irq_queues_on_the_ring_wq"))
+        irq_queues_on_the_ring_wq();
     else
         return 2;
     printf("PASS %s\n", argv[1]);

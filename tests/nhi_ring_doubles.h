@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* After the header extracts: the NHI and its MMIO as doubles. */
-struct tb_nhi { spinlock_t lock; struct workqueue_struct *dma_wq; };
+struct tb_nhi { spinlock_t lock; struct workqueue_struct *dma_wq; struct workqueue_struct *dma_hi_wq; };
+static bool dma_wq_percpu; /* 0044: the module parameter */
 
 /* MMIO: doorbells and interrupt masks are recorded, not performed. */
 static int doorbells, last_doorbell, masks;

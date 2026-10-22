@@ -40,3 +40,5 @@
 0041-gpu-opt-in-polled-completion.patch
 0042-stream-opt-in-cpu-latency-qos.patch
 0043-gpu-tx-progress-stall-detector.patch
+0044-nhi-opt-in-per-cpu-highpri-completion-work.patch
+0045-stream-opt-in-contiguous-dma-buffers.patch

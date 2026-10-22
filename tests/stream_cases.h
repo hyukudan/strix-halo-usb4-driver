@@ -118,6 +118,80 @@ static void frame_arrays_use_kvcalloc(void)
     assert_nothing_held();
 }
 
+/* 0045: with contig_buffers, the frame buffers of a ring are pages of a few
+ * blocks mapped once each; a frame is still one page, and stop releases the
+ * blocks. 1024 frames: two 2 MiB blocks; 64 frames: one 256 KiB block. */
+static void contiguous_buffers_carve_frames(void)
+{
+    static const unsigned int sizes[] = { 1024, 64 };
+    struct host h;
+
+    for (unsigned int k = 0; k < 2; ++k) {
+        unsigned int size = sizes[k], per = size < 512 ? size : 512, blocks = size / per;
+
+        host_init(&h, size);
+        contig_buffers = TBSTREAM_DEV_CONTIG_TX | TBSTREAM_DEV_CONTIG_RX;
+        assert(start(&h.dev[0]) == 0);
+        for (int d = 0; d < 2; ++d) {
+            struct tbstream_ring *r = d ? &h.dev[0].rx_ring : &h.dev[0].tx_ring;
+
+            assert(r->chunks == blocks && r->chunk_order == (size < 512 ? get_order(size * PAGE_SIZE) : 9));
+            for (unsigned int i = 0; i < size; ++i) {
+                assert(r->frames[i].page == r->chunk[i / per] + i % per);
+                assert(r->frames[i].frame.buffer_phy == r->chunk_dma[i / per] + (dma_addr_t)(i % per) * PAGE_SIZE);
+            }
+        }
+        /* No per-frame pages or mappings: one mapping per block. */
+        assert(atomic_load(&live_pages) == 0 && atomic_load(&live_blocks) == (int)(2 * blocks));
+        assert(atomic_load(&live_mappings) == (int)(2 * blocks));
+        /* A TX frame takes the bytes into its own page of the block. */
+        {
+            unsigned char msg[100];
+            struct iov_iter it;
+            struct tbstream_frame *sf;
+
+            for (unsigned int i = 0; i < sizeof(msg); ++i) msg[i] = (unsigned char)(i * 7 + k);
+            memset(&it, 0, sizeof(it));
+            it.buf = msg;
+            it.count = sizeof(msg);
+            sf = tbstream_dev_alloc_tx(&h.dev[0], TBSTREAM_DATA, &it, sizeof(msg));
+            assert(!IS_ERR(sf) && sf == &h.dev[0].tx_ring.frames[0]);
+            assert(!memcmp(page_address(sf->page), msg, sizeof(msg)));
+            assert((void *)(uintptr_t)sf->frame.buffer_phy == (void *)sf->page);
+        }
+        stop(&h.dev[0]);
+        contig_buffers = 0;
+        assert(atomic_load(&live_blocks) == 0);
+        assert_nothing_held();
+    }
+}
+
+/* 0045: a block that cannot be allocated or mapped (the second of two) leaves
+ * nothing behind and the ring uses one page per frame; the open succeeds. */
+static void contiguous_buffers_fall_back(void)
+{
+    struct host h;
+
+    host_init(&h, 1024);
+    contig_buffers = TBSTREAM_DEV_CONTIG_TX;
+    block_fail_after = 1;                 /* the TX ring's second block */
+    assert(start(&h.dev[0]) == 0);
+    assert(block_fail_after == -1);
+    assert(h.dev[0].tx_ring.chunks == 0 && h.dev[0].rx_ring.chunks == 0);
+    assert(atomic_load(&live_blocks) == 0 && atomic_load(&live_pages) == 2 * 1024);
+    stop(&h.dev[0]);
+    assert_nothing_held();
+
+    host_init(&h, 1024);
+    map_fail_after = 1;                   /* the mapping of the second block */
+    assert(start(&h.dev[0]) == 0);
+    assert(map_fail_after == -1 && h.dev[0].tx_ring.chunks == 0);
+    assert(atomic_load(&live_blocks) == 0 && atomic_load(&live_mappings) == 2 * 1024);
+    stop(&h.dev[0]);
+    contig_buffers = 0;
+    assert_nothing_held();
+}
+
 struct spinner { struct tbstream_dev *s; atomic_bool inside, done; bool result; };
 static void *spin_worker(void *data)
 {
@@ -277,6 +351,8 @@ int main(int argc, char **argv)
         { "damaged_close_is_not_eof", damaged_close_is_not_eof },
         { "resume_failure_at_every_step", resume_failure_at_every_step },
         { "latency_qos_follows_rings", latency_qos_follows_rings },
+        { "contiguous_buffers_carve_frames", contiguous_buffers_carve_frames },
+        { "contiguous_buffers_fall_back", contiguous_buffers_fall_back },
     };
 
     assert(argc == 2);

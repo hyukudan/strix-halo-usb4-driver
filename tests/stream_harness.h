@@ -149,6 +149,37 @@ static struct page *alloc_page(int flags)
     return p;
 }
 static void __free_page(struct page *p) { atomic_fetch_sub(&live_pages, 1); free(p); }
+/* 0045: blocks of 2^order pages (contiguous frame buffers). */
+#define PAGE_SHIFT 12
+#define PAGE_SIZE (1UL << PAGE_SHIFT)
+#define __GFP_NOWARN 0
+#define __GFP_NORETRY 0
+#define BUILD_BUG_ON(c) _Static_assert(!(c), #c)
+#ifndef DIV_ROUND_UP
+#define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
+#endif
+static int block_fail_after = -1;
+static atomic_int live_blocks;
+static unsigned int get_order(size_t size)
+{
+    unsigned int order = 0;
+
+    while ((PAGE_SIZE << order) < size)
+        ++order;
+    return order;
+}
+static struct page *alloc_pages(int flags, unsigned int order)
+{
+    struct page *p;
+    (void)flags;
+    if (inject(&block_fail_after))
+        return NULL;
+    p = calloc(1U << order, sizeof(*p));
+    if (p) atomic_fetch_add(&live_blocks, 1);
+    return p;
+}
+static void __free_pages(struct page *p, unsigned int order) { (void)order; atomic_fetch_sub(&live_blocks, 1); free(p); }
+static unsigned int contig_buffers; /* 0045: the module parameter */
 static void *page_address(struct page *p) { return p->data; }
 enum dma_data_direction { DMA_TO_DEVICE, DMA_FROM_DEVICE };
 struct device { int id; };

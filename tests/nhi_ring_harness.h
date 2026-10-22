@@ -23,6 +23,7 @@ typedef uint64_t dma_addr_t;
 #define IS_ENABLED(x) 0
 #define BIT(n) (1U << (n))
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+#define READ_ONCE(x) (x)
 static int warnings;
 #define WARN_ON_ONCE(c) ({ bool __c = (c); if (__c) ++warnings; __c; })
 
@@ -65,9 +66,10 @@ static void spin_unlock(spinlock_t *l) { l->held = 0; pthread_mutex_unlock(&l->m
 struct work_struct { int queued; };
 struct workqueue_struct { int unused; };
 static int works_queued;
+static struct workqueue_struct *last_wq;
 static bool queue_work(struct workqueue_struct *wq, struct work_struct *w)
 {
-    (void)wq;
+    last_wq = wq;
     ++works_queued;
     if (w->queued)
         return false;

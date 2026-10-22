@@ -1,0 +1,234 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+index 49fb04c..28b9995 100644
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -84,6 +84,9 @@
+ #define TBSTREAM_DEV_MAX_RING_SIZE	4096
+ #define TBSTREAM_DEV_THROTTLING		8192
+ #define TBSTREAM_DEV_MAX_THROTTLING	16776960
++/* Contiguous frame buffers: blocks of at most 2 MiB, one frame per page. */
++#define TBSTREAM_DEV_CHUNK_MAX_ORDER	(21 - PAGE_SHIFT)
++#define TBSTREAM_DEV_MAX_CHUNKS		(TBSTREAM_DEV_MAX_RING_SIZE >> TBSTREAM_DEV_CHUNK_MAX_ORDER)
+ 
+ /**
+  * enum tbstream_frame_pdf - PDF numbers for tunneled frames
+@@ -119,12 +122,21 @@ struct tbstream_frame {
+  * @prod: Current value of producer
+  * @cons: Current value of consumer
+  * @frames: Holds the ring frames
++ * @chunk: With contiguous buffers (contig_buffers), the blocks the frame
++ *	   buffers are carved from; each is mapped once
++ * @chunk_dma: DMA address of each block
++ * @chunks: Number of blocks (0: one page and one mapping per frame)
++ * @chunk_order: Page order of every block
+  */
+ struct tbstream_ring {
+ 	struct tb_ring *ring;
+ 	unsigned long prod;
+ 	unsigned long cons;
+ 	struct tbstream_frame *frames;
++	struct page *chunk[TBSTREAM_DEV_MAX_CHUNKS];
++	dma_addr_t chunk_dma[TBSTREAM_DEV_MAX_CHUNKS];
++	unsigned int chunks;
++	unsigned int chunk_order;
+ };
+ 
+ /**
+@@ -310,6 +322,76 @@ static inline bool tbstream_valid(const struct tbstream *stream)
+ 	return false;
+ }
+ 
++static void tbstream_ring_free_chunks(struct tbstream_ring *ring,
++				      enum dma_data_direction dir)
++{
++	struct device *dma_dev = tb_ring_dma_device(ring->ring);
++	unsigned int c;
++
++	for (c = 0; c < ring->chunks; c++) {
++		dma_unmap_page(dma_dev, ring->chunk_dma[c],
++			       PAGE_SIZE << ring->chunk_order, dir);
++		__free_pages(ring->chunk[c], ring->chunk_order);
++		ring->chunk[c] = NULL;
++		ring->chunk_dma[c] = 0;
++	}
++	ring->chunks = 0;
++}
++
++/*
++ * Frame buffers carved from physically contiguous blocks (naturally
++ * aligned, at most 2 MiB), each block mapped once: one IOVA range per
++ * block instead of one per 4 KiB frame, which a translating IOMMU can map
++ * with large pages. Sets every frame's page and DMA address and returns 0,
++ * or releases what it took and returns -ENOMEM (the caller then uses one
++ * page per frame). A frame stays one page: the copies and the partial
++ * syncs of a frame are unchanged.
++ */
++static int tbstream_ring_alloc_chunks(struct tbstream_ring *ring,
++				      enum dma_data_direction dir)
++{
++	struct device *dma_dev = tb_ring_dma_device(ring->ring);
++	size_t ring_size = tb_ring_size(ring->ring), i;
++	unsigned int order, per_chunk, n, c;
++
++	BUILD_BUG_ON(TB_MAX_FRAME_SIZE != PAGE_SIZE);
++	order = min_t(unsigned int, get_order(ring_size * PAGE_SIZE),
++		      TBSTREAM_DEV_CHUNK_MAX_ORDER);
++	per_chunk = 1U << order;
++	n = DIV_ROUND_UP(ring_size, per_chunk);
++	if (n > TBSTREAM_DEV_MAX_CHUNKS)
++		return -EINVAL;
++	ring->chunk_order = order;
++	for (c = 0; c < n; c++) {
++		struct page *page;
++		dma_addr_t dma;
++
++		page = alloc_pages(GFP_KERNEL | __GFP_NOWARN | __GFP_NORETRY, order);
++		if (!page)
++			goto fail;
++		dma = dma_map_page(dma_dev, page, 0, PAGE_SIZE << order, dir);
++		if (dma_mapping_error(dma_dev, dma)) {
++			__free_pages(page, order);
++			goto fail;
++		}
++		ring->chunk[c] = page;
++		ring->chunk_dma[c] = dma;
++		ring->chunks = c + 1;
++	}
++	for (i = 0; i < ring_size; i++) {
++		struct tbstream_frame *sf = &ring->frames[i];
++
++		sf->page = ring->chunk[i / per_chunk] + i % per_chunk;
++		sf->frame.buffer_phy = ring->chunk_dma[i / per_chunk] +
++				       (dma_addr_t)(i % per_chunk) * PAGE_SIZE;
++	}
++	return 0;
++
++fail:
++	tbstream_ring_free_chunks(ring, dir);
++	return -ENOMEM;
++}
++
+ static void tbstream_ring_free(struct tbstream_ring *ring)
+ {
+ 	struct device *dma_dev = tb_ring_dma_device(ring->ring);
+@@ -325,14 +407,16 @@ static void tbstream_ring_free(struct tbstream_ring *ring)
+ 	for (i = 0; ring->frames && i < tb_ring_size(ring->ring); i++) {
+ 		struct tbstream_frame *sf = &ring->frames[i];
+ 
+-		if (sf->frame.buffer_phy)
++		/* Frames carved from blocks are released with the blocks. */
++		if (!ring->chunks && sf->frame.buffer_phy)
+ 			dma_unmap_page(dma_dev, sf->frame.buffer_phy,
+ 				       TB_MAX_FRAME_SIZE, dir);
+ 		sf->frame.buffer_phy = 0;
+-		if (sf->page)
++		if (!ring->chunks && sf->page)
+ 			__free_page(sf->page);
+ 		sf->page = NULL;
+ 	}
++	tbstream_ring_free_chunks(ring, dir);
+ 
+ 	ring->prod = 0;
+ 	ring->cons = 0;
+@@ -379,6 +463,14 @@ MODULE_PARM_DESC(spin_us,
+ 
+ #define TBSTREAM_DEV_MAX_QOS_US		100000
+ 
++#define TBSTREAM_DEV_CONTIG_TX		BIT(0)
++#define TBSTREAM_DEV_CONTIG_RX		BIT(1)
++
++static unsigned int contig_buffers;
++module_param(contig_buffers, uint, 0644);
++MODULE_PARM_DESC(contig_buffers,
++		 "Host streams opened while set carve their DMA frame buffers from physically contiguous blocks of up to 2 MiB, each mapped once (one IOVA range, so a translating IOMMU can use large pages), instead of one page and one mapping per frame: bit 0 TX, bit 1 RX; a stream whose blocks cannot be allocated or mapped uses per-page buffers (default: 0)");
++
+ static int latency_qos_us = -1;
+ module_param(latency_qos_us, int, 0644);
+ MODULE_PARM_DESC(latency_qos_us,
+@@ -728,26 +820,32 @@ static int tbstream_dev_alloc_rx_buffers(struct tbstream_dev *sdev)
+ 	 */
+ 	sdev->rx_ring.cons = 0;
+ 	sdev->rx_ring.prod = 0;
++	if ((READ_ONCE(contig_buffers) & TBSTREAM_DEV_CONTIG_RX) &&
++	    tbstream_ring_alloc_chunks(&sdev->rx_ring, DMA_FROM_DEVICE))
++		pr_info_ratelimited("%s: no contiguous RX buffers, one page per frame\n",
++				    sdev->misc.name);
+ 	for (i = 0; i < ring_size; i++) {
+ 		struct device *dma_dev = tb_ring_dma_device(sdev->rx_ring.ring);
+ 		struct tbstream_frame *sf = &sdev->rx_ring.frames[i];
+ 		dma_addr_t dma_addr;
+ 
+-		sf->page = alloc_page(GFP_KERNEL);
+-		if (!sf->page)
+-			return -ENOMEM;
+-
+-		dma_addr = dma_map_page(dma_dev, sf->page, 0, TB_MAX_FRAME_SIZE,
+-					DMA_FROM_DEVICE);
+-		if (dma_mapping_error(dma_dev, dma_addr)) {
+-			__free_page(sf->page);
+-			sf->page = NULL;
+-			return -ENOMEM;
++		if (!sdev->rx_ring.chunks) {
++			sf->page = alloc_page(GFP_KERNEL);
++			if (!sf->page)
++				return -ENOMEM;
++
++			dma_addr = dma_map_page(dma_dev, sf->page, 0, TB_MAX_FRAME_SIZE,
++						DMA_FROM_DEVICE);
++			if (dma_mapping_error(dma_dev, dma_addr)) {
++				__free_page(sf->page);
++				sf->page = NULL;
++				return -ENOMEM;
++			}
++			sf->frame.buffer_phy = dma_addr;
+ 		}
+ 
+ 		sf->sdev = sdev;
+ 		sf->frame.callback = tbstream_dev_rx_callback;
+-		sf->frame.buffer_phy = dma_addr;
+ 
+ 		tb_ring_rx(sdev->rx_ring.ring, &sf->frame);
+ 	}
+@@ -781,25 +879,31 @@ static int tbstream_dev_alloc_tx_buffers(struct tbstream_dev *sdev)
+ 	if (!sdev->tx_ring.frames)
+ 		return -ENOMEM;
+ 
++	if ((READ_ONCE(contig_buffers) & TBSTREAM_DEV_CONTIG_TX) &&
++	    tbstream_ring_alloc_chunks(&sdev->tx_ring, DMA_TO_DEVICE))
++		pr_info_ratelimited("%s: no contiguous TX buffers, one page per frame\n",
++				    sdev->misc.name);
+ 	for (i = 0; i < ring_size; i++) {
+ 		struct tbstream_frame *sf = &sdev->tx_ring.frames[i];
+ 		dma_addr_t dma_addr;
+ 
+-		sf->page = alloc_page(GFP_KERNEL);
+-		if (!sf->page)
+-			return -ENOMEM;
+-
+-		dma_addr = dma_map_page(dma_dev, sf->page, 0, TB_MAX_FRAME_SIZE,
+-					DMA_TO_DEVICE);
+-		if (dma_mapping_error(dma_dev, dma_addr)) {
+-			__free_page(sf->page);
+-			sf->page = NULL;
+-			return -ENOMEM;
++		if (!sdev->tx_ring.chunks) {
++			sf->page = alloc_page(GFP_KERNEL);
++			if (!sf->page)
++				return -ENOMEM;
++
++			dma_addr = dma_map_page(dma_dev, sf->page, 0, TB_MAX_FRAME_SIZE,
++						DMA_TO_DEVICE);
++			if (dma_mapping_error(dma_dev, dma_addr)) {
++				__free_page(sf->page);
++				sf->page = NULL;
++				return -ENOMEM;
++			}
++			sf->frame.buffer_phy = dma_addr;
+ 		}
+ 
+ 		sf->sdev = sdev;
+ 		sf->frame.callback = tbstream_dev_tx_callback;
+-		sf->frame.buffer_phy = dma_addr;
+ 		sf->frame.sof = TBSTREAM_FRAME_START;
+ 	}
+ 

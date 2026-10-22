@@ -1,0 +1,119 @@
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index 6236473..443ab75 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -41,6 +41,21 @@ static bool host_reset = true;
+ module_param(host_reset, bool, 0444);
+ MODULE_PARM_DESC(host_reset, "reset USB4 host router at probe; v1 host interfaces: only the quirked AMD ones, interface reset (default: true)");
+ 
++static bool dma_wq_percpu;
++module_param(dma_wq_percpu, bool, 0644);
++MODULE_PARM_DESC(dma_wq_percpu,
++		 "Rings started while set run their completion work on the CPU that took the interrupt, in a high-priority per-CPU workqueue, instead of the unbound tb_dma workqueue; read when a ring starts (default: false)");
++
++/*
++ * The workqueue of a ring's completion work. Chosen when the ring starts
++ * and kept until it stops: the same work item queued on two workqueues
++ * would not be serialised, and its callbacks could run out of order.
++ */
++static struct workqueue_struct *ring_select_wq(const struct tb_nhi *nhi)
++{
++	return READ_ONCE(dma_wq_percpu) && nhi->dma_hi_wq ? nhi->dma_hi_wq : nhi->dma_wq;
++}
++
+ static int ring_interrupt_index(const struct tb_ring *ring)
+ {
+ 	int bit = ring->hop;
+@@ -580,7 +595,7 @@ static void __ring_interrupt(struct tb_ring *ring)
+ 		__ring_interrupt_mask(ring, true);
+ 		ring->start_poll(ring->poll_data);
+ 	} else {
+-		queue_work(ring->nhi->dma_wq, &ring->work);
++		queue_work(ring->wq, &ring->work);
+ 	}
+ }
+ 
+@@ -900,6 +915,8 @@ void tb_ring_start(struct tb_ring *ring)
+ 
+ 	if (!(ring->flags & RING_FLAG_NO_INTERRUPT))
+ 		ring_interrupt_active(ring, true);
++	/* Before running: the interrupt handler queues on it from then on. */
++	ring->wq = ring_select_wq(ring->nhi);
+ 	ring->running = true;
+ err:
+ 	spin_unlock(&ring->lock);
+@@ -975,9 +992,10 @@ void tb_ring_stop(struct tb_ring *ring)
+ 	spin_unlock_irq(&ring->nhi->lock);
+ 
+ 	/*
+-	 * schedule ring->work to invoke callbacks on all remaining frames.
++	 * schedule ring->work to invoke callbacks on all remaining frames,
++	 * on the workqueue the ring ran with (none if it never started).
+ 	 */
+-	queue_work(ring->nhi->dma_wq, &ring->work);
++	queue_work(ring->wq ? ring->wq : ring->nhi->dma_wq, &ring->work);
+ 	flush_work(&ring->work);
+ }
+ EXPORT_SYMBOL_GPL(tb_ring_stop);
+@@ -1448,6 +1466,8 @@ static void nhi_release_dma_wq(void *data)
+ {
+ 	struct tb_nhi *nhi = data;
+ 
++	destroy_workqueue(nhi->dma_hi_wq);
++	nhi->dma_hi_wq = NULL;
+ 	destroy_workqueue(nhi->dma_wq);
+ 	nhi->dma_wq = NULL;
+ }
+@@ -1483,6 +1503,12 @@ int nhi_probe(struct tb_nhi *nhi)
+ 	nhi->dma_wq = alloc_workqueue("tb_dma", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+ 	if (!nhi->dma_wq)
+ 		return -ENOMEM;
++	nhi->dma_hi_wq = alloc_workqueue("tb_dma_hi", WQ_PERCPU | WQ_HIGHPRI | WQ_MEM_RECLAIM, 0);
++	if (!nhi->dma_hi_wq) {
++		destroy_workqueue(nhi->dma_wq);
++		nhi->dma_wq = NULL;
++		return -ENOMEM;
++	}
+ 	/* Register before IRQ acquisition: managed IRQ cleanup runs before this
+ 	 * action on probe failures, and normal shutdown releases IRQs explicitly. */
+ 	res = devm_add_action_or_reset(dev, nhi_release_dma_wq, nhi);
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+index 2618683..6601ac9 100644
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -540,6 +540,10 @@ void tb_service_properties_changed(struct tb_service *svc);
+  * @teardown_reset_gen: Counts the requests, so a reset clears only the
+  *			request it ran for (protected by @lock)
+  * @dma_wq: Reclaim-capable workqueue for DMA completion and cancellation
++ * @dma_hi_wq: Per-CPU, high-priority, reclaim-capable workqueue for the
++ *	       completion work of rings started while the dma_wq_percpu
++ *	       parameter is set: the work runs on the CPU that took the
++ *	       interrupt
+  * @iommu_dma_protection: An IOMMU will isolate external-facing ports.
+  * @interrupt_work: Work scheduled to handle ring interrupt when no
+  *		    MSI-X is used.
+@@ -575,6 +579,7 @@ struct tb_nhi {
+ 	bool iommu_dma_protection;
+ 	struct work_struct interrupt_work;
+ 	struct workqueue_struct *dma_wq;
++	struct workqueue_struct *dma_hi_wq;
+ 	u32 hop_count;
+ 	unsigned long quirks;
+ 	struct completion domain_released;
+@@ -627,6 +632,8 @@ struct tb_ring_snapshot {
+  * @queue: Queue holding frames to be transferred over this ring
+  * @in_flight: Queue holding frames that are currently in flight
+  * @work: Interrupt work structure
++ * @wq: Workqueue of @work, chosen when the ring starts and kept until it
++ *	stops (protected by @lock)
+  * @is_tx: Is the ring Tx or Rx
+  * @running: Is the ring running
+  * @irq: MSI-X irq number if the ring uses MSI-X. %0 otherwise.
+@@ -663,6 +670,7 @@ struct tb_ring {
+ 	struct list_head queue;
+ 	struct list_head in_flight;
+ 	struct work_struct work;
++	struct workqueue_struct *wq;
+ 	bool is_tx:1;
+ 	bool running:1;
+ 	int irq;

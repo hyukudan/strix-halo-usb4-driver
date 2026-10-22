@@ -34,9 +34,11 @@ CASES = ('open_failure_is_not_sticky', 'frame_arrays_use_kvcalloc', 'spin_withou
          'close_does_not_flush_rx',
          'spin_us_parameter_is_bounded',
          'damaged_close_is_not_eof', 'resume_failure_at_every_step',
-         'latency_qos_follows_rings')
+         'latency_qos_follows_rings',
+         'contiguous_buffers_carve_frames', 'contiguous_buffers_fall_back')
 STRUCTS = ('tbstream_frame', 'tbstream_ring', 'tbstream_dev', 'tbstream_group', 'tbstream')
-FUNCTIONS = ('spin_us_set', 'tbstream_qos_acquire', 'tbstream_qos_release', 'tbstream_ring_free', 'tbstream_ring_available', 'tbstream_rx_start_poll',
+FUNCTIONS = ('spin_us_set', 'tbstream_qos_acquire', 'tbstream_qos_release', 'tbstream_ring_free_chunks',
+             'tbstream_ring_alloc_chunks', 'tbstream_ring_free', 'tbstream_ring_available', 'tbstream_rx_start_poll',
              'tbstream_dev_napi_rx_locked', 'tbstream_dev_napi_rx', 'tbstream_dev_napi_spin',
              'tbstream_dev_irq_pin', 'tbstream_dev_irq_affinity', 'tbstream_dev_irq_affinity_restore',
              'tbstream_dev_xdomain', 'tbstream_dev_rx_callback', 'tbstream_dev_alloc_rx_buffers',
@@ -77,7 +79,10 @@ class StreamHostPathTests(unittest.TestCase):
         text = source.read_text()
         enum = re.search(r'^enum tbstream_frame_pdf \{\n.*?^\};\n', text, re.MULTILINE | re.DOTALL).group(0)
         parts = ['#include "stream_harness.h"\n', enum,
-                 ''.join(re.findall(r'^#define TBSTREAM_DEV_[A-Z_]+\t+\d+\n', text, re.MULTILINE))]
+                 ''.join(re.findall(r'^#define TBSTREAM_DEV_[A-Z_]+\t+\d+\n', text, re.MULTILINE)),
+                 # 0045: the block geometry and the parameter bits (expressions, after the numeric limits)
+                 ''.join(re.findall(r'^#define TBSTREAM_DEV_(?:CHUNK_MAX_ORDER|MAX_CHUNKS|CONTIG_TX|CONTIG_RX)\t+.*\n',
+                                    text, re.MULTILINE))]
         parts += [extract(text, 'struct', name) for name in STRUCTS]
         parts += [extract(text, 'function', name) for name in FUNCTIONS]
         parts.append('#include "stream_cases.h"\n')
@@ -128,6 +133,12 @@ class StreamHostPathTests(unittest.TestCase):
         self.assertIn('&tbstream_dev_attr_latency_qos_us,', attrs.group(0))
         store = extract(text, 'function', 'tbstream_dev_latency_qos_us_store')
         self.assertIn('-1,\n\t\t\t\t      TBSTREAM_DEV_MAX_QOS_US);', store)
+
+    def test_contiguous_buffers_parameter(self):
+        text = (Path(os.environ['USB4_SOURCE_TREE']) / 'drivers/thunderbolt/stream.c').read_text()
+        self.assertIn('static unsigned int contig_buffers;\n', text)
+        self.assertIn('module_param(contig_buffers, uint, 0644);', text)
+        self.assertIn('#define TBSTREAM_DEV_CHUNK_MAX_ORDER\t(21 - PAGE_SHIFT)\n', text)
 
     def run_case(self, case):
         result = subprocess.run([str(self.binary), case], capture_output=True, text=True, timeout=30,
