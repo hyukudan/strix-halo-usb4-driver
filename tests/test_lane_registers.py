@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """usb4_diagnose.py --registers: LANE_ADP_CS_0/1, sideband LINK_CONF/TXFFE vs sysfs.
 
-Fixtures reproduce the cluster1 capture of 2026-10-19 21:44 (mixed state: one
+Fixtures reproduce the node A capture of 2026-10-19 21:44 (mixed state: one
 cable Gen3 x2, one Gen2 x2) in the debugfs file formats.
 """
 import contextlib
@@ -105,8 +105,8 @@ class LaneRegisterTests(unittest.TestCase):
 
     def test_lanecap_text_reproduces_the_lab_capture(self):
         report = dict(kernel='7.3.0-rc5-strix-gpu-bosgame-20261019det', lanes=self.lanes())
-        text = diag.lanecap_text(report, 'cluster1').splitlines()
-        self.assertEqual(text[0], '### cluster1 7.3.0-rc5-strix-gpu-bosgame-20261019det')
+        text = diag.lanecap_text(report, 'node-a').splitlines()
+        self.assertEqual(text[0], '### node-a 7.3.0-rc5-strix-gpu-bosgame-20261019det')
         self.assertEqual([l for l in text if l.startswith('  ') and not l.startswith('  !')],
                          EXPECTED_LINES)
         self.assertIn('domain1 port2 sysfs rx=10.0 Gb/s x2 tx=10.0 Gb/s x2 peer=1-2', text)

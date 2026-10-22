@@ -2,7 +2,7 @@
 """Run the actual host-path functions of stream.c against userspace doubles.
 
 Covers what no other offline test reaches: the open/start error paths (the
-sticky ENOMEM seen on cluster1), the frame bookkeeping allocation, the NAPI
+sticky ENOMEM seen on node A), the frame bookkeeping allocation, the NAPI
 RX spin of 0011 running without the device mutex, IRQ affinity restore, and
 the stream going away under open RAM-ring files (service removal, rmdir,
 shutdown, reconnect) through the actual file operations.

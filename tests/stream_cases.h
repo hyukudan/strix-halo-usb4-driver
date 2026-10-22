@@ -53,7 +53,7 @@ static void assert_nothing_held(void)
     assert(!qos_live);
 }
 
-/* cluster1, 2026-10-19: an order-4 allocation failed during open() and every
+/* Node A, 2026-10-19: an order-4 allocation failed during open() and every
  * later open of both streams on that NHI returned ENOMEM. Each failure point
  * must leave nothing behind, and the next open of either stream must work. */
 static void open_failure_is_not_sticky(void)

@@ -6,7 +6,7 @@ Strix Halo nodes yet. The hardware checks at the end must pass before this
 series becomes the default kernel.
 
 Source of the findings: the deep review of branch
-`feat/per-stream-latency-controls` (3d11d18) and the cluster1 incident of
+`feat/per-stream-latency-controls` (3d11d18) and the node A incident of
 2026-10-19 (streams of NHI1 failing with `ENOMEM` after one failed open).
 
 ## 0012 — `tb_stop()` unlinks the tunnels it frees (review C-2)
@@ -90,10 +90,10 @@ argument. The AMD NHI is an integrated function: that clearing Bus Master
 Enable really stops its DMA (and that its completions are not reordered by
 Relaxed Ordering) must be confirmed on hardware.
 
-## 0014 — A failed open no longer leaves the NHI unusable (cluster1 incident)
+## 0014 — A failed open no longer leaves the NHI unusable (node A incident)
 
 **Bug.** `tbstream_dev_start()` enables the DMA paths, starts the rings, then
-allocates the RX buffers. If that last step failed (the cluster1 order-4
+allocates the RX buffers. If that last step failed (the node A order-4
 allocation failure), the error path stopped and freed the rings but never
 disabled the paths: the DMA tunnel stayed in the connection manager, holding
 the NHI ring hops and the stream's HopIDs. Every later open of **either**
@@ -115,9 +115,9 @@ functions of `stream.c` against a model of rings, DMA mappings, IRQs and the
 CM tunnel inventory. `open_failure_is_not_sticky` injects a failure at each of
 nine points; after each one nothing must remain and both streams of the NHI
 must open again. With the path-disable line removed it fails exactly like
-cluster1 ("rx frame array failure left tunnels=1").
+node A ("rx frame array failure left tunnels=1").
 
-**Other cluster1 symptom (NHI0, `DMA RX path activation failed: -110`).** Not
+**Other node A symptom (NHI0, `DMA RX path activation failed: -110`).** Not
 fixed here; what the code shows:
 
 - `-110` is `-ETIMEDOUT` from the control channel (`ctl.c`: "timeout reading
@@ -137,7 +137,7 @@ fixed here; what the code shows:
   **host interface reset** at probe instead. That resets ring registers and
   E2E state, not the router or its hop tables. In this tree the only reset that
   is certain to clear router hop state is a **reboot** (cold boot or power
-  cycle). A PCI ACPI reset did not recover the NHI1 of cluster1 on 2026-10-19
+  cycle). A PCI ACPI reset did not recover the NHI1 of node A on 2026-10-19
   (see [DETACH-FIXES-2026-10-19.md](DETACH-FIXES-2026-10-19.md)).
 - The explicit DMA interface reset (`gpu_recover reset`,
   `SGU_IOC_RESET[_GROUP]`) resets the NHI DMA engine, not the router hop
@@ -269,7 +269,7 @@ boot entry. Prefer a build with `CONFIG_KASAN=y`, `CONFIG_PROVE_LOCKING=y` and
    engine runner does not yet). Run the duplex test with it, then once with
    the RX sequence deliberately off by one: EVENT must report
    `SGU_EVENT_FAILED` with frame error 128 and `dmesg` the mismatch.
-8. **NHI0 of cluster1.** Before any of the above, recover it with a reboot.
+8. **NHI0 of node A.** Before any of the above, recover it with a reboot.
    Reloading with `host_reset=Y` does not run HRR on these v1 NHIs (see the
    correction under 0014). If `-110` returns, capture the dynamic-debug
    output described in 0014.

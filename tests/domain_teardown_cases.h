@@ -64,7 +64,7 @@ static const struct tb_cm_ops software_cm = {
 
 /* NHI unbind, reboot or module unload with XDomains connected. Before, the
  * XDomains were only marked unplugged by the router removal and stayed
- * registered: their services outlived the domain and the module (cluster1
+ * registered: their services outlived the domain and the module (node A
  * vmcore, 2026-10-19: device_shutdown() called through a stale bus of
  * service 0-2.0). Their service drivers never ran, so RAM rings also stayed
  * up across the DMA path teardown and nhi_shutdown(). */

@@ -4,9 +4,9 @@ State: implemented, offline-tested (unit tests under ASan/UBSan) and
 compile-tested against the pinned 7.3-rc5 with the nodes' running
 configuration. **Not run on hardware yet**; see the checks at the end.
 
-Sources: the review of the 0012–0016 branch; the cluster1 vmcore of
-2026-10-19 13:50; the live cable pull at 14:24:24 (cluster2 warnings,
-cluster1 NHI1 wedge).
+Sources: the review of the 0012–0016 branch; the node A vmcore of
+2026-10-19 13:50; the live cable pull at 14:24:24 (node B warnings,
+node A NHI1 wedge).
 
 ## 1. The RAM-ring stream bug
 
@@ -22,7 +22,7 @@ stream goes away:
 
 The rings then outlived their paths, their service and possibly the NHI and
 its MMIO. The file's last close stopped them much later, through a ring the
-hardware had already torn down. cluster2 showed exactly this at 14:25:37, a
+hardware had already torn down. Node B showed exactly this at 14:25:37, a
 minute after the cable pull: `WARNING nhi.c:157 ring_interrupt_active:
 interrupt for TX ring 2 is already disabled`, then the same for TX ring 1,
 in `tb_ring_stop()` ← `tbstream_dev_stop()` ← `tbstream_dev_fops_release()`.
@@ -61,7 +61,7 @@ Every later call gets `-ENODEV`.
 
 ## 2. XDomains and services outliving their domain (the vmcore)
 
-**Finding.** The vmcore of cluster1 (13:50, kernel
+**Finding.** The vmcore of node A (13:50, kernel
 `7.3.0-rc5-strix-gpu-bosgame-20261014`, build ID
 `c4928f9cf0e4b28e2a657cdf9282e6cc874c1ac7`) faults at
 `device_shutdown+0x148`. That instruction follows the call
@@ -106,14 +106,14 @@ A CM without the hook (the firmware CM) keeps the previous order.
 remove and shutdown since 0013. The review had found this wait still
 unbounded.
 
-## 3. The cluster1 NHI1 wedge at 14:24:24
+## 3. The node A NHI1 wedge at 14:24:24
 
 **Observed.** NHI1 (`c7:00.6`) stopped answering control-channel reads at
 the moment the cable was pulled. Even route 0, the host router itself, did
 not answer, and the CM was still tearing down the DMA tunnels (`hop
 deactivation failed` for hop 0 of `0:1` index 1 and 2, `0:2` index 9). The
 same NHI later failed every reprobe (`failed to allocate host router`,
-`-ETIMEDOUT`). A PCI ACPI reset did not help either. cluster2's NHI on the
+`-ETIMEDOUT`). A PCI ACPI reset did not help either. Node B's NHI on the
 same cable survived, with the warnings of section 1.
 
 **Assessment.**
@@ -160,7 +160,7 @@ when the NHI is idle. See section 7.
 **Remaining warning.** After a physical unplug, 0017 stops the rings at
 service removal, within about a second rather than at close. If the AMD
 interface itself disables the TX ring interrupt on teardown (one reading of
-cluster2's warnings), `tb_ring_stop()` still logs `interrupt for TX ring N is
+node B's warnings), `tb_ring_stop()` still logs `interrupt for TX ring N is
 already disabled` once per ring at that point. The warning is left in place
 because it is a useful hardware signal.
 
@@ -361,7 +361,7 @@ one at a time (mutation check); every removal makes at least one test fail.
 **Incident (2026-10-19 15:21).** A two-node run sat 27 minutes in
 `tbstream_dev_fops_open` (`wchan`) on `/dev/tbstream1` and `/dev/tbstream3`.
 Their configfs endpoints belonged to domain 1, which no longer existed (NHI1
-of cluster1 wedged, and the second cable of cluster2 had no peer). An open
+of node A wedged, and the second cable of node B had no peer). An open
 with no stream attached slept until a stream appeared or a signal arrived.
 
 **Fix.**

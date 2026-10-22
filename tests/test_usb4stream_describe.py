@@ -104,7 +104,7 @@ class FakeHost:
 
 
 def pair(tmp, a_up, b_up, a_links, b_links):
-    return FakeHost(tmp, 'cluster1', a_up, a_links), FakeHost(tmp, 'cluster2', b_up, b_links)
+    return FakeHost(tmp, 'node-a', a_up, a_links), FakeHost(tmp, 'node-b', b_up, b_links)
 
 
 S5, S6 = '0000:c7:00.5', '0000:c7:00.6'
@@ -121,19 +121,19 @@ class DescribeTests(unittest.TestCase):
 
     def test_two_cables_up_straight(self):
         a, b = pair(self.tmp, BOTH, BOTH,
-                    {S5: ('cluster2', S5, 20.0, 2), S6: ('cluster2', S6, 20.0, 2)},
-                    {S5: ('cluster1', S5, 20.0, 2), S6: ('cluster1', S6, 20.0, 2)})
+                    {S5: ('node-b', S5, 20.0, 2), S6: ('node-b', S6, 20.0, 2)},
+                    {S5: ('node-a', S5, 20.0, 2), S6: ('node-a', S6, 20.0, 2)})
         ra, rb = a.describe(), b.describe()
         topo = ra['topology']
         self.assertEqual((topo['cables_total'], topo['cables_up'], topo['gbps_total']), (2, 2, 80.0))
         self.assertEqual([c['link']['gbps'] for c in topo['cables']], [40.0, 40.0])
-        self.assertEqual(topo['peers']['cluster2']['cables'], ['A', 'B'])
+        self.assertEqual(topo['peers']['node-b']['cables'], ['A', 'B'])
         self.assertEqual(topo['warnings'], [])
         s = ra['0-2.0/data0']
         self.assertEqual((s['local']['nhi_pci'], s['local']['domain'], s['local']['usb4_port']),
                          (S5, 0, 2))
         self.assertEqual((s['remote']['device_name'], s['remote']['route'], s['remote']['unique_id']),
-                         ('cluster2', '0x2', uuid('cluster2', S5)))
+                         ('node-b', '0x2', uuid('node-b', S5)))
         self.assertEqual((s['index'], s['in_hopid'], s['out_hopid']), (0, 8, 8))
         self.assertEqual((s['link']['rx']['gbps_per_lane'], s['link']['tx']['lanes']), (20.0, 2))
         self.assertTrue(s['exists'] and s['attached'] and s['openable'])
@@ -148,8 +148,8 @@ class DescribeTests(unittest.TestCase):
 
     def test_crossed_wiring_with_labels(self):
         a, b = pair(self.tmp, BOTH, BOTH,
-                    {S5: ('cluster2', S6, 20.0, 2), S6: ('cluster2', S5, 20.0, 2)},
-                    {S5: ('cluster1', S6, 20.0, 2), S6: ('cluster1', S5, 20.0, 2)})
+                    {S5: ('node-b', S6, 20.0, 2), S6: ('node-b', S5, 20.0, 2)},
+                    {S5: ('node-a', S6, 20.0, 2), S6: ('node-a', S5, 20.0, 2)})
         ra, rb = a.describe(LABELS), b.describe(LABELS)
         self.assertEqual(ra['0-2.0/data0']['local']['port_label'], 'rear')
         merged = describe_mod.merge([ra, rb])
@@ -157,18 +157,18 @@ class DescribeTests(unittest.TestCase):
         self.assertEqual(sorted(l['wiring_by_label'] for l in merged['links']),
                          ['front-rear', 'rear-front'])
         link = next(l for l in merged['links'] if l['ends'][0]['nhi_pci'] == S5
-                    and l['ends'][0]['host'] == 'cluster1')
+                    and l['ends'][0]['host'] == 'node-a')
         self.assertEqual(link['ends'][1]['nhi_pci'], S6)
-        # NHI0 (domain 0, tbstream0/2) on cluster1 pairs with NHI1 (domain 1, tbstream1/3).
+        # NHI0 (domain 0, tbstream0/2) on node-a pairs with NHI1 (domain 1, tbstream1/3).
         self.assertEqual({(p['a']['device'], p['b']['device']) for p in link['stream_pairs']},
                          {('/dev/tbstream0', '/dev/tbstream1'), ('/dev/tbstream2', '/dev/tbstream3')})
         self.assertIn('crossed', merged['summary'])
 
     def test_one_cable_down_controller_failed_probe(self):
-        # Today's lab state: cluster1 0000:c7:00.5 failed probe (-110).
+        # Today's lab state: node-a 0000:c7:00.5 failed probe (-110).
         a, b = pair(self.tmp, (S6,), BOTH,
-                    {S6: ('cluster2', S5, 20.0, 2)},
-                    {S5: ('cluster1', S6, 20.0, 2), S6: None})
+                    {S6: ('node-b', S5, 20.0, 2)},
+                    {S5: ('node-a', S6, 20.0, 2), S6: None})
         ra, rb = a.describe(), b.describe()
         ta = ra['topology']
         self.assertEqual((ta['cables_total'], ta['cables_up']), (2, 1))
@@ -197,7 +197,7 @@ class DescribeTests(unittest.TestCase):
         self.assertTrue(merged['suspected_down_links'][0]['inferred'])
 
     def test_kernel_log_explains_down_controller(self):
-        a = FakeHost(self.tmp, 'cluster1', (S6,), {S6: ('cluster2', S5, 20.0, 2)})
+        a = FakeHost(self.tmp, 'node-a', (S6,), {S6: ('node-b', S5, 20.0, 2)})
         line = 'thunderbolt 0000:c7:00.5: probe with driver thunderbolt failed with error -110'
         topo = a.describe(kernel_log=['unrelated', line])['topology']
         self.assertEqual(topo['controllers'][0]['kernel_log'], line)
@@ -205,14 +205,14 @@ class DescribeTests(unittest.TestCase):
 
     def test_mixed_20_and_40_gbps(self):
         a, b = pair(self.tmp, BOTH, BOTH,
-                    {S5: ('cluster2', S5, 20.0, 2), S6: ('cluster2', S6, 10.0, 2)},
-                    {S5: ('cluster1', S5, 20.0, 2), S6: ('cluster1', S6, 10.0, 2)})
+                    {S5: ('node-b', S5, 20.0, 2), S6: ('node-b', S6, 10.0, 2)},
+                    {S5: ('node-a', S5, 20.0, 2), S6: ('node-a', S6, 10.0, 2)})
         ra = a.describe()
         topo = ra['topology']
         self.assertEqual([c['link']['gbps'] for c in topo['cables']], [40.0, 20.0])
         self.assertEqual([c['link']['full_speed'] for c in topo['cables']], [True, False])
         self.assertEqual(topo['gbps_total'], 60.0)
-        self.assertEqual(topo['peers']['cluster2']['gbps'], 60.0)
+        self.assertEqual(topo['peers']['node-b']['gbps'], 60.0)
         self.assertEqual([w for w in topo['warnings'] if 'below Gen3' in w],
                          ['cable B (0000:c7:00.6/usb4_port2) trained below Gen3 x2: rx 10x2, tx 10x2'])
         self.assertIn('20 Gb/s (10 Gb/s x2 lanes)', topo['summary'])
@@ -220,12 +220,12 @@ class DescribeTests(unittest.TestCase):
         self.assertEqual(sorted(l['gbps'] for l in merged['links']), [20.0, 40.0])
 
     def test_single_lane_is_20_gbps(self):
-        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 1), S6: None})
+        a = FakeHost(self.tmp, 'node-a', BOTH, {S5: ('node-b', S5, 20.0, 1), S6: None})
         cable = a.describe()['topology']['cables'][0]
         self.assertEqual((cable['link']['gbps'], cable['link']['full_speed']), (20.0, False))
 
     def test_backward_compatible_keys_and_version(self):
-        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        a = FakeHost(self.tmp, 'node-a', BOTH, {S5: ('node-b', S5, 20.0, 2), S6: None})
         report = a.describe()
         self.assertEqual(report['version'], 2)
         streams = {k: v for k, v in report.items() if '/' in k}
@@ -234,15 +234,15 @@ class DescribeTests(unittest.TestCase):
                          a.legacy)
 
     def test_read_only_and_cli(self):
-        a = FakeHost(self.tmp, 'cluster1', (S6,), {S6: ('cluster2', S5, 20.0, 2)})
+        a = FakeHost(self.tmp, 'node-a', (S6,), {S6: ('node-b', S5, 20.0, 2)})
         before = a.snapshot()
         out = Path(self.tmp) / 'out.json'
         with contextlib.redirect_stdout(io.StringIO()) as text:
             describe_mod.main(['--sysfs-root', str(a.sys), '--dev-root', str(a.dev),
-                               '--hostname', 'cluster1', '--output', str(out), '--summary',
+                               '--hostname', 'node-a', '--output', str(out), '--summary',
                                '--port-labels', str(self._labels())])
         self.assertEqual(a.snapshot(), before)
-        self.assertIn('cluster1: 2 cable slot(s), 1 up', text.getvalue())
+        self.assertIn('node-a: 2 cable slot(s), 1 up', text.getvalue())
         report = json.loads(out.read_text())
         self.assertEqual(report['topology']['cables'][1]['local']['port_label'], 'front')
         # Real /dev nodes are required outside tests: plain files are not openable.
@@ -250,7 +250,7 @@ class DescribeTests(unittest.TestCase):
         self.assertIn('not a character device', report['0-2.0/data0']['openable_reason'])
 
     def test_layout_fallback_when_configfs_unreadable(self):
-        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        a = FakeHost(self.tmp, 'node-a', BOTH, {S5: ('node-b', S5, 20.0, 2), S6: None})
         layout = Path(self.tmp) / 'layout.json'
         layout.write_text(json.dumps(a.legacy))
         report = describe_mod.Describer(a.sys, configfs_root=Path(self.tmp) / 'missing',
@@ -271,7 +271,7 @@ class DescribeTests(unittest.TestCase):
         self.assertEqual(setup.LAYOUT, Path('/run/usb4stream-layout.json'))
 
     def test_hopid_zero_is_not_openable(self):
-        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        a = FakeHost(self.tmp, 'node-a', BOTH, {S5: ('node-b', S5, 20.0, 2), S6: None})
         cdir = a.configfs / '0-2.0/data0'
         write(cdir / 'in_hopid', '0')
         report = a.describe()
@@ -283,7 +283,7 @@ class DescribeTests(unittest.TestCase):
         self.assertEqual(report['topology']['cables'][0]['streams_openable'], 1)
 
     def test_legacy_layout_without_hopids_is_not_openable(self):
-        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        a = FakeHost(self.tmp, 'node-a', BOTH, {S5: ('node-b', S5, 20.0, 2), S6: None})
         layout = Path(self.tmp) / 'layout.json'
         layout.write_text(json.dumps(a.legacy))
         report = describe_mod.Describer(a.sys, configfs_root=Path(self.tmp) / 'missing',
@@ -293,8 +293,8 @@ class DescribeTests(unittest.TestCase):
         self.assertIn('HopIDs unknown', report['0-2.0/data0']['openable_reason'])
 
     def test_unknown_speed_is_not_below_gen3(self):
-        a = FakeHost(self.tmp, 'cluster1', BOTH,
-                     {S5: ('cluster2', S5, 20.0, 2), S6: ('cluster2', S6, 20.0, 2)})
+        a = FakeHost(self.tmp, 'node-a', BOTH,
+                     {S5: ('node-b', S5, 20.0, 2), S6: ('node-b', S6, 20.0, 2)})
         xd = a.sys / 'bus/thunderbolt/devices/1-2'
         write(xd / 'rx_speed', 'garbage')
         (xd / 'tx_lanes').unlink()
@@ -307,7 +307,7 @@ class DescribeTests(unittest.TestCase):
         self.assertTrue(topo['cables'][0]['link']['full_speed'])
 
     def test_stream_removed_during_enumeration(self):
-        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        a = FakeHost(self.tmp, 'node-a', BOTH, {S5: ('node-b', S5, 20.0, 2), S6: None})
         gone = a.configfs / '0-2.0/data1'
 
         class Racy(describe_mod.Describer):
@@ -318,20 +318,20 @@ class DescribeTests(unittest.TestCase):
                 gone.rmdir()
                 return found
 
-        report = Racy(a.sys, dev_root=a.dev, hostname='cluster1', require_chardev=False).describe()
+        report = Racy(a.sys, dev_root=a.dev, hostname='node-a', require_chardev=False).describe()
         self.assertNotIn('0-2.0/data1', report)
         self.assertIn('0-2.0/data0', report)
         self.assertTrue(any('0-2.0/data1 vanished' in w for w in report['topology']['warnings']))
 
     def test_vanished_service_directory_and_driver_link(self):
-        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        a = FakeHost(self.tmp, 'node-a', BOTH, {S5: ('node-b', S5, 20.0, 2), S6: None})
         self.assertEqual(describe_mod.listdir(Path(self.tmp) / 'nope'), [])
         self.assertIsNone(describe_mod.driver_name(Path(self.tmp) / 'nope'))
         self.assertEqual(describe_mod.driver_name(a.sys / 'bus/thunderbolt/devices/0-2.0'),
                          'thunderbolt_stream')
 
     def test_journalctl_failure_is_reported(self):
-        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        a = FakeHost(self.tmp, 'node-a', BOTH, {S5: ('node-b', S5, 20.0, 2), S6: None})
 
         class Failed:
             returncode, stdout, stderr = 1, '', 'No journal files were found.'
@@ -342,7 +342,7 @@ class DescribeTests(unittest.TestCase):
             out = Path(self.tmp) / 'out.json'
             with contextlib.redirect_stdout(io.StringIO()):
                 describe_mod.main(['--sysfs-root', str(a.sys), '--dev-root', str(a.dev),
-                                   '--hostname', 'cluster1', '--logs', '--output', str(out),
+                                   '--hostname', 'node-a', '--logs', '--output', str(out),
                                    '--port-labels', str(self._labels())])
         finally:
             describe_mod.subprocess.run = original
@@ -352,10 +352,10 @@ class DescribeTests(unittest.TestCase):
 
     def test_merge_rejects_duplicate_hostnames(self):
         a, b = pair(self.tmp, BOTH, BOTH,
-                    {S5: ('cluster2', S5, 20.0, 2), S6: ('cluster2', S6, 20.0, 2)},
-                    {S5: ('cluster1', S5, 20.0, 2), S6: ('cluster1', S6, 20.0, 2)})
+                    {S5: ('node-b', S5, 20.0, 2), S6: ('node-b', S6, 20.0, 2)},
+                    {S5: ('node-a', S5, 20.0, 2), S6: ('node-a', S6, 20.0, 2)})
         ra = a.describe()
-        with self.assertRaisesRegex(ValueError, "duplicate host 'cluster1'"):
+        with self.assertRaisesRegex(ValueError, "duplicate host 'node-a'"):
             describe_mod.merge([ra, ra])
         files = []
         for i, rep in enumerate((ra, ra)):
@@ -369,7 +369,7 @@ class DescribeTests(unittest.TestCase):
         self.assertEqual(len(describe_mod.merge([ra, b.describe()])['links']), 2)
 
     def test_until_stable_repeats_a_pass_that_saw_a_hotplug(self):
-        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        a = FakeHost(self.tmp, 'node-a', BOTH, {S5: ('node-b', S5, 20.0, 2), S6: None})
         gone = a.configfs / '1-2.0/data1'
 
         class Hotplug(describe_mod.Describer):
@@ -384,14 +384,14 @@ class DescribeTests(unittest.TestCase):
                     gone.rmdir()
                 return layout
 
-        report = Hotplug(a.sys, dev_root=a.dev, hostname='cluster1',
+        report = Hotplug(a.sys, dev_root=a.dev, hostname='node-a',
                          require_chardev=False).describe_stable(5)
         self.assertEqual((Hotplug.calls, report['topology']['passes']), (2, 2))
         self.assertNotIn('1-2.0/data1', report)
         self.assertFalse(any('changed during each' in w for w in report['topology']['warnings']))
 
     def test_until_stable_gives_up_with_a_warning(self):
-        a = FakeHost(self.tmp, 'cluster1', BOTH, {S5: ('cluster2', S5, 20.0, 2), S6: None})
+        a = FakeHost(self.tmp, 'node-a', BOTH, {S5: ('node-b', S5, 20.0, 2), S6: None})
 
         class Flapping(describe_mod.Describer):
             n = 0
@@ -401,7 +401,7 @@ class DescribeTests(unittest.TestCase):
                 (a.configfs / '0-2.0' / f'extra{Flapping.n}').mkdir()
                 return super().describe()
 
-        report = Flapping(a.sys, dev_root=a.dev, hostname='cluster1',
+        report = Flapping(a.sys, dev_root=a.dev, hostname='node-a',
                           require_chardev=False).describe_stable(3)
         self.assertEqual((Flapping.n, report['topology']['passes']), (3, 3))
         self.assertTrue(any('changed during each of 3 passes' in w

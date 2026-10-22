@@ -27,7 +27,7 @@ a status (complete, timeout, refused, error, interrupted).
 
 usage example (the benchmark binary and this driver checkout must be at the
 same paths on both hosts):
-  tools/lab/run_stream_bench.py --peer cluster2 --out ~/bench/2026-10-20-4x \\
+  tools/lab/run_stream_bench.py --peer node-b --out ~/bench/2026-10-20-4x \\
       --bench ~/bin/stream_mem_bench --bytes 8G --block 1M \\
       --pair /dev/tbstream0:/dev/tbstream0:2:2 --pair /dev/tbstream1:/dev/tbstream1:4:4 ...
 """

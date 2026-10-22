@@ -2,7 +2,7 @@
 
 State: implemented and tested **offline only** (unit tests with sanitizers,
 `W=1` object builds, and full `W=1 vmlinux modules` builds with modpost on
-cluster1 with `USB4_GPU_STREAM=y` and `=n`). Nothing here has run on the Strix
+node A with `USB4_GPU_STREAM=y` and `=n`). Nothing here has run on the Strix
 Halo nodes yet. The hardware checks at the end must pass before the series
 becomes the installed kernel.
 
@@ -186,7 +186,7 @@ Conditions, all required, each logged when it blocks:
 1. The local lane adapter supports Gen3 and targets it (LANE_ADP_CS_0/1).
 2. The local port advertises **Gen3 Support in LINK_CONF** (sideband register
    0x0C, byte 1 bit 5). This is read first. Without the bit (the `d3` captures
-   of cluster2) the limit is the port or its on-board retimers: that is logged
+   of node B) the limit is the port or its on-board retimers: that is logged
    and nothing is reset.
 3. No DMA tunnel in the domain and no data ring on the NHI. This is checked
    under the domain lock, which is only tried: the CM may be removing this

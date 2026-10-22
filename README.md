@@ -123,7 +123,7 @@ the current driver on its own.
 
 ```mermaid
 flowchart LR
-    subgraph A["cluster1 · Strix Halo"]
+    subgraph A["node-a · Strix Halo"]
         direction TB
         GA["iGPU (gfx1151)<br/>GTT / system RAM"]
         subgraph NA0["NHI 0 · 1022:158d"]
@@ -139,7 +139,7 @@ flowchart LR
         GA -. "DMA-BUF<br/>(gpu_direct)" .- NA0
         GA -. "DMA-BUF<br/>(gpu_direct)" .- NA1
     end
-    subgraph B["cluster2 · Strix Halo"]
+    subgraph B["node-b · Strix Halo"]
         direction TB
         subgraph NB0["NHI 0 · 1022:158d"]
             B0d["rings 1–2 · data"]
@@ -157,9 +157,9 @@ flowchart LR
 
 The diagram shows the current cabling (front port of one machine to rear port
 of the other). Any port pairing works and performs the same; what matters is
-knowing which endpoint pairs with which. With this cabling NHI 0 on cluster1
-talks to NHI 1 on cluster2 and vice versa, so stream and network configuration
-pair `/dev/tbstream0` on cluster1 with `/dev/tbstream1` on cluster2, and so on.
+knowing which endpoint pairs with which. With this cabling NHI 0 on node A
+talks to NHI 1 on node B and vice versa, so stream and network configuration
+pair `/dev/tbstream0` on node A with `/dev/tbstream1` on node B, and so on.
 After moving a cable, re-check the pairing from `/run/usb4stream-layout.json`
 and the endpoint UUIDs instead of assuming it. The one port that once trained
 at Gen2 did so regardless of which cable was plugged into it.
@@ -397,10 +397,10 @@ Before these fixes the series could not be built:
 
 | Check | Result |
 |---|---|
-| Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 43 patches (0012–0039: checked offline in WSL and on cluster1, 2026-10-20; 0040–0042: offline in WSL and on cluster1, 2026-10-20; 0043: `tools/apply-series.sh` on cluster1, 2026-10-22) |
+| Series applies to pristine 7.3-rc5 (`git apply`) | ✅ all 43 patches (0012–0039: checked offline in WSL and on node A, 2026-10-20; 0040–0042: offline in WSL and on node A, 2026-10-20; 0043: `tools/apply-series.sh` on node A, 2026-10-22) |
 | `prepare_overlay.py` vs applying the series to the kernel | ✅ byte-identical (22 files) |
-| Offline unit tests (`unittest discover`) | ✅ 282 run, OK (1 bundle-only skip) with 0001–0043 (kernel and tools suites merged); every patch 0020–0042 also passes on its own. 0001–0045 (2026-10-22, cluster1): 288 run, all pass except the 3 `test_stream_bench` end-to-end runner tests, which read the machine's live ring budget and fail identically on 0001–0043 while a pair session holds the rings |
-| Modules with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` (0001–0017, 0001–0018 and 0001–0019: full `vmlinux modules` builds with modpost on cluster1, 2026-10-19; 0001–0032, 0001–0035, 0001–0039 and 0001–0042: `vmlinux modules` with GPU on, then all modules relinked with GPU off, modpost both times, no kernel-doc warnings left; 0001–0043: `W=1` objects of `drivers/thunderbolt/` and `drivers/net/thunderbolt/` after `modules_prepare`, GPU on and off, on cluster1, 2026-10-22, not linked; `tools/check_build_log.py` makes any diagnostic in this series' files fatal in CI) |
+| Offline unit tests (`unittest discover`) | ✅ 282 run, OK (1 bundle-only skip) with 0001–0043 (kernel and tools suites merged); every patch 0020–0042 also passes on its own. 0001–0045 (2026-10-22, node A): 288 run, all pass except the 3 `test_stream_bench` end-to-end runner tests, which read the machine's live ring budget and fail identically on 0001–0043 while a pair session holds the rings |
+| Modules with `W=1` and the machines' running config | ✅ 0 warnings, 0 errors, `USB4_GPU_STREAM=y` and `=n` (0001–0017, 0001–0018 and 0001–0019: full `vmlinux modules` builds with modpost on node A, 2026-10-19; 0001–0032, 0001–0035, 0001–0039 and 0001–0042: `vmlinux modules` with GPU on, then all modules relinked with GPU off, modpost both times, no kernel-doc warnings left; 0001–0043: `W=1` objects of `drivers/thunderbolt/` and `drivers/net/thunderbolt/` after `modules_prepare`, GPU on and off, on node A, 2026-10-22, not linked; `tools/check_build_log.py` makes any diagnostic in this series' files fatal in CI) |
 | Link negotiation Gen3 × 2 on both cables | ✅ sysfs and lane registers; kept across every module reload and controller reset |
 | Complete 0001–0010 series loaded on hardware (0011 measured separately; 0012–0043 not yet) | ✅ both machines, modules built against the running kernel (exact vermagic and CRCs) |
 | Host-memory bandwidth, integrity, latency (series) | ✅ 41.0–41.5 Gb/s with 4 streams, zero bad chunks; latency as above |

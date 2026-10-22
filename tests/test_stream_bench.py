@@ -105,7 +105,7 @@ class AggregateTests(unittest.TestCase):
         self.assertIsNone(bench.aggregate([]))
 
     def test_plan_pins_bounds_and_marks_every_process(self):
-        args = bench.argparse.Namespace(peer='cluster2', bench=Path('/opt/b'), bytes=1 << 30,
+        args = bench.argparse.Namespace(peer='node-b', bench=Path('/opt/b'), bytes=1 << 30,
                                         block=1 << 20, direction='send', timeout=600, run_id='r1',
                                         ssh='ssh -o BatchMode=yes',
                                         pair=[bench.parse_pair('/dev/tbstream0:/dev/tbstream2:2:4')])
@@ -116,7 +116,7 @@ class AggregateTests(unittest.TestCase):
                                                '--kill-after=10 600 "$@"', 'usb4bench-r1-0'])
         self.assertEqual(stream['local'][4:], ['taskset', '-c', '2', '/opt/b', 'send',
                                                '/dev/tbstream0', str(1 << 30), str(1 << 20), '1'])
-        self.assertEqual(stream['remote'][:4], ['ssh', '-o', 'BatchMode=yes', 'cluster2'])
+        self.assertEqual(stream['remote'][:4], ['ssh', '-o', 'BatchMode=yes', 'node-b'])
         self.assertIn('timeout --kill-after=10 600', stream['remote'][-1])
         self.assertIn('taskset -c 4 /opt/b recv /dev/tbstream2', stream['remote'][-1])
         self.assertEqual((plan['receiver'], plan['timeout_seconds']), ('peer', 600))

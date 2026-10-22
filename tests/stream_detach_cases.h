@@ -4,7 +4,7 @@
  * removal, configfs rmdir, system shutdown. Runs the actual detach, rmdir,
  * shutdown and file operations of stream.c. Before the fix the rings stayed
  * alive until the file was closed, after the NHI could be gone; the close
- * then stopped them (cluster2, 2026-10-19: "interrupt for TX ring N is
+ * then stopped them (node B, 2026-10-19: "interrupt for TX ring N is
  * already disabled"), and a reconnect let the stale file reach the new
  * stream with no rings at all. */
 

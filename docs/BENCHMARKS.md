@@ -52,7 +52,7 @@ Example: four streams, both cables, this host sends 8 GiB per stream in 1 MiB
 writes, each process pinned to its own CPU on both ends:
 
 ```sh
-tools/lab/run_stream_bench.py --peer cluster2 --out ~/bench/$(date +%Y%m%d-%H%M)-4x \
+tools/lab/run_stream_bench.py --peer node-b --out ~/bench/$(date +%Y%m%d-%H%M)-4x \
     --bench ~/bin/stream_mem_bench --bytes 8G --block 1M \
     --pair /dev/tbstream0:/dev/tbstream0:2:2 --pair /dev/tbstream1:/dev/tbstream1:4:4 \
     --pair /dev/tbstream2:/dev/tbstream2:6:6 --pair /dev/tbstream3:/dev/tbstream3:8:8
