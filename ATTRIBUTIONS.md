@@ -7,22 +7,23 @@ The copied/modified files preserve their original copyright and SPDX notices.
 The kernel extension is GPL-2.0-only; the experimental UAPI carries
 GPL-2.0 WITH Linux-syscall-note. Existing upstream files retain their own tags.
 
-The project DMA-BUF extension originated in the local
-`hyukudan/strix-halo-engine-lab` source, including kernel extension files last
-committed there at `9aa96d512691a7ccfb18ab0b205ee92e3a54adaf`, followed by local
-driver fixes. This backup captures the current source bytes, not merely that
-historical project revision. Original USB4STREAM Intel notices remain present.
+The DMA-BUF GPU stream extension originated in the
+[`hyukudan/strix-halo-engine-lab`](https://github.com/hyukudan/strix-halo-engine-lab)
+source and was then developed here. The USB4STREAM configfs streams build on
+the original Intel USB4STREAM code; its notices remain present.
 
-Two MSI-X fixes were adapted from CiruStrixLink's Linux 7.2.2 patch series:
-https://github.com/ciru-ai/CiruStrixLink/tree/master/kernel/linux-7.2.2
+Two MSI-X fixes in 0001 were adapted from CiruStrixLink's Linux 7.2.2 patch
+series: https://github.com/ciru-ai/CiruStrixLink/tree/master/kernel/linux-7.2.2
 
-- Jonathan Yates, "Flush posted MSI-X interrupt clears", patch mail object
-  `0b1c43d0ab12af459479635a06e8288c4ae765d5`.
-- "Clear stale MSI-X status before ring arm", patch mail object
-  `4c9c48479c2a6d17ccd04619bbfcdb9ec7572869`, attributed in its original header
-  to Codex USB4STREAM Analysis.
+- Jonathan Yates, "thunderbolt: Flush posted MSI-X interrupt clears", patch
+  mail object `0b1c43d0ab12af459479635a06e8288c4ae765d5`. Its original header,
+  author and sign-off are retained in `provenance/reference-patches/`.
+- "thunderbolt: Clear stale MSI-X status before ring arm", patch mail object
+  `4c9c48479c2a6d17ccd04619bbfcdb9ec7572869` in that series, which links
+  Benjamin S. Berman's upstream submission:
+  https://patchew.org/linux/20260428015521.3454006-1-benjamin.s.berman@gmail.com/
 
-Their original headers, author/sign-off text and public links are retained in
-`provenance/reference-patches/`. They are provenance copies, not additional
-patches to apply after the combined snapshot. Public source inspection and
-private audit correspondence are not redistributed here.
+The provenance copy is not an additional patch to apply after the series.
+
+`patches/kernel-backports/` holds an unmodified upstream Linux fix
+(`e6895021a328`, drm/amdkfd) with its original authorship.

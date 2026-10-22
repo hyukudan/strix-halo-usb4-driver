@@ -28,7 +28,7 @@ CI): it stops with a non-zero status at the first patch that does not apply,
 instead of continuing and reporting success on a partially patched tree.
 
 Apply all series entries, not just 0001. Do not reapply anything from
-`provenance/reference-patches/`: those changes are already in 0001.
+`provenance/reference-patches/`: that change is already in 0001.
 
 Alternatively, generate the audited overlay and copy it onto a **clean copy of
 the same pinned upstream tree**, instead of applying the series:

@@ -36,21 +36,13 @@ effective IRQ affinities, per-thread masks, tracing overruns and binary hashes.
 An attribute accepting `irq_cpu` is insufficient proof of effective affinity.
 
 Tracing adds overhead when enabled. Capture attribution separately from the
-untraced latency and bandwidth runs; do not combine their percentiles. The
-administrative helper in `tools/lab/usb4lat2-root.py` uses fixed arms, private
-tracefs state, at most five seconds per capture, and restores the saved stream
-attributes and module parameters on exit. It requires administrative review and
-startup; application processes continue to run as the ordinary lab user.
+untraced latency and bandwidth runs; do not combine their percentiles. Keep
+captures short (a few seconds), use a private tracefs instance with overwrite
+disabled and a buffer large enough to avoid drops (8 MiB per CPU was enough for
+a 20 KB exchange loop), save the per-CPU drop counters with every capture, and
+disable the event and select the `nop` tracer between captures so untraced runs
+do not keep the hooks enabled. Restore any stream attributes or module
+parameters changed for an experiment when it ends.
 
-The revised helper allocates 8 MiB per CPU (about 256 MiB on a 32-CPU host),
-keeps overwrite disabled and saves per-CPU drop counters for every capture.
-Attribution runs must be short enough to avoid drops. It disables the event
-hooks and selects the `nop` tracer between captures, after saving trace data
-and counters, so plain sessions do not retain enabled tracing hooks.
-
-Fixed arms `BP` and `BP3` select existing `busy_poll=1`, `rx_napi=0`, unbound
-completion work and contiguous buffer modes 0 and 3 respectively. No new
-kernel policy is introduced. Busy-poll rejects `poll(2)`; applications must
-explicitly select bounded nonblocking read/write loops, including pairing.
-These arms are diagnostic only until byte, model, power and bandwidth gates
-pass. No arm changes CPU latency QoS.
+Busy-poll streams (`busy_poll=1`) reject `poll(2)`: applications must use
+bounded non-blocking read/write loops, including for pairing.
