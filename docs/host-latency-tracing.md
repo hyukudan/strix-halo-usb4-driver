@@ -41,3 +41,16 @@ administrative helper in `tools/lab/usb4lat2-root.py` uses fixed arms, private
 tracefs state, at most five seconds per capture, and restores the saved stream
 attributes and module parameters on exit. It requires administrative review and
 startup; application processes continue to run as the ordinary lab user.
+
+The revised helper allocates 8 MiB per CPU (about 256 MiB on a 32-CPU host),
+keeps overwrite disabled and saves per-CPU drop counters for every capture.
+Attribution runs must be short enough to avoid drops. It disables the event
+hooks and selects the `nop` tracer between captures, after saving trace data
+and counters, so plain sessions do not retain enabled tracing hooks.
+
+Fixed arms `BP` and `BP3` select existing `busy_poll=1`, `rx_napi=0`, unbound
+completion work and contiguous buffer modes 0 and 3 respectively. No new
+kernel policy is introduced. Busy-poll rejects `poll(2)`; applications must
+explicitly select bounded nonblocking read/write loops, including pairing.
+These arms are diagnostic only until byte, model, power and bandwidth gates
+pass. No arm changes CPU latency QoS.

@@ -3,7 +3,7 @@
 
 sudo python3 /home/sergioc/ai-cluster-lab/usb4-lat2/usb4lat2-root.py
 Lifetime 1800s, then at most 30s to restore closed streams. Never unloads/reboots.
-Protocol: write '<unique-number> A0|A1|B0|B1|Q0|Q1|T1|C3|end' to request;
+Protocol: write '<unique-number> A0|A1|B0|B1|Q0|Q1|T1|C3|BP|BP3|end' to request;
 or '<number> traceon <label>' / '<number> traceoff'. ACK JSON includes request ID.
 All paths, knobs and events are fixed; no command from the request is executed.
 """
@@ -29,7 +29,9 @@ INST = TRACE / 'instances/usb4lat2'
 ARMS = {'A0': (0, 14, 'N', 8192, 0), 'A1': (1, 14, 'N', 8192, 0),
         'B0': (0, 11, 'N', 8192, 0), 'B1': (1, 11, 'N', 8192, 0),
         'Q0': (0, 14, 'Y', 8192, 0), 'Q1': (0, 11, 'Y', 8192, 0),
-        'T1': (1, 14, 'N', 0, 0), 'C3': (1, 14, 'N', 8192, 3)}
+        'T1': (1, 14, 'N', 0, 0), 'C3': (1, 14, 'N', 8192, 3),
+        # No data-ring interrupts. Applications must use bounded nonblocking read/write loops, never poll().
+        'BP': (0, 14, 'N', 8192, 0), 'BP3': (0, 14, 'N', 8192, 3)}
 ATTRS = ('rx_napi', 'irq_cpu', 'busy_poll', 'spin_us', 'throttling')
 EVENTS = ('irq/irq_handler_entry', 'irq/irq_handler_exit', 'workqueue/workqueue_queue_work',
           'workqueue/workqueue_execute_start', 'workqueue/workqueue_execute_end',
@@ -104,6 +106,19 @@ def main():
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
 
+    def hooks(enabled):
+        # tracing_on=0 stops recording but can leave trace hooks on the hot path.
+        # Plain arms must also disable event static keys and the function tracer.
+        if enabled:
+            put(INST / 'current_tracer', 'function')
+        for event in EVENTS:
+            put(INST / 'events' / event / 'enable', int(enabled))
+        custom = INST / 'events/thunderbolt/tb_latency/enable'
+        if custom.exists():
+            put(custom, int(enabled))
+        if not enabled:
+            put(INST / 'current_tracer', 'nop')
+
     def traceoff():
         nonlocal active
         if active is None:
@@ -114,6 +129,7 @@ def main():
         stats = {p.parent.name: read(p) for p in INST.glob('per_cpu/cpu*/stats')}
         put(captures / (active + '.stats.json'), json.dumps(stats, indent=2))
         active = None
+        hooks(False)  # only after copying the trace: changing tracer may clear it
 
     deadline = time.monotonic() + 1800
     last = ''
@@ -124,20 +140,14 @@ def main():
         created = True
         put(INST / 'tracing_on', 0)
         put(INST / 'trace_clock', 'mono')
-        put(INST / 'buffer_size_kb', 1024)  # per CPU, bounded (~32 MiB total on these nodes)
+        put(INST / 'buffer_size_kb', 8192)  # per CPU, bounded (~256 MiB total); 1 MiB dropped W4 IRQ bursts
         put(INST / 'options/overwrite', 0)
         available = {line.split()[0] for line in (TRACE / 'available_filter_functions').read_text().splitlines()}
         selected = [f for f in FUNCTIONS if f in available]
         if not selected:
             raise RuntimeError('no required host completion functions traceable')
         put(INST / 'set_ftrace_filter', '\n'.join(selected))
-        put(INST / 'current_tracer', 'function')
-        for event in EVENTS:
-            put(INST / 'events' / event / 'enable', 1)
-        # Future 0046 supplies ring/frame identity, while the deployed kernel uses filtered functions.
-        custom = INST / 'events/thunderbolt/tb_latency/enable'
-        if custom.exists():
-            put(custom, 1)
+        hooks(False)
         put(captures / 'functions.json', json.dumps(selected))
         put(RUN / 'ready.json', json.dumps(state))
         while not stop and time.monotonic() < deadline:
@@ -164,6 +174,7 @@ def main():
                         if (captures / (active + '.trace')).exists():
                             active = None
                             raise RuntimeError('capture label already used')
+                        hooks(True)
                         put(INST / 'trace', '')
                         put(INST / 'tracing_on', 1)
                         trace_deadline = min(deadline, time.monotonic() + 5)
@@ -174,13 +185,14 @@ def main():
                             raise RuntimeError('arm requires layout 1')
                         qos_clear(streams)
                         napi, cpu, wq, itr, cb = ARMS[command]
+                        busy = int(command in ('BP', 'BP3'))
                         put(WQ, wq)
                         put(CB, cb)
                         for s in streams:
-                            for attr, value in zip(ATTRS, (napi, cpu, 0, 0, itr)):
+                            for attr, value in zip(ATTRS, (napi, cpu, busy, 0, itr)):
                                 put(s / attr, value)  # EBUSY aborts arm; never acknowledge partial state as success
                         expected = {str(s / a): str(v) for s in streams
-                                    for a, v in zip(ATTRS, (napi, cpu, 0, 0, itr))}
+                                    for a, v in zip(ATTRS, (napi, cpu, busy, 0, itr))}
                         expected.update({str(WQ): wq, str(CB): str(cb)})
                         if any(read(Path(p)) != v for p, v in expected.items()):
                             raise RuntimeError('knob readback mismatch')
