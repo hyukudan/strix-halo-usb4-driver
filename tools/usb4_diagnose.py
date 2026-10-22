@@ -62,8 +62,35 @@ def held_rings(interrupts_text):
     return {pci: max(0, count - CONTROL_RINGS) for pci, count in vectors.items()}
 
 
+def stream_openers(proc=Path('/proc')):
+    """({tbstream index: [pid, ...]}, number of processes whose fds could not be read).
+
+    Read-only scan of /proc/<pid>/fd links to /dev/tbstreamN. Without root,
+    other users' processes are unreadable; the caller must treat that as unknown.
+    """
+    openers, unreadable = {}, 0
+    for pid in sorted(proc.glob('[0-9]*')):
+        try:
+            fds = list((pid / 'fd').iterdir())
+        except FileNotFoundError:
+            continue                    # exited meanwhile
+        except OSError:
+            unreadable += 1
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(fd)
+            except OSError:
+                continue
+            match = re.fullmatch(r'/dev/tbstream(\d+)', target)
+            if match:
+                openers.setdefault(int(match[1]), []).append(int(pid.name))
+    return openers, unreadable
+
+
 def ring_budget(root, configfs=None, modprobe_dir=Path('/etc/modprobe.d'), kernel=None,
-                interrupts=Path('/proc/interrupts'), kernel_log=None, allow_held=False):
+                interrupts=Path('/proc/interrupts'), kernel_log=None, allow_held=False,
+                log_error=None, openers=None):
     """Ring-pair consumers per Thunderbolt domain against the lab budget.
 
     Two views, both read-only:
@@ -76,7 +103,14 @@ def ring_budget(root, configfs=None, modprobe_dir=Path('/etc/modprobe.d'), kerne
     was released when their owner was abandoned are not visible there; for
     those the kernel log (kernel_log) is the evidence, and configfs
     gpu_quarantine shows quarantined contexts whose group still exists.
+
+    Everything that could not be checked is listed in `unknown`; a preflight
+    (--require-budget) must fail on it, never pass by default: unreadable
+    /proc/interrupts or configfs, a kernel log that was not read or failed,
+    and busy_poll streams whose openers (`openers`, see stream_openers) could
+    not all be inspected.
     """
+    unknown = []
     configfs = Path(configfs) if configfs else root / 'kernel/config/thunderbolt/stream'
     domains = {}
 
@@ -86,15 +120,19 @@ def ring_budget(root, configfs=None, modprobe_dir=Path('/etc/modprobe.d'), kerne
 
     try:
         groups = sorted(configfs.iterdir()) if configfs.is_dir() else []
-    except OSError:
+    except OSError as exc:
         groups = []
+        unknown.append(f'cannot list {configfs}: {exc.strerror or exc}')
     for group in groups:
         match = SERVICE.match(group.name)
         if not match:
             continue
         try:
             names = sorted(p.name for p in group.iterdir() if p.is_dir())
-        except OSError:
+        except FileNotFoundError:
+            continue                    # removed meanwhile
+        except OSError as exc:
+            unknown.append(f'cannot list {group}: {exc.strerror or exc}')
             continue
         item = slot(int(match[1]))
         for name in names:
@@ -103,7 +141,8 @@ def ring_budget(root, configfs=None, modprobe_dir=Path('/etc/modprobe.d'), kerne
             if read(group / name / 'gpu_quarantine') == '1':
                 item['quarantined'].append(key)
             if read(group / name / 'busy_poll') == '1':
-                item['busy_poll'].append(key)
+                index = read(group / name / 'index')
+                item['busy_poll'].append((key, int(index) if index and index.isdecimal() else None))
     devices = root / 'bus/thunderbolt/devices'
     for dev in sorted(devices.glob('*')) if devices.is_dir() else []:
         match = SERVICE.match(dev.name)
@@ -150,16 +189,37 @@ def ring_budget(root, configfs=None, modprobe_dir=Path('/etc/modprobe.d'), kerne
                 problems.append(f'domain {domain}: {item["held_data_rings"]} data rings already '
                                 'held (open streams, USB4NET or a retained GPU context); close '
                                 'them before a test')
-        if item['busy_poll']:
-            notes.append(f'domain {domain}: busy_poll streams ({", ".join(item["busy_poll"])}) '
-                         'run without interrupts; their rings are not counted as held')
+        for key, index in item['busy_poll']:
+            # No interrupt: an open busy_poll stream holds rings that
+            # /proc/interrupts cannot show, so look for its openers instead.
+            if openers is None:
+                unknown.append(f'domain {domain}: busy_poll stream {key} may hold rings without '
+                               'an interrupt and its openers were not checked')
+                continue
+            pids, unreadable = openers[0].get(index, []) if index is not None else [], openers[1]
+            if index is None:
+                unknown.append(f'domain {domain}: busy_poll stream {key} has no readable index')
+            elif pids and not allow_held:
+                problems.append(f'domain {domain}: busy_poll stream {key} (/dev/tbstream{index}) '
+                                f'is open by pid {", ".join(map(str, pids))} and holds rings '
+                                'without an interrupt')
+            elif not pids and unreadable:
+                unknown.append(f'domain {domain}: busy_poll stream {key} may be open: '
+                               f'{unreadable} processes could not be inspected (run as root)')
+        item['busy_poll'] = [key for key, _index in item['busy_poll']]
+    if log_error:
+        unknown.append(f'kernel log unavailable ({log_error}): rings of abandoned owners and '
+                       'orphaned GPU contexts reported only there were not checked')
+    elif kernel_log is None:
+        unknown.append('kernel log not read: rings of abandoned owners and orphaned GPU '
+                       'contexts reported only there were not checked')
     for line in kernel_log or []:
         for needle, label in EVIDENCE:
             if needle in line:
                 (notes if label == 'teardown reset pending' else problems).append(
                     f'kernel log: {label}: {line.strip()}')
     if held_error:
-        notes.append(f'held rings unknown ({held_error})')
+        unknown.append(f'held rings unknown ({held_error})')
     net_loaded = (root / 'module/thunderbolt_net').exists()
     policy = Path(modprobe_dir) / POLICY
     lab_kernel = (kernel or platform.release()).startswith('7.3.0-rc5-strix-gpu-bosgame-')
@@ -171,9 +231,16 @@ def ring_budget(root, configfs=None, modprobe_dir=Path('/etc/modprobe.d'), kerne
     return dict(domains={str(d): v for d, v in sorted(domains.items())},
                 thunderbolt_net_loaded=net_loaded, modprobe_policy=str(policy),
                 modprobe_policy_present=policy.is_file(), problems=problems, notes=notes,
+                unknown=unknown,
                 limits='held rings come from MSI-X vectors in /proc/interrupts: rings without '
                        'interrupts (busy_poll) and rings of abandoned owners (IRQ released) '
-                       'are only visible through the kernel log (--logs)')
+                       'are only visible through the kernel log; busy_poll streams are '
+                       'checked through their openers in /proc/<pid>/fd')
+
+
+def filter_log(text):
+    return [line for line in text.splitlines()
+            if re.search(r'thunderbolt|tbstream|usb4|lane bonding|\bnhi\b', line, re.I)]
 
 
 def collect(root):
@@ -387,6 +454,9 @@ def main(argv=None):
     parser.add_argument('--allow-held', action='store_true',
                         help='do not flag rings held by configured consumers (monitoring a run)')
     parser.add_argument('--interrupts', type=Path, default=Path('/proc/interrupts'))
+    parser.add_argument('--proc-root', type=Path, default=Path('/proc'))
+    parser.add_argument('--kernel-log', type=Path,
+                        help='read the kernel log from FILE instead of journalctl (offline/tests)')
     parser.add_argument('--registers', action='store_true',
                         help='also read LANE_ADP_CS_0/1 of both lane adapters of every USB4 port '
                              'and sideband LINK_CONF/TXFFE from debugfs (root; read-only) and '
@@ -398,12 +468,17 @@ def main(argv=None):
     report = collect(args.sysfs_root)
     if args.registers or args.lanecap:
         report['lanes'] = lane_registers(args.sysfs_root, args.debugfs_root)
-    if args.logs:
+    if args.kernel_log is not None:
         try:
-            result = subprocess.run(['journalctl', '-k', '-b', '--no-pager', '-n', '2000'],
-                                    text=True, capture_output=True, timeout=15)
-            report['kernel_log'] = [line for line in result.stdout.splitlines()
-                                    if re.search(r'thunderbolt|tbstream|usb4|lane bonding|\bnhi\b', line, re.I)]
+            report['kernel_log'] = filter_log(args.kernel_log.read_text(errors='replace'))
+        except OSError as exc:
+            report['log_warning'] = f'{args.kernel_log}: {exc.strerror or exc}'
+    elif args.logs or args.require_budget:
+        # The whole boot: an orphan or abandoned-ring message can be old.
+        try:
+            result = subprocess.run(['journalctl', '-k', '-b', '--no-pager'],
+                                    text=True, capture_output=True, timeout=30)
+            report['kernel_log'] = filter_log(result.stdout)
             if result.returncode or result.stderr.strip():
                 report['log_warning'] = result.stderr.strip() or 'journalctl failed'
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -411,7 +486,9 @@ def main(argv=None):
     report['ring_budget'] = ring_budget(args.sysfs_root, modprobe_dir=args.modprobe_dir,
                                         interrupts=args.interrupts,
                                         kernel_log=report.get('kernel_log'),
-                                        allow_held=args.allow_held)
+                                        allow_held=args.allow_held,
+                                        log_error=report.get('log_warning'),
+                                        openers=stream_openers(args.proc_root))
     if args.lanecap:
         print(lanecap_text(report, platform.node()))
     else:
@@ -428,10 +505,13 @@ def main(argv=None):
         if lanes['errors'] and lanes['ports'] and all(
                 not any(e['adapters'].values()) for e in lanes['ports']):
             status = 1      # nothing readable (not root?): no comparison happened
-    problems = report['ring_budget']['problems']
-    if args.require_budget and problems:
-        for problem in problems:
+    budget = report['ring_budget']
+    if args.require_budget and (budget['problems'] or budget['unknown']):
+        # Fail closed: anything that could not be checked blocks the preflight.
+        for problem in budget['problems']:
             print(f'ring budget: {problem}', file=sys.stderr)
+        for unknown in budget['unknown']:
+            print(f'ring budget: not verified: {unknown}', file=sys.stderr)
         return 1
     return status
 

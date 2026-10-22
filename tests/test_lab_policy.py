@@ -177,8 +177,24 @@ class RingBudgetTests(unittest.TestCase):
         self.interrupts.write_text('\n'.join(lines) + '\n')
 
     def budget(self, kernel=LAB_BUILD, **kw):
+        kw.setdefault('kernel_log', [])
+        kw.setdefault('openers', ({}, 0))
         return diag.ring_budget(self.sys, modprobe_dir=self.modprobe, kernel=kernel,
                                 interrupts=self.interrupts, **kw)
+
+    def cli(self, *extra, log=''):
+        """diag.main with fixture sysfs/interrupts/proc and a kernel-log file."""
+        logfile = self.root / 'kernel.log'
+        logfile.write_text(log)
+        proc = self.root / 'proc'
+        proc.mkdir(exist_ok=True)
+        args = ['--sysfs-root', str(self.sys), '--modprobe-dir', str(self.modprobe),
+                '--interrupts', str(self.interrupts), '--proc-root', str(proc),
+                '--kernel-log', str(logfile), *extra]
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            status = diag.main(args)
+        return status, err.getvalue()
 
     def test_lab_layout_fits_and_requires_policy(self):
         report = self.budget()
@@ -234,6 +250,7 @@ class RingBudgetTests(unittest.TestCase):
         (self.modprobe / 'usb4stream-dedicated.conf').write_text('x')
         (self.sys / 'kernel/config/thunderbolt/stream/0-2.0/data1/gpu_quarantine').write_text('1\n')
         (self.sys / 'kernel/config/thunderbolt/stream/1-2.0/data0/busy_poll').write_text('1\n')
+        (self.sys / 'kernel/config/thunderbolt/stream/1-2.0/data0/index').write_text('1\n')
         log = ['oct 20 kernel: tbstream: tbstream3: GPU context still quarantined after rmdir, '
                'retry with /sys/module/thunderbolt_stream/parameters/gpu_reap_orphans',
                'oct 20 kernel: thunderbolt 0000:c7:00.6: ring 3 leaked by an abandoned DMA owner',
@@ -245,35 +262,84 @@ class RingBudgetTests(unittest.TestCase):
         self.assertIn('0-2.0/data1 has a quarantined GPU context', problems[0])
         self.assertTrue(any('orphaned GPU context kept after rmdir' in p for p in problems))
         self.assertTrue(any('ring leaked by an abandoned DMA owner' in p for p in problems))
-        self.assertTrue(any('busy_poll streams (1-2.0/data0)' in n for n in report['notes']))
+        self.assertEqual(report['domains']['1']['busy_poll'], ['1-2.0/data0'])
+        self.assertEqual(report['unknown'], [])           # openers checked: nobody
         self.assertTrue(any('teardown reset pending' in n for n in report['notes']))
 
-    def test_unreadable_interrupts_is_reported(self):
+    def test_unreadable_interrupts_is_unknown_and_fails_closed(self):
+        (self.modprobe / 'usb4stream-dedicated.conf').write_text('x')
         self.interrupts.unlink()
         report = self.budget()
         self.assertIsNone(report['domains']['0']['held_data_rings'])
-        self.assertTrue(any('held rings unknown' in n for n in report['notes']))
+        self.assertEqual(report['problems'], [])
+        self.assertTrue(any('held rings unknown' in u for u in report['unknown']))
+        status, err = self.cli('--require-budget')
+        self.assertEqual(status, 1)                      # was 0 before: never pass unchecked
+        self.assertIn('not verified: held rings unknown', err)
 
-    def test_require_budget_exit_status(self):
-        import contextlib
-        import io
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            status = diag.main(['--sysfs-root', str(self.sys), '--modprobe-dir', str(self.modprobe),
-                                '--interrupts', str(self.interrupts), '--require-budget'])
+    def test_kernel_log_is_required_for_the_preflight(self):
+        (self.modprobe / 'usb4stream-dedicated.conf').write_text('x')
+        self.assertTrue(any('kernel log not read' in u
+                            for u in self.budget(kernel_log=None)['unknown']))
+        self.assertTrue(any('kernel log unavailable (No journal files were found.)' in u
+                            for u in self.budget(log_error='No journal files were found.')['unknown']))
+        self.assertEqual(self.budget()['unknown'], [])
+        status, err = self.cli('--require-budget', '--kernel-log', str(self.root / 'missing.log'))
+        self.assertEqual(status, 1)
+        self.assertIn('kernel log unavailable', err)
+        orphan = ('oct 20 kernel: tbstream: tbstream3: GPU context still quarantined after '
+                  'rmdir, retry with /sys/module/thunderbolt_stream/parameters/gpu_reap_orphans\n')
+        status, err = self.cli('--require-budget', log=orphan)
+        self.assertEqual(status, 1)
+        self.assertIn('orphaned GPU context kept after rmdir', err)
+
+    def test_busy_poll_streams_are_checked_through_their_openers(self):
+        (self.modprobe / 'usb4stream-dedicated.conf').write_text('x')
+        cdir = self.sys / 'kernel/config/thunderbolt/stream/1-2.0/data0'
+        (cdir / 'busy_poll').write_text('1\n')
+        (cdir / 'index').write_text('1\n')
+        self.assertEqual(self.budget(openers=({}, 0))['problems'], [])
+        self.assertEqual(self.budget(openers=({}, 0))['unknown'], [])
+        report = self.budget(openers=({1: [4242]}, 0))
+        self.assertIn('/dev/tbstream1) is open by pid 4242', report['problems'][0])
+        self.assertEqual(self.budget(openers=({1: [4242]}, 0), allow_held=True)['problems'], [])
+        self.assertIn('3 processes could not be inspected',
+                      self.budget(openers=({}, 3))['unknown'][0])
+        self.assertIn('openers were not checked', self.budget(openers=None)['unknown'][0])
+
+    def test_stream_openers_scans_proc_fds(self):
+        proc = self.root / 'proc'
+        for pid, target in (('100', '/dev/tbstream2'), ('200', '/dev/null'), ('300', '/dev/tbstream2')):
+            (proc / pid / 'fd').mkdir(parents=True)
+            os.symlink(target, proc / pid / 'fd' / '3')
+        (proc / 'self').mkdir()                          # not a pid
+        self.assertEqual(diag.stream_openers(proc), ({2: [100, 300]}, 0))
+        locked = proc / '400' / 'fd'
+        locked.mkdir(parents=True)
+        locked.chmod(0)
+        try:
+            if os.access(locked, os.R_OK):               # root reads everything
+                self.skipTest('running as root')
+            self.assertEqual(diag.stream_openers(proc), ({2: [100, 300]}, 1))
+        finally:
+            locked.chmod(0o755)
+
+    def test_require_budget_exit_status_cli(self):
+        status, _ = self.cli('--require-budget')
         expected = 1 if diag.platform.release().startswith('7.3.0-rc5' + ck.LAB_PREFIX) else 0
         self.assertEqual(status, expected)
-        (self.sys / 'kernel/config/thunderbolt/stream/0-2.0/data2').mkdir()
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(diag.main(['--sysfs-root', str(self.sys), '--modprobe-dir',
-                                        str(self.modprobe), '--interrupts', str(self.interrupts),
-                                        '--require-budget']), 1)
+        (self.modprobe / 'usb4stream-dedicated.conf').write_text('x')
+        self.assertEqual(self.cli('--require-budget')[0], 0)
         self.held(2, 0)
-        (self.sys / 'kernel/config/thunderbolt/stream/0-2.0/data2').rmdir()
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(diag.main(['--sysfs-root', str(self.sys), '--modprobe-dir',
-                                        str(self.modprobe), '--interrupts', str(self.interrupts),
-                                        '--require-budget', '--allow-held']), expected)
+        self.assertEqual(self.cli('--require-budget')[0], 1)
+        self.assertEqual(self.cli('--require-budget', '--allow-held')[0], 0)
 
+    def test_require_budget_over_budget(self):
+        (self.modprobe / 'usb4stream-dedicated.conf').write_text('x')
+        (self.sys / 'kernel/config/thunderbolt/stream/0-2.0/data2').mkdir()
+        status, err = self.cli('--require-budget')
+        self.assertEqual(status, 1)
+        self.assertIn('budget of 2', err)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

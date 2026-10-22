@@ -191,6 +191,9 @@ def main(argv=None):
     parser.add_argument('--timeout', type=int, default=3600,
                         help='seconds allowed for the transfer phase (default 3600)')
     parser.add_argument('--ssh', default='ssh -o BatchMode=yes', help='remote shell command')
+    parser.add_argument('--diagnose-args', default='',
+                        help='extra arguments for the usb4_diagnose.py preflight on both hosts '
+                             '(e.g. --kernel-log FILE for offline tests)')
     parser.add_argument('--dry-run', action='store_true', help='print the plan only')
     args = parser.parse_args(argv)
     if not 1 <= args.block <= 64 << 20:
@@ -210,8 +213,11 @@ def main(argv=None):
     try:
         for role, prefix in (('local', []), ('peer', ssh + [args.peer])):
             ident = identity(prefix, args.bench, REPO)
+            # Fail-closed preflight: held rings, kernel-log evidence (rings
+            # without an IRQ or of abandoned owners), busy_poll openers.
             diag = subprocess.run(prefix + ['python3', str(REPO / 'tools/usb4_diagnose.py'),
-                                            '--require-budget'],
+                                            '--require-budget', '--logs',
+                                            *shlex.split(args.diagnose_args)],
                                   capture_output=True, text=True, timeout=60)
             topo = subprocess.run(prefix + ['python3',
                                             str(REPO / 'tools/lab/usb4stream_describe.py')],
