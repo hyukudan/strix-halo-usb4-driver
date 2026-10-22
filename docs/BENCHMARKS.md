@@ -1,10 +1,10 @@
 # Reproducible USB4STREAM measurements
 
-The bandwidth and latency figures in the README are **lab observations** from
-2026-10-17 (bandwidth) and the 0010 work (latency). Their raw logs stayed on
-the machines; this repository does not contain them, so they cannot be
-re-audited from here. In particular the "~9–11 Gb/s per ring pair" figure is
-an observation of these two machines, not a property of the driver. Any new
+The bandwidth and latency figures in the README are **lab observations** of
+two machines (2026-10-17 to 2026-10-23). Their raw logs stayed on the machines;
+this repository does not contain them, so they cannot be re-audited from here.
+In particular the "~9–12 Gb/s per host ring" figure is an observation of these
+two machines, not a property of the driver. Any new
 figure must come with the records listed below.
 
 ## Harnesses
@@ -94,3 +94,24 @@ timeout in ms. The client prints min/p50/p90/p99/max/mean in µs. Record the
 same identity data as for bandwidth (the `rx_napi`, `spin_us`, `throttling`,
 `busy_poll` and `irq_cpu` settings dominate the result) and the exit status of
 both ends (6 = payload mismatch, 7 = timeout).
+
+## Ruled out for the per-ring rate
+
+A/B/A runs on 2026-10-17 (module reloads, no reboot, data verified), 4 streams
+over two Gen3 cables:
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| DMA path credits | `dma_credits` 14 → 32; the router caps higher requests at 32, confirmed in the hop entry's `initial_credits` | no change |
+| End-to-end flow control | `thunderbolt_stream` rebuilt without `RING_FLAG_E2E` | 43.7 Gb/s, no change |
+| IOMMU translation | NHI IOMMU groups switched from `DMA-FQ` to `identity` | +3 % |
+| Interrupt moderation | `throttling` 8192 / 1024 / 0 ns | no bandwidth change |
+| PCIe read request size | NHI `MaxReadReq` 512 → 1024 → 4096 B | no gain (4096 slightly worse) |
+| SoC / fabric clocks | `power_dpm_force_performance_level=high` | no change |
+| Platform power mode | Quiet vs Balanced (EC byte `0x31`) | no change |
+| CPU | ~25 % of one core per stream | not the limit |
+| CLx / ASPM | disabled on all lanes and on the NHI links | not applicable |
+
+Later measurements (2026-10-22) showed that a GPU-direct ring moves ~22.8 Gb/s,
+twice a host ring, and that mapping host frame buffers in large contiguous
+blocks (0045) raises a Gen3 host ring by 7–8 %.
