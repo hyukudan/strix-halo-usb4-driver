@@ -8,22 +8,19 @@ becomes the installed kernel.
 
 Source: the external audit of 2026-10-19: section A (kernel lifecycle,
 A1–A12), section D (hardware matrix), and the addenda E (Gen3 follow-up,
-E1–E3) and F (refined A12 model), against PR #1 head `dfc27c5` (0001–0019).
+E1–E3) and F (refined A12 model), against the 0001–0019 tree.
 Line references in the verdicts are to that tree.
 
 ## Numbering
 
-The audit fixes are **0020–0039**, directly after 0019 (0036–0039 answer the review of 0020–0035). The per-stream
-end-to-end setting on `perf/stream-throughput` (also numbered 0020 there) is a
-measurement-only option and moves to the end: it gets the next free number when
-that branch is rebased on this one. The other choice, putting these fixes after
-the perf patch, would make correctness fixes depend on an experimental patch.
-The perf patch touches `stream.c` too, so its context is refreshed during that
-rebase.
+The audit fixes are **0020–0039**, directly after 0019 (0036–0039 answer the review of 0020–0035). A
+measurement-only per-stream end-to-end flow-control setting was tried and not
+kept: rebuilding without `RING_FLAG_E2E` did not change bandwidth (see the
+README).
 
 ## Verdicts
 
-| # | Verdict | Where (dfc27c5) | Patch |
+| # | Verdict | Where (0001–0019) | Patch |
 |---|---------|-----------------|-------|
 | A1 | Confirmed | `nhi.c:1194-1214` `nhi_shutdown()`, `nhi.c:512` `ring_msix()` | 0020 |
 | A2 | Confirmed | `stream.c:519` `tbstream_dev_valid()`; unlocked at `:976`, `:1103` and in wait conditions `:1022`, `:1145`, `:1258` | 0021 |
@@ -206,7 +203,7 @@ already published patches keep their content.
 
 ## Review of 0020–0035 and fixes 0036–0039 (2026-10-20)
 
-A read-only review of the merged branch (`fix/audit-merged` 304033a) found
+A read-only review of the 0001–0035 tree found
 four defects in these patches and gaps in their tests. All are confirmed
 and fixed:
 

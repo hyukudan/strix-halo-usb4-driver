@@ -1,6 +1,6 @@
 # External GPU dependencies and cluster readiness
 
-Patch 0007 builds on the recovery series in PR #2. It does not modify the
+Patch 0007 builds on the recovery patches 0002–0006. It does not modify the
 original capture, internal wire sizes, ioctl numbers, or any Actions workflow.
 
 ## Correctness fix
@@ -31,7 +31,7 @@ harnesses. Cases cover failed completed dependencies in TX/RX, pruning during a
 blocking wait, nonblocking pruning, STOP/RELEASE while waiting, and balanced
 references. Test doubles are not the kernel, the GPU or a cache simulator.
 
-The new patch's affected code was compared with the published PR #2 hunks.
+The new patch's affected code was compared with the 0002–0006 hunks.
 The portable delivery is not a full pinned Linux checkout. A fresh reconstruction
 of all seven patches on Linux 72d3fcf802c45d00b300f25b848a93c3a2bd7c7e, module
 linkage and physical two-host validation are still required. Do not interpret
@@ -43,7 +43,7 @@ these tests as that build or as measured 40 Gb/s performance.
   engine HIP/commissioning path still uses one operation per direction (paired
   TX/RX duplex is distinct from eight slots). Do not advertise engine queue-depth
   support merely because SGU_IOC_QUEUE exists in the driver.
-- PR #2 provides explicit reset only for an exclusively idle supported AMD NHI,
+- 0006 provides explicit reset only for an exclusively idle supported AMD NHI,
   not transparent multi-consumer recovery. Unprovable/disconnected quarantines
   remain retained. No timer, fence error, or missing sysfs node authorizes free.
 - GPU visibility requires testing the actual HIP export, DMA importer, raw RX

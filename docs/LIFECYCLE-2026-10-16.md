@@ -1,7 +1,6 @@
 # Detached quarantine and property-notification lifecycle
 
-Development follow-up to driver PR #2 at
-`e990c7c3dc1955c6c39a18c8dbbd359ad9a01b79`. Additive kernel patch 0008;
+Follows patches 0001–0007. Additive kernel patch 0008;
 no rewrite of the immutable capture, old patches, workflows or userspace ABI.
 The queued-engine package remains a separate delivery; this patch does not
 publish it or activate a production engine backend.
@@ -166,7 +165,7 @@ disable or unconditional global-reset workaround is introduced.
 
 - Linux `72d3fcf802c45d00b300f25b848a93c3a2bd7c7e`,
   `drivers/thunderbolt/{tb.c,tb.h,tunnel.c}`, fetched through GitHub.
-- Driver PR #2 `e990c7c3dc1955c6c39a18c8dbbd359ad9a01b79`, captured
+- Patches 0001–0007, captured
   `stream.c`, `xdomain.c`, `pci.c`, plus materialized recovery/dependency sources.
 - The post-enumeration notification motivation was also checked against Milo
   Chen's June 24, 2026 Linux USB patch discussion. The bounded/coalesced lifecycle

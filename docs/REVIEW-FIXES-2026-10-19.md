@@ -5,8 +5,8 @@ State: implemented and tested **offline only** (unit tests with sanitizers and
 Strix Halo nodes yet. The hardware checks at the end must pass before this
 series becomes the default kernel.
 
-Source of the findings: the deep review of branch
-`feat/per-stream-latency-controls` (3d11d18) and the node A incident of
+Source of the findings: a deep review of the
+0001–0011 tree and the node A incident of
 2026-10-19 (streams of NHI1 failing with `ENOMEM` after one failed open).
 
 ## 0012 — `tb_stop()` unlinks the tunnels it frees (review C-2)
