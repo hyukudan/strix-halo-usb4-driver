@@ -14,8 +14,9 @@ production settings.
 
 Why: one host ring moves 9-12 Gb/s on Gen2 and Gen3 alike, the rate drops
 when the sender's DRAM or CPUs are loaded (not the receiver's), and the same
-ring moves ~22.8 Gb/s when its frames are GPU DMA-BUF pages, which the CPU
-never wrote. The per-ring limit therefore looks like bytes-in-flight over the
+ring measures 12.1 Gb/s when its frames are GPU DMA-BUF pages, which the CPU
+never wrote: the same as a host ring with contiguous buffers (an earlier
+version said ~22.8 Gb/s; that figure was two rings). The per-ring limit therefore looks like bytes-in-flight over the
 latency of the controller's TX reads, and a host frame, freshly written by
 `copy_from_user`, is still dirty in the CPU caches when the controller reads it.
 `tx_copy` changes only that cache state; `tx_frame_bytes` separates a fixed

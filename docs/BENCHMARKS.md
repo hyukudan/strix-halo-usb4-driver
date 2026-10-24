@@ -112,6 +112,8 @@ over two Gen3 cables:
 | CPU | ~25 % of one core per stream | not the limit |
 | CLx / ASPM | disabled on all lanes and on the NHI links | not applicable |
 
-Later measurements (2026-10-22) showed that a GPU-direct ring moves ~22.8 Gb/s,
-twice a host ring, and that mapping host frame buffers in large contiguous
-blocks (0045) raises a Gen3 host ring by 7–8 %.
+Later measurements (2026-10-22/23) showed that two GPU-direct rings move
+~22.8 Gb/s together while a single GPU-direct ring measures 12.1 Gb/s (an
+earlier note quoted 22.8 Gb/s for one ring; that run used two rings), and that
+mapping host frame buffers in large contiguous blocks (0045) raises a Gen3 host
+ring by 7–8 %, to the same ~12 Gb/s.

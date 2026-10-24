@@ -231,9 +231,11 @@ below): the Gen2 cable finishes last, so adding per-stream rates overstates it.
 
 The per-ring rate, not the link, is the limit for host memory: each NHI has
 only two data rings and a host ring moves 9–12 Gb/s regardless of link
-generation. A GPU-direct ring (below) moves twice as much, so the limit lies in
-how host memory is presented to the controller (4 KiB frame buffers mapped one
-by one through a translating IOMMU), which is what 0045 addresses in part.
+generation. A single GPU-direct ring measures the same ~12 Gb/s as a Gen3 host
+ring with contiguous buffers (0045), so GPU versus host memory is not the
+limit; what costs is how host memory is presented to the controller (4 KiB
+frame buffers mapped one by one through a translating IOMMU cost ~7–10 %),
+which is what 0045 addresses.
 The A/B/A tests that ruled out credits, end-to-end flow control, interrupt
 moderation, PCIe read request size, clocks, platform power mode and CLx are in
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md#ruled-out-for-the-per-ring-rate).
@@ -241,9 +243,11 @@ moderation, PCIe read request size, clocks, platform power mode and CLx are in
 ### Bandwidth, GPU-direct
 
 2026-10-22, 0001–0043, engine probe over DMA-BUF windows with `gpu_poll=1`,
-every byte checked on the GPU. One GPU-direct ring moves **~22.8 Gb/s per
-direction** (16 MB in 5.88 ms); two rings saturate at ~22.5–23 Gb/s per
-direction for messages ≥ 4 MB. For small messages the GPU path costs 45–50 µs
+every byte checked on the GPU. Two GPU-direct rings move **~22.8 Gb/s per
+direction** (16 MB in 5.88 ms) and saturate at ~22.5–23 Gb/s per direction for
+messages ≥ 4 MB; a single GPU-direct ring measures **12.1 Gb/s**, the same as a
+Gen3 host ring with contiguous buffers (0045). An earlier version of this page
+quoted 22.8 Gb/s for one ring; that run used two rings. For small messages the GPU path costs 45–50 µs
 per 20 KB exchange (including the engine's own copies and synchronization)
 versus 30–40 µs through host streams; it wins from ~64 KB.
 
@@ -523,7 +527,8 @@ topology.
 
 - **Host-memory bandwidth is bounded per ring**, not by the link: 9–12 Gb/s per
   host ring and two data rings per NHI, so a Gen3 cable carries ~22–24 Gb/s of
-  its ~37 Gb/s. GPU-direct rings reach ~23 Gb/s each.
+  its ~37 Gb/s. A GPU-direct ring measures ~12.1 Gb/s, like a host ring with
+  contiguous buffers; two reach ~23 Gb/s together.
 - **Polled RX costs bandwidth on Gen3:** RX-only and full polling receive
   7–9 % less per Gen3 ring than interrupt RX (2026-10-23); Gen2 rings are
   link-bound and do not show it.
