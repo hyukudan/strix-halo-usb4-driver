@@ -42,6 +42,22 @@ own. Changes per release: [CHANGELOG.md](CHANGELOG.md).
 
 **Reading the measurements:** Bulk throughput, a single GPU-direct ring, small-message latency and end-to-end inference exchange overhead measure **different workloads**. Do not compare them as if they were one interchangeable benchmark. Where a measurement is not yet available, no result is implied. Figures apply to the stated hardware, stream count, directionality and driver configuration—not arbitrary USB4 PCs.
 
+## Getting started safely
+
+**Do not install these kernel changes on an everyday workstation.** They are tested on a specific pair of machines and pinned Linux kernel, and require a separate build/rollback plan. The repository does not provide a generic package installer.
+
+1. Read [tested hardware](#tested-hardware), [deployment and safety](#deployment-and-safety) and the complete [install-and-test guide](docs/INSTALL-AND-TEST.md).
+2. Obtain the **exact** kernel commit `72d3fcf802c45d00b300f25b848a93c3a2bd7c7e`, then apply the default [stable series](patches/series) using `tools/apply-series.sh`; do **not** enable experimental patches for initial deployment.
+3. Build a kernel with a **new, unique local version**, matching module configuration and a verified rollback kernel. The canonical commands are in [Build and install](#build-and-install).
+4. After booting the test kernel on both nodes, inspect controller/ring topology before creating streams:
+
+```bash
+python3 tools/usb4_diagnose.py --require-budget
+python3 tools/lab/usb4stream_describe.py --logs --summary
+```
+
+Use the complete [install-and-test guide](docs/INSTALL-AND-TEST.md) for stream setup, two-host verification, safe teardown and recovery. GPU-direct DMA requires the documented kernel and userspace setup; a device appearing under `/dev/tbstreamN` alone does **not** establish correct GPU-direct operation. Reproduce throughput and latency with [the benchmark protocol](docs/BENCHMARKS.md), recording cables, ring counts, transfer direction and streams.
+
 ## Highlights
 
 - **~37 Gb/s per direction** sustained over two USB4 40 Gb/s cables with four
