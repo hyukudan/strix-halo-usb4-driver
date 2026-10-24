@@ -79,6 +79,22 @@ class StreamMemBenchTests(unittest.TestCase):
         self.assertEqual(code, 7)
         self.assertEqual(result['bad_chunks'], 1)
 
+    def test_diagnostic_counts_preserve_verified_bytes(self):
+        binary = Path(self.tmp.name) / 'stream_mem_bench_diagnostic'
+        subprocess.run([CC, '-std=gnu11', '-O2', '-Wall', '-Wextra', '-Werror',
+                        '-DUSB4_BENCH_DIAGNOSTIC', str(REPO / 'tools/stream_mem_bench.c'),
+                        '-o', str(binary)], check=True)
+        self.binary = binary
+        total = 3 * 65536 + 13
+        send, code, result = self.transfer(total, 65536)
+        self.assertEqual((send.returncode, code), (0, 0))
+        for row in (json.loads(send.stdout.splitlines()[-1]), result):
+            counters = row['io_stats']
+            self.assertEqual(counters['bytes'], total)
+            self.assertEqual(sum(counters['bytes_le_4k_16k_64k_256k_1m_over_1m']), counters['positive'])
+            self.assertEqual(counters['calls'], counters['positive'] + counters['eagain'] + counters['eintr'])
+            self.assertLessEqual(counters['short'], counters['positive'])
+
     def test_usage_errors(self):
         for args in ([], ['send', '/dev/null', '0', '4096', '1'],
                      ['send', '/dev/null', '100', '0', '1'],

@@ -14,7 +14,7 @@ import tempfile
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
-CASES = ("geometry", "queue", "failure_isolation", "events_legacy", "timeout_recovery",
+CASES = ("geometry", "queue", "failure_isolation", "events_legacy", "timeout_recovery", "host_polling_rejected",
          "wait_concurrency", "nonblock_contended_mutex", "nonblock_contended_dma_lock", "completion_timing", "polled_completion", "session_latency_qos", "stall_episode_once", "stall_reset_keeps_progress", "stall_polled_without_event", "stall_rx_standby_and_stop", "stall_threshold_zero", "stall_cancel_unseen", "stall_races", "wait_retry_order", "export_lifetime", "admission_rollback", "watchdog_schedule", "max_queue_reuse", "watchdog_mutex_independence", "fence_precedes_event", "stop_before_publication",
          "quarantine_reaping", "explicit_controller_reset", "statistics_snapshot", "detached_reap", "detached_path_proof", "detached_device_guard", "detached_reset_rejected", "group_success", "group_rejections", "group_copy_failure", "domain_retirement_open_fds", "domain_retirement_keeps_unproved_dma", "domain_retirement_foreign_domain", "domain_retirement_concurrent_poll",
          "domain_revoked_releases_retained", "domain_abandoned_leaks_safely", "orphan_reaping_after_rmdir",
@@ -41,7 +41,9 @@ class GpuQueueTests(unittest.TestCase):
         compiler = os.environ.get("CC", "cc")
         if not shutil.which(compiler):
             raise RuntimeError(f"Required C compiler unavailable: {compiler}")
-        command = [compiler, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
+        # 0049 (patches/experimental) adds the RX window to the GPU open guard.
+        defines = ["-DUSB4_EXPERIMENTAL"] if "rx_window_bytes" in implementation else []
+        command = [compiler, *defines, "-std=gnu11", "-g", "-O1", "-Wall", "-Wextra", "-Werror",
                    "-Wno-unused-function", "-Wno-unused-parameter", "-Wno-unused-const-variable",
                    "-fno-omit-frame-pointer", "-fno-pie", "-no-pie", "-fsanitize=address,undefined", "-pthread",
                    "-I", str(REPO / "tests"), "-I", str(source / "drivers/thunderbolt"),

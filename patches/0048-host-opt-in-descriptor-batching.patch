@@ -1,0 +1,322 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -153,6 +153,8 @@
+  * @throttling: Interrupt throttling rate in ns
+  * @busy_poll: Instead of interrupts, busy poll both rings
+  * @rx_busy_poll: Host RX only: no RX interrupt, TX keeps normal completions
++ * @rx_repost_batch: Host RX repost budget, 0 keeps single-frame submission
++ * @tx_submit_batch: Host TX submission budget, 0 keeps single-frame submission
+  * @rx_napi: The reader reaps RX completions (start_poll) instead of the
+  *	     ring work; set when the stream is started
+  * @rx_poll_pending: The RX interrupt fired and is masked until a reader
+@@ -205,6 +207,8 @@
+ 	unsigned int throttling;
+ 	bool busy_poll;
+ 	bool rx_busy_poll;
++	unsigned int rx_repost_batch;
++	unsigned int tx_submit_batch;
+ 	bool rx_napi;
+ 	bool rx_poll_pending;
+ 	int cfg_rx_napi;
+@@ -788,7 +792,24 @@
+ 	return sf;
+ }
+ 
+-static int tbstream_dev_consume_rx(struct tbstream_dev *sdev)
++/* All bookkeeping precedes publication: callbacks may run immediately. */
++static int tbstream_dev_submit_batch(struct tb_ring *ring, struct list_head *batch)
++{
++	int ret;
++
++	if (list_empty(batch))
++		return 0;
++	ret = __tb_ring_enqueue_list(ring, batch);
++	if (ret) {
++		/* Failure leaves ownership with us; no stack list may survive. */
++		while (!list_empty(batch))
++			list_del_init(batch->next);
++	}
++	return ret;
++}
++
++static int tbstream_dev_consume_rx_batch(struct tbstream_dev *sdev,
++			      struct list_head *batch)
+ {
+ 	struct device *dma_dev = tb_ring_dma_device(sdev->rx_ring.ring);
+ 	struct tbstream_frame *sf;
+@@ -806,7 +827,16 @@
+ 				   tb_ring_frame_size(&sf->frame),
+ 				   DMA_FROM_DEVICE);
+ 
++	if (batch) {
++		list_add_tail(&sf->frame.list, batch);
++		return 0;
++	}
+ 	return tb_ring_rx(sdev->rx_ring.ring, &sf->frame);
++}
++
++static int tbstream_dev_consume_rx(struct tbstream_dev *sdev)
++{
++	return tbstream_dev_consume_rx_batch(sdev, NULL);
+ }
+ 
+ static int tbstream_dev_alloc_rx_buffers(struct tbstream_dev *sdev)
+@@ -978,6 +1008,41 @@
+ 		sdev->tx_ring.cons--;
+ 	}
+ 	return ret;
++}
++
++/* Caller holds sdev->lock. Never wait for a full batch or more credits. */
++static ssize_t tbstream_dev_send_data_batch(struct tbstream_dev *sdev,
++					  struct iov_iter *from)
++{
++	LIST_HEAD(batch);
++	size_t bytes = 0;
++	unsigned int count = 0;
++	int ret = 0;
++
++	while (iov_iter_count(from) && count < sdev->tx_submit_batch) {
++		struct tbstream_frame *sf;
++		size_t size = min(iov_iter_count(from), TB_MAX_FRAME_SIZE);
++
++		sf = tbstream_dev_alloc_tx(sdev, TBSTREAM_DATA, from, size);
++		if (IS_ERR(sf)) {
++			ret = PTR_ERR(sf);
++			break;
++		}
++		list_add_tail(&sf->frame.list, &batch);
++		bytes += size;
++		count++;
++	}
++	if (!count)
++		return ret;
++
++	/* A later copy fault does not discard the complete prefix. */
++	ret = tbstream_dev_submit_batch(sdev->tx_ring.ring, &batch);
++	if (ret) {
++		iov_iter_revert(from, bytes);
++		sdev->tx_ring.cons -= count;
++		return ret;
++	}
++	return bytes;
+ }
+ 
+ static void
+@@ -1234,6 +1299,8 @@
+ 	struct file *file = kiocb->ki_filp;
+ 	bool nowait = file->f_flags & O_NONBLOCK || kiocb->ki_flags & IOCB_NOWAIT;
+ 	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
++	LIST_HEAD(repost);
++	unsigned int repost_count = 0;
+ 	size_t nbytes;
+ 	int ret;
+ 
+@@ -1267,6 +1334,10 @@
+ 			return ret;
+ 		}
+ 
++		if (sdev->rx_failed) {
++			mutex_unlock(&sdev->lock);
++			return -EIO;
++		}
+ 		if (tbstream_dev_closed(sdev) || tbstream_dev_removed(sdev)) {
+ 			mutex_unlock(&sdev->lock);
+ 			return 0;
+@@ -1329,7 +1400,8 @@
+ 		 */
+ 		if (sf->frame.eof == TBSTREAM_CLOSE) {
+ 			if (!nbytes) {
+-				tbstream_dev_consume_rx(sdev);
++				tbstream_dev_consume_rx_batch(sdev,
++						sdev->rx_repost_batch ? &repost : NULL);
+ 				sdev->closed = true;
+ 			}
+ 			break;
+@@ -1355,12 +1427,32 @@
+ 			}
+ 		} else {
+ 			/* Delivered; a failed re-post shows on the next call */
+-			ret = tbstream_dev_consume_rx(sdev);
+-			if (ret)
++			ret = sdev->rx_repost_batch ?
++				tbstream_dev_consume_rx_batch(sdev, &repost) :
++				tbstream_dev_consume_rx(sdev);
++			if (!ret && sdev->rx_repost_batch &&
++			    ++repost_count >= sdev->rx_repost_batch) {
++				ret = tbstream_dev_submit_batch(sdev->rx_ring.ring, &repost);
++				repost_count = 0;
++			}
++			if (ret) {
++				if (sdev->rx_repost_batch)
++					sdev->rx_failed = true;
+ 				break;
+-		}
+-	}
+-
++			}
++		}
++	}
++
++	/* Also flush on partial copies, CLOSE and faults; never hold credits. */
++	if (!list_empty(&repost)) {
++		int flush_ret = tbstream_dev_submit_batch(sdev->rx_ring.ring, &repost);
++
++		if (flush_ret) {
++			sdev->rx_failed = true;
++			if (!ret)
++				ret = flush_ret;
++		}
++	}
+ 	mutex_unlock(&sdev->lock);
+ 	/* Bytes already copied to the caller are never reported as lost */
+ 	if (nbytes)
+@@ -1439,10 +1531,20 @@
+ 
+ 	nbytes = 0;
+ 	while (iov_iter_count(from)) {
+-		size_t size;
+-
+-		size = min(iov_iter_count(from), TB_MAX_FRAME_SIZE);
+-		ret = tbstream_dev_send_data(sdev, from, size);
++		size_t size = 0;
++
++		if (sdev->tx_submit_batch) {
++			ssize_t sent = tbstream_dev_send_data_batch(sdev, from);
++
++			if (sent > 0) {
++				nbytes += sent;
++				continue;
++			}
++			ret = sent;
++		} else {
++			size = min(iov_iter_count(from), TB_MAX_FRAME_SIZE);
++			ret = tbstream_dev_send_data(sdev, from, size);
++		}
+ 		if (ret) {
+ 			/*
+ 			 * If there are no more buffers we are done for
+@@ -1453,7 +1555,8 @@
+ 			break;
+ 		}
+ 
+-		nbytes += size;
++		if (!sdev->tx_submit_batch)
++			nbytes += size;
+ 	}
+ 
+ 	mutex_unlock(&sdev->lock);
+@@ -1725,7 +1828,8 @@
+ 	guard(mutex)(&sdev->lock);
+ 	if (tbstream_dev_config_busy(sdev))
+ 		return -EBUSY;
+-	if (enabled && (sdev->busy_poll || sdev->rx_busy_poll))
++	if (enabled && (sdev->busy_poll || sdev->rx_busy_poll ||
++			sdev->rx_repost_batch || sdev->tx_submit_batch))
+ 		return -EOPNOTSUPP;
+ 	sdev->gpu_direct = enabled;
+ 	return count;
+@@ -1794,6 +1898,68 @@
+ 	return count;
+ }
+ CONFIGFS_ATTR(tbstream_dev_, rx_busy_poll);
++
++/* Zero preserves the legacy path. Experimental, host-only, closed streams. */
++static ssize_t tbstream_dev_rx_repost_batch_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return sysfs_emit(buf, "%u\n", sdev->rx_repost_batch);
++}
++
++static ssize_t tbstream_dev_rx_repost_batch_store(struct config_item *item,
++					      const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++	unsigned int value;
++	int ret = kstrtouint(buf, 0, &value);
++
++	if (ret)
++		return ret;
++	if (value > 64)
++		return -ERANGE;
++	guard(mutex)(&sdev->lock);
++	if (tbstream_dev_config_busy(sdev))
++		return -EBUSY;
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	if (value && sdev->gpu_direct)
++		return -EOPNOTSUPP;
++#endif
++	sdev->rx_repost_batch = value;
++	return count;
++}
++CONFIGFS_ATTR(tbstream_dev_, rx_repost_batch);
++
++/* Zero preserves the legacy path. Experimental, host-only, closed streams. */
++static ssize_t tbstream_dev_tx_submit_batch_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return sysfs_emit(buf, "%u\n", sdev->tx_submit_batch);
++}
++
++static ssize_t tbstream_dev_tx_submit_batch_store(struct config_item *item,
++					      const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++	unsigned int value;
++	int ret = kstrtouint(buf, 0, &value);
++
++	if (ret)
++		return ret;
++	if (value > 64)
++		return -ERANGE;
++	guard(mutex)(&sdev->lock);
++	if (tbstream_dev_config_busy(sdev))
++		return -EBUSY;
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	if (value && sdev->gpu_direct)
++		return -EOPNOTSUPP;
++#endif
++	sdev->tx_submit_batch = value;
++	return count;
++}
++CONFIGFS_ATTR(tbstream_dev_, tx_submit_batch);
+ 
+ static ssize_t tbstream_dev_int_store(struct tbstream_dev *sdev, int *field,
+ 				      const char *buf, size_t count, int min, int max)
+@@ -2280,6 +2446,8 @@
+ static struct configfs_attribute *tbstream_dev_attrs[] = {
+ 	&tbstream_dev_attr_busy_poll,
+ 	&tbstream_dev_attr_rx_busy_poll,
++	&tbstream_dev_attr_rx_repost_batch,
++	&tbstream_dev_attr_tx_submit_batch,
+ 	&tbstream_dev_attr_irq_cpu,
+ 	&tbstream_dev_attr_open_timeout_ms,
+ 	&tbstream_dev_attr_latency_qos_us,
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -995,7 +995,8 @@
+     unsigned int ring_flags;
+     int ret;
+ 
+-    if (sdev->busy_poll || sdev->rx_busy_poll || !xd || !xd->local_uuid || !xd->remote_uuid ||
++    if (sdev->busy_poll || sdev->rx_busy_poll ||
++        sdev->rx_repost_batch || sdev->tx_submit_batch || !xd || !xd->local_uuid || !xd->remote_uuid ||
+         !xd->tb->cm_ops || xd->tb->cm_ops->driver_ready)
+         return -EOPNOTSUPP;
+     if (sdev->gpu_context)
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -774,6 +774,8 @@
+ void tb_ring_free(struct tb_ring *ring);
+ 
+ int __tb_ring_enqueue(struct tb_ring *ring, struct ring_frame *frame);
++/* Success consumes the list; failure leaves ownership with the caller. */
++int __tb_ring_enqueue_list(struct tb_ring *ring, struct list_head *frames);
+ 
+ /**
+  * tb_ring_rx() - enqueue a frame on an RX ring

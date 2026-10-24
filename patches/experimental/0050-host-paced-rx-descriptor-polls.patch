@@ -1,0 +1,100 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -155,6 +155,10 @@
+  * @throttling: Interrupt throttling rate in ns
+  * @busy_poll: Instead of interrupts, busy poll both rings
+  * @rx_busy_poll: Host RX only: no RX interrupt, TX keeps normal completions
++ * @rx_poll_pace_ns: Polled RX: after a poll found nothing, leave the
++ *		     descriptor ring alone this long (0 polls on every read)
++ * @rx_poll_next: Polled RX: earliest time of the next descriptor poll
++ *		  (protected by @lock)
+  * @rx_window_bytes: Maximum logical RX bytes for explicit polling, zero disables
+  * @rx_window_us: Bounded window duration in microseconds
+  * @window_lock: Protects timer state and the borrowed RX ring lifetime
+@@ -216,6 +220,8 @@
+ 	unsigned int throttling;
+ 	bool busy_poll;
+ 	bool rx_busy_poll;
++	unsigned int rx_poll_pace_ns;
++	ktime_t rx_poll_next;
+ 	u32 rx_window_bytes;
+ 	u32 rx_window_us;
+ 	spinlock_t window_lock;
+@@ -1070,6 +1076,25 @@
+ 	    !(sdev->rx_busy_poll && ring == &sdev->rx_ring))
+ 		return;
+ 
++	if (ring == &sdev->rx_ring && sdev->rx_poll_pace_ns) {
++		unsigned int prod = ring->prod;
++		ktime_t now = ktime_get();
++
++		/*
++		 * The descriptor polled here is the one the controller fills
++		 * next. Re-reading it in a tight loop competes with the
++		 * controller for that cache line; after an empty poll the
++		 * caller gets -EAGAIN without touching the ring for a while.
++		 */
++		if (ktime_before(now, sdev->rx_poll_next))
++			return;
++		while ((frame = tb_ring_poll(ring->ring)))
++			frame->callback(ring->ring, frame, false);
++		sdev->rx_poll_next = ring->prod == prod ?
++			ktime_add_ns(now, sdev->rx_poll_pace_ns) : 0;
++		return;
++	}
++
+ 	while ((frame = tb_ring_poll(ring->ring)))
+ 		frame->callback(ring->ring, frame, false);
+ }
+@@ -1141,6 +1166,7 @@
+ 			   min_t(unsigned int, READ_ONCE(spin_us), TBSTREAM_DEV_MAX_SPIN_US) :
+ 			   sdev->cfg_spin_us;
+ 	sdev->rx_poll_pending = false;
++	sdev->rx_poll_next = 0;
+ 	sdev->rx_failed = false;
+ 	ring = tb_ring_alloc_tx(xd->tb->nhi, -1, sdev->ring_size, flags);
+ 	if (!ring) {
+@@ -2024,6 +2050,34 @@
+ }
+ CONFIGFS_ATTR(tbstream_dev_, rx_busy_poll);
+ 
++/* Zero preserves the legacy path. Polled RX only (busy_poll, rx_busy_poll). */
++static ssize_t tbstream_dev_rx_poll_pace_ns_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return sysfs_emit(buf, "%u\n", sdev->rx_poll_pace_ns);
++}
++
++static ssize_t tbstream_dev_rx_poll_pace_ns_store(struct config_item *item,
++					       const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++	unsigned int value;
++	int ret = kstrtouint(buf, 0, &value);
++
++	if (ret)
++		return ret;
++	if (value > 10000)
++		return -ERANGE;
++	guard(mutex)(&sdev->lock);
++	if (tbstream_dev_config_busy(sdev))
++		return -EBUSY;
++	/* No effect without busy_poll or rx_busy_poll, which exclude gpu_direct. */
++	sdev->rx_poll_pace_ns = value;
++	return count;
++}
++CONFIGFS_ATTR(tbstream_dev_, rx_poll_pace_ns);
++
+ /* Zero preserves the legacy path. Experimental, host-only, closed streams. */
+ static ssize_t tbstream_dev_rx_repost_batch_show(struct config_item *item, char *buf)
+ {
+@@ -2638,6 +2692,7 @@
+ 	&tbstream_dev_attr_rx_window_us,
+ 	&tbstream_dev_attr_busy_poll,
+ 	&tbstream_dev_attr_rx_busy_poll,
++	&tbstream_dev_attr_rx_poll_pace_ns,
+ 	&tbstream_dev_attr_rx_repost_batch,
+ 	&tbstream_dev_attr_tx_submit_batch,
+ 	&tbstream_dev_attr_irq_cpu,

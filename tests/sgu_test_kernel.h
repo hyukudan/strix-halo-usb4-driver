@@ -454,7 +454,7 @@ struct tb_xdomain { struct tb *tb;uuid_t *local_uuid,*remote_uuid;struct device 
 struct tb_service { struct device dev;struct tb_xdomain *xd; };
 struct tbstream { struct tb_service *svc; };
 struct tbstream_gpu_context;
-struct tbstream_dev { struct mutex lock;struct tbstream *stream;struct { struct tb_ring *ring; } tx_ring,rx_ring;struct tbstream_gpu_context *gpu_context;unsigned ring_size,throttling,in_hopid,out_hopid;bool busy_poll,rx_napi,removed,gpu_direct;u64 gpu_last_epoch;int wait,refs,users;int cfg_gpu_poll;int cfg_latency_qos_us; };
+struct tbstream_dev { struct mutex lock;struct tbstream *stream;struct { struct tb_ring *ring; } tx_ring,rx_ring;struct tbstream_gpu_context *gpu_context;unsigned ring_size,throttling,in_hopid,out_hopid,rx_repost_batch,tx_submit_batch,rx_window_bytes;bool busy_poll,rx_busy_poll,rx_napi,removed,gpu_direct;u64 gpu_last_epoch;int wait,refs,users;int cfg_gpu_poll;int cfg_latency_qos_us; };
 /* CPU latency QoS: the core's request API, and stream.c's helpers verbatim. */
 struct pm_qos_request { bool active; int value; };
 static int qos_live, qos_adds, latency_qos_us = -1;

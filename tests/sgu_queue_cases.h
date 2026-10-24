@@ -398,6 +398,32 @@ static void test_completion_timing(void) {
     struct tbstream_dev none={0};static char small[PAGE_SIZE];
     assert(tbstream_gpu_timing_reset(&none)==-ENXIO&&tbstream_gpu_timing_show(&none,small)==5);
 }
+/* Host polling cannot enter the GPU-direct open path, even if configfs is bypassed. */
+static void test_host_polling_rejected(void) {
+    struct fixture f;
+    fixture_open(&f,1,64,false);
+    fixture_close(&f);
+    assert(!f.sdev.gpu_context);
+    f.sdev.busy_poll=true;
+    assert(tbstream_gpu_open(&f.sdev)==-EOPNOTSUPP);
+    assert(!f.sdev.gpu_context);
+    f.sdev.busy_poll=false;f.sdev.rx_busy_poll=true;
+    assert(tbstream_gpu_open(&f.sdev)==-EOPNOTSUPP);
+    assert(!f.sdev.gpu_context);
+    f.sdev.rx_busy_poll=false;f.sdev.rx_repost_batch=64;
+    assert(tbstream_gpu_open(&f.sdev)==-EOPNOTSUPP);
+    assert(!f.sdev.gpu_context);
+#ifdef USB4_EXPERIMENTAL
+    f.sdev.rx_repost_batch=0;f.sdev.rx_window_bytes=32768;
+    assert(tbstream_gpu_open(&f.sdev)==-EOPNOTSUPP);
+    f.sdev.rx_window_bytes=0;
+#endif
+    f.sdev.rx_repost_batch=0;f.sdev.tx_submit_batch=64;
+    assert(tbstream_gpu_open(&f.sdev)==-EOPNOTSUPP);
+    assert(!f.sdev.gpu_context);
+    assert(atomic_load(&module_refs)==0);
+}
+
 /* 0041: opt-in polled completion. */
 /* 0042: the session's CPU latency request lives from ARM to STOP, close,
  * a failed arm or abandonment; never more than one per session. */
@@ -936,6 +962,7 @@ int main(int argc,char **argv) {
     assert(argc==2);
     struct { const char *name; void (*run)(void); } tests[]={
         {"geometry",test_geometry},{"queue",test_queue},{"failure_isolation",test_failure_isolation},
+        {"host_polling_rejected",test_host_polling_rejected},
         {"events_legacy",test_events_and_legacy},{"timeout_recovery",test_timeout_recovery},
         {"wait_concurrency",test_wait_concurrency},{"nonblock_contended_mutex",test_nonblock_contended_mutex},{"nonblock_contended_dma_lock",test_nonblock_contended_dma_lock},{"completion_timing",test_completion_timing},{"polled_completion",test_polled_completion},{"session_latency_qos",test_session_latency_qos},
         {"stall_episode_once",test_stall_episode_once},{"stall_reset_keeps_progress",test_stall_reset_keeps_progress},

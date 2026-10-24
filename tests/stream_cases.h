@@ -316,6 +316,12 @@ static void irq_affinity_is_restored(void)
 #include "stream_detach_cases.h"
 #include "stream_open_cases.h"
 #include "stream_audit_cases.h"
+#include "stream_rx_only_cases.h"
+#include "stream_host_batch_cases.h"
+#ifdef USB4_EXPERIMENTAL /* patches/experimental: 0050, 0051 */
+#include "stream_rx_pace_cases.h"
+#include "stream_tx_path_cases.h"
+#endif
 
 int main(int argc, char **argv)
 {
@@ -353,6 +359,21 @@ int main(int argc, char **argv)
         { "latency_qos_follows_rings", latency_qos_follows_rings },
         { "contiguous_buffers_carve_frames", contiguous_buffers_carve_frames },
         { "contiguous_buffers_fall_back", contiguous_buffers_fall_back },
+        { "rx_only_poll_keeps_tx_interrupts", rx_only_poll_keeps_tx_interrupts },
+        { "rx_only_poll_reads_and_errors", rx_only_poll_reads_and_errors },
+        { "host_batch_tx_limits", host_batch_tx_limits },
+        { "host_batch_tx_faults", host_batch_tx_faults },
+        { "host_batch_rx_flush", host_batch_rx_flush },
+        { "host_batch_rx_faults", host_batch_rx_faults },
+#ifdef USB4_EXPERIMENTAL
+        { "rx_pace_skips_descriptor_polls", rx_pace_skips_descriptor_polls },
+        { "rx_pace_zero_is_legacy", rx_pace_zero_is_legacy },
+        { "rx_pace_ignored_with_interrupts", rx_pace_ignored_with_interrupts },
+        { "tx_frame_bytes_splits_writes", tx_frame_bytes_splits_writes },
+        { "tx_copy_nocache_same_bytes", tx_copy_nocache_same_bytes },
+        { "tx_no_snoop_needs_uncached_copy", tx_no_snoop_needs_uncached_copy },
+        { "tx_path_parameters_are_bounded", tx_path_parameters_are_bounded },
+#endif
     };
 
     assert(argc == 2);

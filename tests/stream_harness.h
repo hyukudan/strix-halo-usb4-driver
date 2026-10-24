@@ -54,6 +54,7 @@ static atomic_int warnings, infos;
 #define WARN_ON(x) ({ bool __w = (x); if (__w) atomic_fetch_add(&warnings, 1); __w; })
 
 struct list_head { struct list_head *next, *prev; };
+#define LIST_HEAD(name) struct list_head name = { &(name), &(name) }
 static void INIT_LIST_HEAD(struct list_head *l) { l->next = l->prev = l; }
 static bool list_empty(const struct list_head *l) { return l->next == l; }
 static void list_add_tail(struct list_head *n, struct list_head *h)
@@ -105,6 +106,7 @@ static ktime_t ktime_get(void)
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (ktime_t)t.tv_sec * 1000000000LL + t.tv_nsec;
 }
+#define ktime_add_ns(t, ns) ((t) + (ktime_t)(ns))
 #define ktime_add_us(t, us) ((t) + (ktime_t)(us) * 1000)
 #define ktime_add_ms(t, ms) ((t) + (ktime_t)(ms) * 1000000)
 #define ktime_before(a, b) ((a) < (b))
@@ -235,6 +237,7 @@ struct ring_frame {
 #define RING_FLAG_NO_INTERRUPT BIT(0)
 #define RING_FLAG_FRAME BIT(1)
 #define RING_FLAG_E2E BIT(2)
+#define RING_FLAG_NO_SNOOP BIT(4)
 #define RING_DESC_CRC_ERROR 1U
 #define RING_DESC_BUFFER_OVERRUN 2U
 #define MAX_HOPS 3
@@ -243,6 +246,7 @@ struct tb_ring {
     struct tb_nhi *nhi;
     pthread_mutex_t lock;
     int hop, size, irq;
+    unsigned int flags;
     bool is_tx, running, masked;
     struct list_head posted, done;
     void (*start_poll)(void *);
@@ -274,16 +278,19 @@ static struct tb_ring *ring_alloc(struct tb_nhi *nhi, bool tx, int size)
 }
 static struct tb_ring *tb_ring_alloc_tx(struct tb_nhi *nhi, int hop, int size, unsigned int flags)
 {
-    (void)hop; (void)flags;
-    return ring_alloc(nhi, true, size);
+    struct tb_ring *r;
+    (void)hop;
+    r = ring_alloc(nhi, true, size);
+    if (r) r->flags = flags;
+    return r;
 }
 static struct tb_ring *tb_ring_alloc_rx(struct tb_nhi *nhi, int hop, int size, unsigned int flags,
                                         int e2e, u16 sof, u16 eof, void (*start_poll)(void *), void *data)
 {
     struct tb_ring *r;
-    (void)hop; (void)flags; (void)e2e; (void)sof; (void)eof;
+    (void)hop; (void)e2e; (void)sof; (void)eof;
     r = ring_alloc(nhi, false, size);
-    if (r) { r->start_poll = start_poll; r->poll_data = data; }
+    if (r) { r->flags = flags; r->start_poll = start_poll; r->poll_data = data; }
     return r;
 }
 static void tb_ring_start(struct tb_ring *r) { assert(!r->running); r->running = true; }
@@ -364,6 +371,31 @@ static int tb_ring_rx(struct tb_ring *r, struct ring_frame *f)
     return ret;
 }
 static int tx_fail_after = -1;
+static int batch_fail_after = -1;
+static unsigned int batch_calls[2], batch_frames[2], batch_max[2];
+/* Atomic ownership model for the existing NHI list enqueue API. */
+static int __tb_ring_enqueue_list(struct tb_ring *r, struct list_head *frames)
+{
+    unsigned int count = 0;
+
+    pthread_mutex_lock(&r->lock);
+    if (!r->running || inject(&batch_fail_after)) {
+        pthread_mutex_unlock(&r->lock);
+        return -ESHUTDOWN;
+    }
+    while (!list_empty(frames)) {
+        struct list_head *n = frames->next;
+        list_del_init(n);
+        list_add_tail(n, &r->posted);
+        count++;
+    }
+    batch_calls[r->is_tx]++;
+    batch_frames[r->is_tx] += count;
+    if (count > batch_max[r->is_tx]) batch_max[r->is_tx] = count;
+    if (r->is_tx) atomic_fetch_add(&tx_frames, count);
+    pthread_mutex_unlock(&r->lock);
+    return 0;
+}
 static int tb_ring_tx(struct tb_ring *r, struct ring_frame *f)
 {
     assert(r->is_tx);
@@ -544,6 +576,16 @@ static size_t copy_page_from_iter(struct page *p, size_t off, size_t size, struc
     memcpy(p->data + off, i->buf, size); i->buf += size; i->count -= size;
     return size;
 }
+/* 0051: non-temporal copy; counted so tests see which path ran */
+static atomic_int flushcache_copies;
+static size_t _copy_from_iter_flushcache(void *addr, size_t size, struct iov_iter *i)
+{
+    size = iov_take(size);
+    memcpy(addr, i->buf, size); i->buf += size; i->count -= size;
+    atomic_fetch_add(&flushcache_copies, 1);
+    return size;
+}
+#define wmb() atomic_thread_fence(memory_order_seq_cst)
 static void iov_iter_revert(struct iov_iter *i, size_t n) { i->buf -= n; i->count += n; }
 static void poll_wait(struct file *f, wait_queue_head_t *w, struct poll_table_struct *pt) { (void)f; (void)w; (void)pt; }
 static void cond_resched(void) { sched_yield(); }
@@ -598,6 +640,10 @@ static bool rx_napi;
 static unsigned int spin_us;
 static unsigned int open_timeout_ms = 30000;
 static int latency_qos_us = -1;
+#ifdef USB4_EXPERIMENTAL
+static unsigned int tx_copy, tx_frame_bytes; /* 0051: module parameters */
+static bool tx_no_snoop;
+#endif
 /* CPU latency QoS requests (0042): one per open host stream at most. */
 struct pm_qos_request { bool active; int value; };
 static int qos_live, qos_adds;

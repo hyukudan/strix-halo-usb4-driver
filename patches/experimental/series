@@ -1,0 +1,5 @@
+# Experimental: apply on top of patches/series (0001-0048), all three in this
+# order. Not installed or measured on hardware yet; see README.md "Status".
+0049-host-bounded-rx-poll-window.patch
+0050-host-paced-rx-descriptor-polls.patch
+0051-host-tx-memory-path-experiments.patch

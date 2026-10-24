@@ -1,0 +1,501 @@
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -995,7 +995,7 @@
+     unsigned int ring_flags;
+     int ret;
+ 
+-    if (sdev->busy_poll || sdev->rx_busy_poll ||
++    if (sdev->rx_window_bytes || sdev->busy_poll || sdev->rx_busy_poll ||
+         sdev->rx_repost_batch || sdev->tx_submit_batch || !xd || !xd->local_uuid || !xd->remote_uuid ||
+         !xd->tb->cm_ops || xd->tb->cm_ops->driver_ready)
+         return -EOPNOTSUPP;
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -622,12 +622,67 @@
+ 
+ 	spin_lock_irqsave(&ring->nhi->lock, flags);
+ 	spin_lock(&ring->lock);
+-	if (ring->start_poll)
++	if (ring->start_poll && !ring->poll_window)
+ 		__ring_interrupt_mask(ring, false);
+ 	spin_unlock(&ring->lock);
+ 	spin_unlock_irqrestore(&ring->nhi->lock, flags);
+ }
+ EXPORT_SYMBOL_GPL(tb_ring_poll_complete);
++
++/**
++ * tb_ring_poll_begin() - Temporarily mask an IRQ-driven RX NAPI ring
++ * @ring: Running RX ring with start_poll, whose lifetime the caller owns
++ *
++ * The owner must call tb_ring_poll_end() or stop the ring. No descriptors,
++ * callbacks or NO_INTERRUPT flags change. poll_complete cannot end this lease.
++ */
++int tb_ring_poll_begin(struct tb_ring *ring)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	spin_lock_irqsave(&ring->nhi->lock, flags);
++	spin_lock(&ring->lock);
++	if (ring->nhi->going_away || !ring->running)
++		ret = -ENODEV;
++	else if (ring->is_tx || !ring->start_poll ||
++		 (ring->flags & RING_FLAG_NO_INTERRUPT))
++		ret = -EOPNOTSUPP;
++	else if (ring->poll_window)
++		ret = -EBUSY;
++	else {
++		ring->poll_window = true;
++		__ring_interrupt_mask(ring, true);
++	}
++	spin_unlock(&ring->lock);
++	spin_unlock_irqrestore(&ring->nhi->lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(tb_ring_poll_begin);
++
++/**
++ * tb_ring_poll_end() - End a temporary RX polling lease, if any
++ * @ring: Ring whose lifetime the caller owns
++ *
++ * Pending completions are retained. Re-enabling the interrupt lets the normal
++ * start_poll callback wake the reader. Safe after stop, before ring_free.
++ */
++void tb_ring_poll_end(struct tb_ring *ring)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&ring->nhi->lock, flags);
++	spin_lock(&ring->lock);
++	if (ring->poll_window) {
++		ring->poll_window = false;
++		if (ring->running && !ring->nhi->going_away && ring->start_poll)
++			__ring_interrupt_mask(ring, false);
++	}
++	spin_unlock(&ring->lock);
++	spin_unlock_irqrestore(&ring->nhi->lock, flags);
++}
++EXPORT_SYMBOL_GPL(tb_ring_poll_end);
++
+ 
+ static void ring_clear_msix(const struct tb_ring *ring)
+ {
+@@ -977,6 +1032,7 @@
+ {
+ 	spin_lock_irq(&ring->nhi->lock);
+ 	spin_lock(&ring->lock);
++	ring->poll_window = false;
+ 	dev_dbg(ring->nhi->dev, "stopping %s %d\n",
+ 		RING_TYPE(ring), ring->hop);
+ 	if (ring->nhi->going_away)
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -18,6 +18,8 @@
+ #include <linux/fs.h>
+ #include <linux/idr.h>
+ #include <linux/ktime.h>
++#include <linux/hrtimer.h>
++#include <uapi/linux/strix_host_stream.h>
+ #include <linux/miscdevice.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+@@ -153,6 +155,13 @@
+  * @throttling: Interrupt throttling rate in ns
+  * @busy_poll: Instead of interrupts, busy poll both rings
+  * @rx_busy_poll: Host RX only: no RX interrupt, TX keeps normal completions
++ * @rx_window_bytes: Maximum logical RX bytes for explicit polling, zero disables
++ * @rx_window_us: Bounded window duration in microseconds
++ * @window_lock: Protects timer state and the borrowed RX ring lifetime
++ * @window_timer: Independently ends the hardware interrupt mask
++ * @window_active: Explicit RX polling lease is active
++ * @window_cookie: Cookie of the last successfully started window
++ * @window_deadline: Monotonic expiry of the current window
+  * @rx_repost_batch: Host RX repost budget, 0 keeps single-frame submission
+  * @tx_submit_batch: Host TX submission budget, 0 keeps single-frame submission
+  * @rx_napi: The reader reaps RX completions (start_poll) instead of the
+@@ -207,6 +216,13 @@
+ 	unsigned int throttling;
+ 	bool busy_poll;
+ 	bool rx_busy_poll;
++	u32 rx_window_bytes;
++	u32 rx_window_us;
++	spinlock_t window_lock;
++	struct hrtimer window_timer;
++	bool window_active;
++	u64 window_cookie;
++	ktime_t window_deadline;
+ 	unsigned int rx_repost_batch;
+ 	unsigned int tx_submit_batch;
+ 	bool rx_napi;
+@@ -1118,7 +1134,8 @@
+ 	if (sdev->busy_poll)
+ 		flags |= RING_FLAG_NO_INTERRUPT;
+ 
+-	sdev->rx_napi = (sdev->cfg_rx_napi < 0 ? READ_ONCE(rx_napi) : sdev->cfg_rx_napi) &&
++	sdev->rx_napi = (sdev->rx_window_bytes ||
++			(sdev->cfg_rx_napi < 0 ? READ_ONCE(rx_napi) : sdev->cfg_rx_napi)) &&
+ 			!sdev->busy_poll && !sdev->rx_busy_poll;
+ 	sdev->rx_spin_us = sdev->cfg_spin_us < 0 ?
+ 			   min_t(unsigned int, READ_ONCE(spin_us), TBSTREAM_DEV_MAX_SPIN_US) :
+@@ -1216,9 +1233,91 @@
+ 	return ring->prod - ring->cons == tb_ring_size(ring->ring) - 1;
+ }
+ 
++/* sdev->lock serializes BEGIN/END/stop. The timer takes only window_lock,
++ * then the core's NHI/ring locks; the IRQ callback never takes window_lock.
++ * Cancel synchronously outside window_lock before releasing any ring lifetime.
++ */
++static void tbstream_dev_window_stop(struct tbstream_dev *sdev)
++{
++	unsigned long flags;
++
++	hrtimer_cancel(&sdev->window_timer);
++	spin_lock_irqsave(&sdev->window_lock, flags);
++	if (sdev->window_active) {
++		WRITE_ONCE(sdev->window_active, false);
++		tb_ring_poll_end(sdev->rx_ring.ring);
++	}
++	spin_unlock_irqrestore(&sdev->window_lock, flags);
++	wake_up_interruptible(&sdev->wait);
++}
++
++static enum hrtimer_restart tbstream_dev_window_expire(struct hrtimer *timer)
++{
++	struct tbstream_dev *sdev = container_of(timer, struct tbstream_dev, window_timer);
++	unsigned long flags;
++	enum hrtimer_restart ret = HRTIMER_NORESTART;
++
++	spin_lock_irqsave(&sdev->window_lock, flags);
++	if (sdev->window_active) {
++		if (ktime_before(ktime_get(), sdev->window_deadline)) {
++			hrtimer_set_expires(timer, sdev->window_deadline);
++			ret = HRTIMER_RESTART;
++		} else {
++			WRITE_ONCE(sdev->window_active, false);
++			tb_ring_poll_end(sdev->rx_ring.ring);
++		}
++	}
++	spin_unlock_irqrestore(&sdev->window_lock, flags);
++	wake_up_interruptible(&sdev->wait);
++	return ret;
++}
++
++static int tbstream_dev_window_command(struct tbstream_dev *sdev,
++		unsigned int command, const struct shs_rx_window *hint)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	lockdep_assert_held(&sdev->lock);
++	if (hint->flags || hint->reserved || !hint->cookie)
++		return -EINVAL;
++	if (!sdev->rx_window_bytes)
++		return -EOPNOTSUPP;
++	if (!sdev->rx_ring.ring || sdev->detached || sdev->removed || sdev->closed)
++		return -ENODEV;
++	if (command == SHS_RX_WINDOW_END) {
++		if (hint->cookie != sdev->window_cookie)
++			return -ESTALE;
++		tbstream_dev_window_stop(sdev);
++		return 0;
++	}
++	if (command != SHS_RX_WINDOW_BEGIN || !hint->bytes)
++		return -EINVAL;
++	if (READ_ONCE(sdev->window_active))
++		return -EBUSY;
++	/* Join a just-expired callback before reusing its timer/cookie. */
++	hrtimer_cancel(&sdev->window_timer);
++	if (hint->bytes > sdev->rx_window_bytes)
++		return -E2BIG; /* No masking: caller uses ordinary IRQ path. */
++	spin_lock_irqsave(&sdev->window_lock, flags);
++	ret = tb_ring_poll_begin(sdev->rx_ring.ring);
++	if (!ret) {
++		sdev->window_cookie = hint->cookie;
++		sdev->window_deadline = ktime_add_us(ktime_get(), sdev->rx_window_us);
++		WRITE_ONCE(sdev->window_active, true);
++		hrtimer_start(&sdev->window_timer, sdev->window_deadline, HRTIMER_MODE_ABS_HARD);
++	}
++	spin_unlock_irqrestore(&sdev->window_lock, flags);
++	if (!ret)
++		wake_up_interruptible(&sdev->wait);
++	return ret;
++}
++
+ static void tbstream_dev_stop(struct tbstream_dev *sdev)
+ {
+ 	struct tb_xdomain *xd;
++
++	tbstream_dev_window_stop(sdev);
+ 
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+ 	if (sdev->gpu_context) {
+@@ -1596,7 +1695,7 @@
+ 	} else {
+ 		if (tbstream_ring_available(&sdev->tx_ring))
+ 			mask |= EPOLLOUT | EPOLLWRNORM;
+-		if (tbstream_ring_available(&sdev->rx_ring))
++		if (tbstream_ring_available(&sdev->rx_ring) || READ_ONCE(sdev->window_active))
+ 			mask |= EPOLLIN | EPOLLRDNORM;
+ 	}
+ 	return mask;
+@@ -1666,6 +1765,10 @@
+ 		return -ERESTARTSYS;
+ 	}
+ 
++	if (sdev->rx_window_bytes && sdev->users) {
++		ret = -EBUSY;
++		goto err_unlock;
++	}
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+ 	if (sdev->gpu_context || (sdev->gpu_direct && sdev->users)) {
+ 		ret = -EBUSY;
+@@ -1694,6 +1797,10 @@
+ 		}
+ 	}
+ 
++	if (sdev->rx_window_bytes && sdev->users) {
++		ret = -EBUSY;
++		goto err_unlock;
++	}
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+ 	if (sdev->gpu_context || (sdev->gpu_direct && sdev->users)) {
+ 		ret = -EBUSY;
+@@ -1741,6 +1848,7 @@
+ 
+ 	mutex_lock(&sdev->lock);
+ 	if (--sdev->users == 0) {
++		tbstream_dev_window_stop(sdev);
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+ 		if (sdev->gpu_context) {
+ 			tbstream_gpu_close(sdev);
+@@ -1769,16 +1877,29 @@
+ 	return 0;
+ }
+ 
++static long tbstream_dev_fops_ioctl(struct file *file, unsigned int command, unsigned long argument)
++{
++	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
++	struct shs_rx_window hint;
++
++	if (command == SHS_RX_WINDOW_BEGIN || command == SHS_RX_WINDOW_END) {
++		if (!(file->f_flags & O_NONBLOCK))
++			return -EOPNOTSUPP;
++		if (copy_from_user(&hint, (void __user *)argument, sizeof(hint)))
++			return -EFAULT;
++		guard(mutex)(&sdev->lock);
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+-static long tbstream_dev_fops_ioctl(struct file *file, unsigned int command, unsigned long argument)
+-{
+-	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+-
+-	if (!READ_ONCE(sdev->gpu_direct))
+-		return -ENOTTY;
+-	return tbstream_gpu_ioctl(file, command, argument);
+-}
+-#endif
++		if (sdev->gpu_direct || sdev->gpu_context)
++			return -EOPNOTSUPP;
++#endif
++		return tbstream_dev_window_command(sdev, command, &hint);
++	}
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	if (READ_ONCE(sdev->gpu_direct))
++		return tbstream_gpu_ioctl(file, command, argument);
++#endif
++	return -ENOTTY;
++}
+ 
+ static const struct file_operations tbstream_dev_fops = {
+ 	.owner = THIS_MODULE,
+@@ -1788,11 +1909,9 @@
+ 	.poll = tbstream_dev_fops_poll,
+ 	.open = tbstream_dev_fops_open,
+ 	.release = tbstream_dev_fops_release,
+-#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+ 	.unlocked_ioctl = tbstream_dev_fops_ioctl,
+ #ifdef CONFIG_COMPAT
+ 	.compat_ioctl = compat_ptr_ioctl,
+-#endif
+ #endif
+ };
+ 
+@@ -1831,6 +1950,8 @@
+ 	if (enabled && (sdev->busy_poll || sdev->rx_busy_poll ||
+ 			sdev->rx_repost_batch || sdev->tx_submit_batch))
+ 		return -EOPNOTSUPP;
++	if (enabled && sdev->rx_window_bytes)
++		return -EOPNOTSUPP;
+ 	sdev->gpu_direct = enabled;
+ 	return count;
+ }
+@@ -1865,6 +1986,8 @@
+ 	if (busy_poll && sdev->gpu_direct)
+ 		return -EOPNOTSUPP;
+ #endif
++	if (busy_poll && sdev->rx_window_bytes)
++		return -EOPNOTSUPP;
+ 	sdev->busy_poll = busy_poll;
+ 	return count;
+ }
+@@ -1894,6 +2017,8 @@
+ 	if (enabled && sdev->gpu_direct)
+ 		return -EOPNOTSUPP;
+ #endif
++	if (enabled && sdev->rx_window_bytes)
++		return -EOPNOTSUPP;
+ 	sdev->rx_busy_poll = enabled;
+ 	return count;
+ }
+@@ -1925,6 +2050,8 @@
+ 	if (value && sdev->gpu_direct)
+ 		return -EOPNOTSUPP;
+ #endif
++	if (value && sdev->rx_window_bytes)
++		return -EBUSY;
+ 	sdev->rx_repost_batch = value;
+ 	return count;
+ }
+@@ -1956,6 +2083,8 @@
+ 	if (value && sdev->gpu_direct)
+ 		return -EOPNOTSUPP;
+ #endif
++	if (value && sdev->rx_window_bytes)
++		return -EBUSY;
+ 	sdev->tx_submit_batch = value;
+ 	return count;
+ }
+@@ -2443,7 +2572,70 @@
+ CONFIGFS_ATTR_WO(tbstream_dev_, gpu_recover);
+ #endif
+ 
++static ssize_t tbstream_dev_rx_window_bytes_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return sysfs_emit(buf, "%u\n", sdev->rx_window_bytes);
++}
++
++static ssize_t tbstream_dev_rx_window_bytes_store(struct config_item *item,
++		const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++	unsigned int value;
++	int ret = kstrtouint(buf, 0, &value);
++
++	if (ret)
++		return ret;
++	if (value > 1048576)
++		return -EINVAL;
++	guard(mutex)(&sdev->lock);
++	if (tbstream_dev_config_busy(sdev))
++		return -EBUSY;
++	if (value && (sdev->busy_poll || sdev->rx_busy_poll))
++		return -EOPNOTSUPP;
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	if (value && sdev->gpu_direct)
++		return -EOPNOTSUPP;
++#endif
++	/* Batch budgets are a separate opt-in: clear them first. */
++	if (value && (sdev->rx_repost_batch || sdev->tx_submit_batch))
++		return -EBUSY;
++	sdev->rx_window_bytes = value;
++	return count;
++}
++CONFIGFS_ATTR(tbstream_dev_, rx_window_bytes);
++
++static ssize_t tbstream_dev_rx_window_us_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return sysfs_emit(buf, "%u\n", sdev->rx_window_us);
++}
++
++static ssize_t tbstream_dev_rx_window_us_store(struct config_item *item,
++		const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++	unsigned int value;
++	int ret = kstrtouint(buf, 0, &value);
++
++	if (ret)
++		return ret;
++	if (!value || value > 10000)
++		return -EINVAL;
++	guard(mutex)(&sdev->lock);
++	if (tbstream_dev_config_busy(sdev))
++		return -EBUSY;
++	sdev->rx_window_us = value;
++	return count;
++}
++CONFIGFS_ATTR(tbstream_dev_, rx_window_us);
++
+ static struct configfs_attribute *tbstream_dev_attrs[] = {
++	&tbstream_dev_attr_rx_window_bytes,
++	&tbstream_dev_attr_rx_window_us,
+ 	&tbstream_dev_attr_busy_poll,
+ 	&tbstream_dev_attr_rx_busy_poll,
+ 	&tbstream_dev_attr_rx_repost_batch,
+@@ -2657,6 +2849,10 @@
+ 	sdev->irq_cpu = -1;
+ 	mutex_init(&sdev->lock);
+ 	mutex_init(&sdev->rx_lock);
++	spin_lock_init(&sdev->window_lock);
++	sdev->rx_window_us = 1000;
++	hrtimer_setup(&sdev->window_timer, tbstream_dev_window_expire,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_ABS_HARD);
+ 	init_waitqueue_head(&sdev->wait);
+ 	INIT_LIST_HEAD(&sdev->list);
+ 	/* This point forward tbstream_dev_put() must be used to release sdev */
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -609,6 +609,7 @@
+  * @front_completed: The descriptor at @tail is posted and completed, but
+  *		     not collected yet
+  * @running: The ring runs
++ * @poll_window: Temporary RX IRQ masking owned by a bounded polling caller
+  */
+ struct tb_ring_snapshot {
+ 	u32 head;
+@@ -673,6 +674,7 @@
+ 	struct workqueue_struct *wq;
+ 	bool is_tx:1;
+ 	bool running:1;
++	bool poll_window; /* Temporary RX IRQ masking, protected by NHI/ring locks. */
+ 	int irq;
+ 	u8 vector;
+ 	unsigned int flags;
+@@ -825,6 +827,8 @@
+ unsigned int tb_ring_collect(struct tb_ring *ring, unsigned int budget);
+ void tb_ring_snapshot(struct tb_ring *ring, struct tb_ring_snapshot *snap);
+ void tb_ring_poll_complete(struct tb_ring *ring);
++int tb_ring_poll_begin(struct tb_ring *ring);
++void tb_ring_poll_end(struct tb_ring *ring);
+ 
+ int tb_ring_throttling(struct tb_ring *ring, unsigned int interval_nsec);
+ 
+diff --git a/include/uapi/linux/strix_host_stream.h b/include/uapi/linux/strix_host_stream.h
+new file mode 100644
+--- /dev/null
++++ b/include/uapi/linux/strix_host_stream.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/* Project-owned host-only experimental ABI; no wire-format change. */
++#ifndef STRIX_HOST_STREAM_H
++#define STRIX_HOST_STREAM_H
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++/* Fixed-width/aligned on 32/64-bit userspace; reserved fields must be zero. */
++struct shs_rx_window {
++	__u64 cookie;        /* Nonzero, unique for this fd's exchange. */
++	__u64 bytes;         /* Full logical RX exchange, including its header. */
++	__u32 flags;
++	__u32 reserved;
++};
++#define SHS_RX_WINDOW_BEGIN _IOW('H', 0xe0, struct shs_rx_window)
++#define SHS_RX_WINDOW_END   _IOW('H', 0xe1, struct shs_rx_window)
++#endif

@@ -1,0 +1,134 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -151,7 +151,8 @@
+  * @out_hopid: Out HopID
+  * @ring_size: Size of the rings
+  * @throttling: Interrupt throttling rate in ns
+- * @busy_poll: Instead of interrupts, busy poll the rings
++ * @busy_poll: Instead of interrupts, busy poll both rings
++ * @rx_busy_poll: Host RX only: no RX interrupt, TX keeps normal completions
+  * @rx_napi: The reader reaps RX completions (start_poll) instead of the
+  *	     ring work; set when the stream is started
+  * @rx_poll_pending: The RX interrupt fired and is masked until a reader
+@@ -203,6 +204,7 @@
+ 	unsigned int ring_size;
+ 	unsigned int throttling;
+ 	bool busy_poll;
++	bool rx_busy_poll;
+ 	bool rx_napi;
+ 	bool rx_poll_pending;
+ 	int cfg_rx_napi;
+@@ -983,7 +985,8 @@
+ {
+ 	struct ring_frame *frame;
+ 
+-	if (!sdev->busy_poll)
++	if (!sdev->busy_poll &&
++	    !(sdev->rx_busy_poll && ring == &sdev->rx_ring))
+ 		return;
+ 
+ 	while ((frame = tb_ring_poll(ring->ring)))
+@@ -1051,7 +1054,7 @@
+ 		flags |= RING_FLAG_NO_INTERRUPT;
+ 
+ 	sdev->rx_napi = (sdev->cfg_rx_napi < 0 ? READ_ONCE(rx_napi) : sdev->cfg_rx_napi) &&
+-			!sdev->busy_poll;
++			!sdev->busy_poll && !sdev->rx_busy_poll;
+ 	sdev->rx_spin_us = sdev->cfg_spin_us < 0 ?
+ 			   min_t(unsigned int, READ_ONCE(spin_us), TBSTREAM_DEV_MAX_SPIN_US) :
+ 			   sdev->cfg_spin_us;
+@@ -1071,6 +1074,10 @@
+ 	e2e_tx_hop = ring->hop;
+ 	sof_mask = BIT(TBSTREAM_FRAME_START);
+ 	eof_mask = BIT(TBSTREAM_DATA) | BIT(TBSTREAM_CLOSE);
++
++	/* RX-only polling deliberately preserves interrupt-driven TX. */
++	if (sdev->rx_busy_poll)
++		flags |= RING_FLAG_NO_INTERRUPT;
+ 
+ 	ring = tb_ring_alloc_rx(xd->tb->nhi, -1, sdev->ring_size, flags,
+ 				e2e_tx_hop, sof_mask, eof_mask,
+@@ -1273,7 +1280,7 @@
+ 		if (nowait)
+ 			return -EAGAIN;
+ 
+-		if (sdev->busy_poll) {
++		if (sdev->busy_poll || sdev->rx_busy_poll) {
+ 			if (signal_pending(current))
+ 				return -ERESTARTSYS;
+ 			cond_resched();
+@@ -1470,7 +1477,7 @@
+ 	 * Without interrupts there is nothing that can wake us up so
+ 	 * return failure instead.
+ 	 */
+-	if (sdev->busy_poll)
++	if (sdev->busy_poll || sdev->rx_busy_poll)
+ 		return EPOLLERR;
+ 
+ 	poll_wait(file, &sdev->wait, wait);
+@@ -1718,7 +1725,7 @@
+ 	guard(mutex)(&sdev->lock);
+ 	if (tbstream_dev_config_busy(sdev))
+ 		return -EBUSY;
+-	if (enabled && sdev->busy_poll)
++	if (enabled && (sdev->busy_poll || sdev->rx_busy_poll))
+ 		return -EOPNOTSUPP;
+ 	sdev->gpu_direct = enabled;
+ 	return count;
+@@ -1758,6 +1765,35 @@
+ 	return count;
+ }
+ CONFIGFS_ATTR(tbstream_dev_, busy_poll);
++
++/* Host RX only. Both modes require a bounded read/write loop, not poll(). */
++static ssize_t tbstream_dev_rx_busy_poll_show(struct config_item *item, char *buf)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++
++	return sysfs_emit(buf, "%u\n", sdev->rx_busy_poll);
++}
++
++static ssize_t tbstream_dev_rx_busy_poll_store(struct config_item *item,
++					     const char *buf, size_t count)
++{
++	struct tbstream_dev *sdev = tbstream_dev_from_group(to_config_group(item));
++	bool enabled;
++	int ret = kstrtobool(buf, &enabled);
++
++	if (ret)
++		return ret;
++	guard(mutex)(&sdev->lock);
++	if (tbstream_dev_config_busy(sdev))
++		return -EBUSY;
++#if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
++	if (enabled && sdev->gpu_direct)
++		return -EOPNOTSUPP;
++#endif
++	sdev->rx_busy_poll = enabled;
++	return count;
++}
++CONFIGFS_ATTR(tbstream_dev_, rx_busy_poll);
+ 
+ static ssize_t tbstream_dev_int_store(struct tbstream_dev *sdev, int *field,
+ 				      const char *buf, size_t count, int min, int max)
+@@ -2243,6 +2279,7 @@
+ 
+ static struct configfs_attribute *tbstream_dev_attrs[] = {
+ 	&tbstream_dev_attr_busy_poll,
++	&tbstream_dev_attr_rx_busy_poll,
+ 	&tbstream_dev_attr_irq_cpu,
+ 	&tbstream_dev_attr_open_timeout_ms,
+ 	&tbstream_dev_attr_latency_qos_us,
+diff --git a/drivers/thunderbolt/gpu_stream.c b/drivers/thunderbolt/gpu_stream.c
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -995,7 +995,7 @@
+     unsigned int ring_flags;
+     int ret;
+ 
+-    if (sdev->busy_poll || !xd || !xd->local_uuid || !xd->remote_uuid ||
++    if (sdev->busy_poll || sdev->rx_busy_poll || !xd || !xd->local_uuid || !xd->remote_uuid ||
+         !xd->tb->cm_ops || xd->tb->cm_ops->driver_ready)
+         return -EOPNOTSUPP;
+     if (sdev->gpu_context)

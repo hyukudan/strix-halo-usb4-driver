@@ -12,7 +12,13 @@ on:
 permissions:
   contents: read
 jobs:
+  # stable = patches/series (the default install path); experimental adds
+  # patches/experimental/series on top.
   unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        series: [stable, experimental]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -30,7 +36,7 @@ jobs:
             drivers/thunderbolt
             drivers/net/thunderbolt
           sparse-checkout-cone-mode: true
-      - run: python3 tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source" --kernel-source "$GITHUB_WORKSPACE/pinned-linux"
+      - run: python3 tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source" --kernel-source "$GITHUB_WORKSPACE/pinned-linux" ${{ matrix.series == 'experimental' && '--experimental' || '' }}
       # Includes the tools tests (pingpong with ASan/UBSan, describe, manifest,
       # Kconfig check, apply-series) and the shipped manifest vs the reconstruction.
       - run: python3 -m unittest discover -s tests -v
@@ -40,6 +46,13 @@ jobs:
 
   kernel-modules:
     needs: unit
+    strategy:
+      fail-fast: false
+      matrix:
+        series: [stable, experimental]
+    env:
+      EXPERIMENTAL: ${{ matrix.series == 'experimental' && '--experimental' || '' }}
+      APPLY_EXPERIMENTAL: ${{ matrix.series == 'experimental' && '--with-experimental' || '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -56,8 +69,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y flex bison libelf-dev libssl-dev bc dwarves
       - name: Reconstruct and compare both reconstruction methods
         run: |
-          python3 driver/tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source" --kernel-source "$PWD/kernel"
-          sh driver/tools/apply-series.sh kernel
+          python3 driver/tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source" --kernel-source "$PWD/kernel" $EXPERIMENTAL
+          sh driver/tools/apply-series.sh $APPLY_EXPERIMENTAL kernel
           cd kernel
           python3 - <<'PY'
           import os
@@ -98,7 +111,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-build-logs
+          name: kernel-build-logs-${{ matrix.series }}
           path: ${{ runner.temp }}/build-gpu-*.log
           if-no-files-found: ignore
 

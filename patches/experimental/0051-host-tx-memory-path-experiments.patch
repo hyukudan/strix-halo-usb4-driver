@@ -1,0 +1,220 @@
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -940,6 +940,8 @@ void tb_ring_start(struct tb_ring *ring)
+ 		frame_size = TB_FRAME_SIZE;
+ 		flags = RING_FLAG_ENABLE | RING_FLAG_RAW;
+ 	}
++	if (ring->flags & RING_FLAG_NO_SNOOP)
++		flags |= RING_FLAG_PCI_NO_SNOOP;
+ 
+ 	ring_iowrite64desc(ring, ring->descriptors_dma, 0);
+ 	if (ring->is_tx) {
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -32,6 +32,10 @@
+ #include <linux/uuid.h>
+ #include <linux/wait.h>
+ #include <trace/events/thunderbolt_latency.h>
++#ifdef CONFIG_X86
++#include <linux/libnvdimm.h>
++#include <asm/cacheflush.h>
++#endif
+ 
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+ #include "gpu_stream.h"
+@@ -195,6 +199,9 @@ struct tbstream_ring {
+  *		  interrupts (-1 follows the gpu_poll module parameter)
+  * @cfg_open_timeout_ms: How long open() waits for the peer's stream service
+  *			 (-1 follows the open_timeout_ms module parameter)
++ * @tx_copy: How write() fills TX frame buffers (tx_copy module parameter),
++ *	     fixed when the stream is opened
++ * @tx_frame_bytes: Payload bytes per TX frame, fixed when opened (0: 4096)
+  * @cfg_latency_qos_us: CPU latency limit held while the rings run, in
+  *			microseconds (-1 follows the latency_qos_us module
+  *			parameter, which is -1, no limit, by default)
+@@ -231,6 +238,8 @@ struct tbstream_dev {
+ 	ktime_t window_deadline;
+ 	unsigned int rx_repost_batch;
+ 	unsigned int tx_submit_batch;
++	unsigned int tx_copy;
++	unsigned int tx_frame_bytes;
+ 	bool rx_napi;
+ 	bool rx_poll_pending;
+ 	int cfg_rx_napi;
+@@ -500,6 +509,71 @@ module_param(contig_buffers, uint, 0644);
+ MODULE_PARM_DESC(contig_buffers,
+ 		 "Host streams opened while set carve their DMA frame buffers from physically contiguous blocks of up to 2 MiB, each mapped once (one IOVA range, so a translating IOMMU can use large pages), instead of one page and one mapping per frame: bit 0 TX, bit 1 RX; a stream whose blocks cannot be allocated or mapped uses per-page buffers (default: 0)");
+ 
++/*
++ * How write() fills a TX frame buffer. The controller reads it with snooped
++ * DMA, so the state of those lines in the CPU caches is part of what each
++ * frame costs. Measurement only: every mode sends the same bytes.
++ */
++#define TBSTREAM_TX_COPY_CACHED		0	/* copy_page_from_iter() */
++#define TBSTREAM_TX_COPY_NOCACHE	1	/* non-temporal stores, edges written back */
++#define TBSTREAM_TX_COPY_CLWB		2	/* copy, then write the lines back (kept clean) */
++#define TBSTREAM_TX_COPY_FLUSH		3	/* copy, then write back and evict the lines */
++#define TBSTREAM_TX_COPY_MAX		TBSTREAM_TX_COPY_FLUSH
++
++static int tx_copy_set(const char *value, const struct kernel_param *kp)
++{
++	unsigned int mode;
++	int ret;
++
++	ret = kstrtouint(value, 0, &mode);
++	if (ret)
++		return ret;
++	if (mode > TBSTREAM_TX_COPY_MAX)
++		return -EINVAL;
++	return param_set_uint(value, kp);
++}
++
++static const struct kernel_param_ops tx_copy_ops = {
++	.set = tx_copy_set,
++	.get = param_get_uint,
++};
++
++static unsigned int tx_copy;
++module_param_cb(tx_copy, &tx_copy_ops, &tx_copy, 0644);
++MODULE_PARM_DESC(tx_copy,
++		 "How host streams opened afterwards fill TX frame buffers: 0 cached copy, 1 non-temporal stores, 2 copy then write back (clwb), 3 copy then write back and evict (clflushopt); measurement only (default: 0)");
++
++#define TBSTREAM_TX_FRAME_MIN		256
++
++static int tx_frame_bytes_set(const char *value, const struct kernel_param *kp)
++{
++	unsigned int bytes;
++	int ret;
++
++	ret = kstrtouint(value, 0, &bytes);
++	if (ret)
++		return ret;
++	if (bytes && (bytes < TBSTREAM_TX_FRAME_MIN || bytes > TB_MAX_FRAME_SIZE ||
++		      bytes % 64))
++		return -EINVAL;
++	return param_set_uint(value, kp);
++}
++
++static const struct kernel_param_ops tx_frame_bytes_ops = {
++	.set = tx_frame_bytes_set,
++	.get = param_get_uint,
++};
++
++static unsigned int tx_frame_bytes;
++module_param_cb(tx_frame_bytes, &tx_frame_bytes_ops, &tx_frame_bytes, 0644);
++MODULE_PARM_DESC(tx_frame_bytes,
++		 "Payload bytes per TX frame of host streams opened afterwards, 256..4096 in steps of 64; the receiver accepts any frame size (default: 0 = 4096)");
++
++static bool tx_no_snoop;
++module_param(tx_no_snoop, bool, 0644);
++MODULE_PARM_DESC(tx_no_snoop,
++		 "Host streams opened afterwards set PCIe No Snoop on their TX ring; needs tx_copy 1 or 3 (open fails with EINVAL otherwise); experimental, measurement only (default: false)");
++
+ static int latency_qos_us = -1;
+ module_param(latency_qos_us, int, 0644);
+ MODULE_PARM_DESC(latency_qos_us,
+@@ -977,6 +1051,38 @@ static int tbstream_dev_alloc_tx_buffers(struct tbstream_dev *sdev)
+ 	return 0;
+ }
+ 
++static inline size_t tbstream_tx_frame_bytes(const struct tbstream_dev *sdev)
++{
++	return sdev->tx_frame_bytes ?: TB_MAX_FRAME_SIZE;
++}
++
++static size_t tbstream_tx_fill(struct tbstream_dev *sdev, struct tbstream_frame *sf,
++			       size_t size, struct iov_iter *from)
++{
++	void *buf = page_address(sf->page);
++	size_t copied;
++
++	switch (sdev->tx_copy) {
++	case TBSTREAM_TX_COPY_NOCACHE:
++		copied = _copy_from_iter_flushcache(buf, size, from);
++		/* Non-temporal stores are weakly ordered: drain them before the doorbell */
++		wmb();
++		return copied;
++#ifdef CONFIG_X86
++	case TBSTREAM_TX_COPY_CLWB:
++		copied = copy_page_from_iter(sf->page, 0, size, from);
++		arch_wb_cache_pmem(buf, copied);
++		return copied;
++	case TBSTREAM_TX_COPY_FLUSH:
++		copied = copy_page_from_iter(sf->page, 0, size, from);
++		clflush_cache_range(buf, copied);
++		return copied;
++#endif
++	default:
++		return copy_page_from_iter(sf->page, 0, size, from);
++	}
++}
++
+ static struct tbstream_frame *
+ tbstream_dev_alloc_tx(struct tbstream_dev *sdev, enum tbstream_frame_pdf pdf,
+ 		      struct iov_iter *from, size_t size)
+@@ -998,7 +1104,7 @@ tbstream_dev_alloc_tx(struct tbstream_dev *sdev, enum tbstream_frame_pdf pdf,
+ 	dma_sync_single_for_cpu(dma_dev, sf->frame.buffer_phy, size,
+ 				DMA_TO_DEVICE);
+ 	if (pdf == TBSTREAM_DATA) {
+-		size_t copied = copy_page_from_iter(sf->page, 0, size, from);
++		size_t copied = tbstream_tx_fill(sdev, sf, size, from);
+ 
+ 		if (copied != size) {
+ 			/* Not sent: the caller reports only what was */
+@@ -1043,7 +1149,7 @@ static ssize_t tbstream_dev_send_data_batch(struct tbstream_dev *sdev,
+ 
+ 	while (iov_iter_count(from) && count < sdev->tx_submit_batch) {
+ 		struct tbstream_frame *sf;
+-		size_t size = min(iov_iter_count(from), TB_MAX_FRAME_SIZE);
++		size_t size = min_t(size_t, iov_iter_count(from), tbstream_tx_frame_bytes(sdev));
+ 
+ 		sf = tbstream_dev_alloc_tx(sdev, TBSTREAM_DATA, from, size);
+ 		if (IS_ERR(sf)) {
+@@ -1168,7 +1274,20 @@ static int tbstream_dev_start(struct tbstream_dev *sdev)
+ 	sdev->rx_poll_pending = false;
+ 	sdev->rx_poll_next = 0;
+ 	sdev->rx_failed = false;
++	sdev->tx_copy = READ_ONCE(tx_copy);
++	sdev->tx_frame_bytes = READ_ONCE(tx_frame_bytes);
++	if (READ_ONCE(tx_no_snoop)) {
++		if (sdev->tx_copy != TBSTREAM_TX_COPY_NOCACHE &&
++		    sdev->tx_copy != TBSTREAM_TX_COPY_FLUSH) {
++			pr_warn_ratelimited("%s: tx_no_snoop needs tx_copy 1 or 3\n",
++					    sdev->misc.name);
++			ret = -EINVAL;
++			goto err_report;
++		}
++		flags |= RING_FLAG_NO_SNOOP;
++	}
+ 	ring = tb_ring_alloc_tx(xd->tb->nhi, -1, sdev->ring_size, flags);
++	flags &= ~RING_FLAG_NO_SNOOP;
+ 	if (!ring) {
+ 		ret = -ENOMEM;
+ 		goto err_report;
+@@ -1667,7 +1786,7 @@ tbstream_dev_fops_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ 			}
+ 			ret = sent;
+ 		} else {
+-			size = min(iov_iter_count(from), TB_MAX_FRAME_SIZE);
++			size = min_t(size_t, iov_iter_count(from), tbstream_tx_frame_bytes(sdev));
+ 			ret = tbstream_dev_send_data(sdev, from, size);
+ 		}
+ 		if (ret) {
+diff --git a/include/linux/thunderbolt.h b/include/linux/thunderbolt.h
+--- a/include/linux/thunderbolt.h
++++ b/include/linux/thunderbolt.h
+@@ -702,6 +702,12 @@ struct tb_ring {
+ #define RING_FLAG_E2E		BIT(2)
+ /* Do not enable interrupt for the ring */
+ #define RING_FLAG_NO_INTERRUPT	BIT(3)
++/*
++ * Set the ring's PCIe No Snoop option. Only for frame buffers the caller
++ * keeps out of the CPU caches. Whether the controller also fetches the
++ * descriptors without snooping is not documented: experimental.
++ */
++#define RING_FLAG_NO_SNOOP	BIT(4)
+ 
+ struct ring_frame;
+ typedef void (*ring_cb)(struct tb_ring *, struct ring_frame *, bool canceled);

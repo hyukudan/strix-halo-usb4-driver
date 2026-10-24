@@ -10,6 +10,10 @@
 // START_GATE: optional file; prints READY after open, then waits at most30s for
 // it to exist before starting the transfer clock. No gate preserves old behavior.
 // USB4_BENCH_NONBLOCK=1: opt-in bounded read/write retry loops, without poll().
+// USB4_BENCH_EAGAIN_PAUSE_NS=N (with NONBLOCK, 1..100000): spin N ns after each
+// EAGAIN before the next call (diagnostic: lower descriptor poll rate). Unset = old loop.
+// Compile with USB4_BENCH_DIAGNOSTIC for syscall counters/histogram; that
+// separate binary is diagnostic only. Default builds have no counter writes.
 // 2 usage, 3 alloc, 4 open, 5 I/O error, 6 early EOF, 7 bad chunks, 8 gate error.
 // docs/BENCHMARKS.md describes a complete, reproducible measurement.
 #define _POSIX_C_SOURCE 200809L
@@ -34,6 +38,8 @@ int main(int argc,char **argv){
  if(argc!=6&&argc!=7){fprintf(stderr,"usage: bench send|recv device bytes block_bytes verify [start_gate]\n");return 2;}
  int send=!strcmp(argv[1],"send"),verify=atoi(argv[5]);
  const char *nb=getenv("USB4_BENCH_NONBLOCK");int nonblock=nb&&!strcmp(nb,"1");
+ const char *pz=getenv("USB4_BENCH_EAGAIN_PAUSE_NS");long pause_ns=pz?strtol(pz,0,10):0;
+ if(pz&&(pause_ns<1||pause_ns>100000||!nonblock)){fprintf(stderr,"USB4_BENCH_EAGAIN_PAUSE_NS needs NONBLOCK and 1..100000\n");return 2;}
  uint64_t total=strtoull(argv[3],0,0),done=0,first=0,errors=0;
  size_t block=strtoul(argv[4],0,0);if(!block||block>(64u<<20)||!total)return 2;
  unsigned char *buf=malloc(block),*pattern=malloc(block+256);if(!buf||!pattern)return 3;
@@ -50,6 +56,9 @@ int main(int argc,char **argv){
  double start=now(),cpu_start=(double)clock()/CLOCKS_PER_SEC;
  double progress_deadline=start+20;
  uint64_t prepared_base=UINT64_MAX;size_t prepared_size=0;
+#ifdef USB4_BENCH_DIAGNOSTIC
+ uint64_t io_calls=0,io_eagain=0,io_eintr=0,io_positive=0,io_short=0,io_bytes=0,io_bins[6]={0};
+#endif
  while(done<total){
   size_t want=total-done<block?(size_t)(total-done):block;
   size_t pos=(size_t)(done%block);
@@ -59,6 +68,14 @@ int main(int argc,char **argv){
    want=prepared_size-pos;
   }
   ssize_t n=send?write(fd,pattern+pos,want):read(fd,buf,want);
+#ifdef USB4_BENCH_DIAGNOSTIC
+  io_calls++;
+  if(n<0){if(errno==EAGAIN)io_eagain++;else if(errno==EINTR)io_eintr++;}
+  if(n>0){
+   unsigned int bin=n<=4096?0:n<=16384?1:n<=65536?2:n<=262144?3:n<=1048576?4:5;
+   io_positive++;io_bytes+=(uint64_t)n;io_short+=(size_t)n<want;io_bins[bin]++;
+  }
+#endif
   if(n<0){
    if(errno==EINTR)continue;
    if(nonblock&&errno==EAGAIN){
@@ -66,6 +83,11 @@ int main(int argc,char **argv){
 #if defined(__x86_64__)
     __asm__ __volatile__("pause");
 #endif
+    if(pause_ns){double until=now()+pause_ns*1e-9;while(now()<until){
+#if defined(__x86_64__)
+     __asm__ __volatile__("pause");
+#endif
+    }}
     continue;
    }
    perror("transfer");return 5;
@@ -77,6 +99,12 @@ int main(int argc,char **argv){
   if(!send&&!first){first=(uint64_t)n;start=now();cpu_start=(double)clock()/CLOCKS_PER_SEC;}
  }
  double end=now(),elapsed=end-start,cpu=(double)clock()/CLOCKS_PER_SEC-cpu_start;
- printf("{\"mode\":\"%s\",\"bytes\":%llu,\"seconds\":%.6f,\"gbps\":%.6f,\"cpu_seconds\":%.6f,\"verification\":%d,\"bad_chunks\":%llu,\"start_monotonic\":%.9f,\"end_monotonic\":%.9f,\"first_bytes_excluded\":%llu}\n",argv[1],(unsigned long long)done,elapsed,(done-first)*8e-9/elapsed,cpu,verify,(unsigned long long)errors,start,end,(unsigned long long)first);
+ printf("{\"mode\":\"%s\",\"bytes\":%llu,\"seconds\":%.6f,\"gbps\":%.6f,\"cpu_seconds\":%.6f,\"verification\":%d,\"bad_chunks\":%llu,\"start_monotonic\":%.9f,\"end_monotonic\":%.9f,\"first_bytes_excluded\":%llu",argv[1],(unsigned long long)done,elapsed,(done-first)*8e-9/elapsed,cpu,verify,(unsigned long long)errors,start,end,(unsigned long long)first);
+#ifdef USB4_BENCH_DIAGNOSTIC
+ printf(",\"io_stats\":{\"scope\":\"complete transfer including first bytes\",\"calls\":%llu,\"eagain\":%llu,\"eintr\":%llu,\"positive\":%llu,\"short\":%llu,\"bytes\":%llu,\"bytes_le_4k_16k_64k_256k_1m_over_1m\":[",(unsigned long long)io_calls,(unsigned long long)io_eagain,(unsigned long long)io_eintr,(unsigned long long)io_positive,(unsigned long long)io_short,(unsigned long long)io_bytes);
+ for(unsigned int i=0;i<6;i++)printf("%s%llu",i?",":"",(unsigned long long)io_bins[i]);
+ printf("]}");
+#endif
+ puts("}");
  close(fd);free(buf);free(pattern);return errors?7:0;
 }
