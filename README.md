@@ -27,8 +27,39 @@ top of them and have not run on hardware yet. `overlay/` is an immutable capture
 of the original source (pristine + 0001) and is *not* the current driver on its
 own. Changes per release: [CHANGELOG.md](CHANGELOG.md).
 
+## Highlights
+
+- **~37 Gb/s per direction** sustained over two USB4 40 Gb/s cables with four
+  parallel streams, both directions at once; ~34 Gb/s inside the inference
+  engine for large pipelined transfers
+  ([Measured performance](#measured-performance)).
+- **GPU-to-GPU DMA:** the USB4 controller reads and writes iGPU memory directly
+  through imported DMA-BUFs. No CPU copy, every byte verified.
+- **Path chosen per message class:** per-layer decode exchanges, speculative
+  verify windows, batched decode and prefill activations each take the host or
+  GPU-direct path that is fastest for their size
+  ([Routing per message class](#routing-per-message-class)).
+- **Low latency when needed:** NAPI-style hybrid RX completion, busy polling
+  and per-stream IRQ placement; 8.35 µs round trip for 64 B with interrupts on.
+- **Built for real inference schedules** (measured with the engine's exchange
+  module on two-node token replays, exact outputs):
+  - MiniMax-class decode: exchange overhead **2.91 → 1.89 ms per token
+    (−35 %)** with deferred checksums, an in-kernel GPU wait and
+    producer-published buffers;
+  - eight concurrent users: exchange time per step **12.55 → 7.71 ms (−38 %)**;
+    one host poller plus a device gate replaced per-stream polling
+    (17.80 → 7.80 ms at that point);
+  - receive buffers posted ahead: long stalls go from **9–15 per 3,000
+    exchanges to none**.
+- **Exact by design:** no lossy compression on the wire; models produce the
+  same tokens as without the interconnect.
+- **Fail-closed lifecycle:** controller group reset and recovery, live session
+  recovery, bounded teardown that revokes DMA before releasing a GPU context,
+  and an audited patch series ([Verification](#verification)).
+
 ## Contents
 
+- [Highlights](#highlights)
 - [Status](#status)
 - [Tested hardware](#tested-hardware)
 - [Architecture](#architecture)
