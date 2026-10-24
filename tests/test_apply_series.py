@@ -76,6 +76,27 @@ class ApplySeriesTests(unittest.TestCase):
         self.assertEqual(self.run_script('--with-backports').returncode, 0)
         self.assertEqual(self.contents(), ['new', 'new', 'bp'])
 
+    def test_experimental_is_opt_in(self):
+        self.patches.pop('0003-c.patch')
+        self.write()
+        experimental = self.repo / 'patches/experimental'
+        experimental.mkdir()
+        (experimental / '0003-c.patch').write_text(patch('c.c', 'old', 'exp'))
+        (experimental / 'series').write_text('# on top of patches/series\n0003-c.patch\n')
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertEqual(self.contents(), ['new', 'new', 'old'])
+        for name in ('a.c', 'b.c', 'c.c'):
+            (self.kernel / name).write_text('old\n')
+        result = self.run_script('--with-experimental')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('applied 3 patch(es)', result.stdout)
+        self.assertEqual(self.contents(), ['new', 'new', 'exp'])
+        for name in ('a.c', 'b.c', 'c.c'):
+            (self.kernel / name).write_text('old\n')
+        (experimental / 'series').write_text('0003-c.patch\n../0001-a.patch\n')
+        self.assertEqual(self.run_script('--with-experimental').returncode, 1)
+        self.assertEqual(self.contents(), ['old', 'old', 'old'])
+
     def test_usage(self):
         result = subprocess.run(['sh', str(self.repo / 'tools/apply-series.sh')],
                                 capture_output=True, text=True)

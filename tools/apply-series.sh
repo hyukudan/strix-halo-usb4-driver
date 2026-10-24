@@ -1,9 +1,10 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
-# Apply patches/series (and optionally patches/kernel-backports/) to a pristine
-# pinned Linux tree. Canonical procedure used by README.md, BUILD.md and CI.
+# Apply patches/series (and optionally patches/kernel-backports/ and the
+# experimental patches/experimental/series on top) to a pristine pinned Linux
+# tree. Canonical procedure used by README.md, BUILD.md and CI.
 #
-# usage: tools/apply-series.sh [--with-backports] KERNEL_DIR
+# usage: tools/apply-series.sh [--with-backports] [--with-experimental] KERNEL_DIR
 #
 # Fail fast: every patch is checked against the current tree before it is
 # applied and the first failure stops with a non-zero status naming the patch.
@@ -11,12 +12,17 @@
 set -eu
 
 backports=0
-if [ "${1-}" = "--with-backports" ]; then
-	backports=1
+experimental=0
+while [ $# -gt 1 ]; do
+	case $1 in
+	--with-backports) backports=1 ;;
+	--with-experimental) experimental=1 ;;
+	*) break ;;
+	esac
 	shift
-fi
+done
 if [ $# -ne 1 ] || [ ! -d "$1" ]; then
-	echo "usage: $0 [--with-backports] KERNEL_DIR" >&2
+	echo "usage: $0 [--with-backports] [--with-experimental] KERNEL_DIR" >&2
 	exit 2
 fi
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -30,21 +36,28 @@ export GIT_CEILING_DIRECTORIES
 # Validate the whole list before touching the tree.
 list=$(mktemp)
 trap 'rm -f "$list"' EXIT
-while IFS= read -r patch || [ -n "$patch" ]; do
-	case $patch in
-	'' | '#'*) continue ;;
-	*/* | .*) echo "apply-series: unsafe series entry: $patch" >&2; exit 1 ;;
-	esac
-	if [ ! -f "$repo/patches/$patch" ] || [ -L "$repo/patches/$patch" ]; then
-		echo "apply-series: missing or symlinked patch: $patch" >&2
-		exit 1
-	fi
-	printf '%s\n' "$repo/patches/$patch" >> "$list"
-done < "$repo/patches/series"
+add_series() {
+	while IFS= read -r patch || [ -n "$patch" ]; do
+		case $patch in
+		'' | '#'*) continue ;;
+		*/* | .*) echo "apply-series: unsafe series entry: $patch" >&2; exit 1 ;;
+		esac
+		if [ ! -f "$1/$patch" ] || [ -L "$1/$patch" ]; then
+			echo "apply-series: missing or symlinked patch: $patch" >&2
+			exit 1
+		fi
+		printf '%s\n' "$1/$patch" >> "$list"
+	done < "$1/series"
+}
+add_series "$repo/patches"
 if [ "$backports" -eq 1 ]; then
 	for patch in "$repo"/patches/kernel-backports/*.patch; do
 		[ -f "$patch" ] && printf '%s\n' "$patch" >> "$list"
 	done
+fi
+# Experimental patches are not part of the default install path.
+if [ "$experimental" -eq 1 ]; then
+	add_series "$repo/patches/experimental"
 fi
 
 count=0

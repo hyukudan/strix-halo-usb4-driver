@@ -88,6 +88,22 @@ def audit_series(repo: Path) -> list[Path]:
     return result
 
 
+def experimental_series(repo: Path) -> list[Path]:
+    """patches/experimental/series: regular files in that directory, in order."""
+    directory = repo / 'patches/experimental'
+    result = []
+    for name in (directory / 'series').read_text().splitlines():
+        if not name or name.startswith('#'):
+            continue
+        if Path(name).name != name or not name.endswith('.patch'):
+            raise ValueError(f'Invalid patch name: {name}')
+        patch = directory / name
+        if patch.is_symlink() or not patch.is_file():
+            raise ValueError(f'Missing or symlinked patch: {name}')
+        result.append(patch)
+    return result
+
+
 def copy_additional_base(repo: Path, tree: Path) -> None:
     """Add hash-pinned upstream files absent from the immutable capture.
 
@@ -183,7 +199,8 @@ def copy_external_base(repo: Path, tree: Path, kernel_source: Path | None) -> No
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
 
-def materialize(output: Path, repo: Path = REPO, kernel_source: Path | None = None) -> None:
+def materialize(output: Path, repo: Path = REPO, kernel_source: Path | None = None,
+                experimental: bool = False) -> None:
     repo = repo.resolve()
     output = output.resolve()
     if kernel_source is None and os.environ.get('USB4_KERNEL_SOURCE'):
@@ -192,6 +209,8 @@ def materialize(output: Path, repo: Path = REPO, kernel_source: Path | None = No
         raise ValueError(f"Refusing to overwrite {output}")
     manifest = json.loads((repo / 'provenance/source-manifest.json').read_text())
     patches = audit_series(repo)
+    if experimental:
+        patches += experimental_series(repo)
     original = repo / 'patches/0001-usb4-current-source.patch'
     if hashlib.sha256(original.read_bytes()).hexdigest() != manifest['combined_patch_sha256']:
         raise ValueError('Original combined patch hash mismatch')
@@ -217,8 +236,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path, help='New, non-existing directory')
     parser.add_argument('--kernel-source', type=Path, help='Pinned upstream kernel files absent from the capture; never modified')
+    parser.add_argument('--experimental', action='store_true',
+                        help='Also apply patches/experimental/series on top of the stable series')
     args = parser.parse_args()
     try:
-        materialize(args.output, kernel_source=args.kernel_source)
+        materialize(args.output, kernel_source=args.kernel_source, experimental=args.experimental)
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f'{exc}\n')

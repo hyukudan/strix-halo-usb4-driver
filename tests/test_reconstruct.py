@@ -100,5 +100,22 @@ class ReconstructionTests(unittest.TestCase):
         (self.repo / 'patches/series').write_text('0001-usb4-current-source.patch\n0002-test.patch\n')
         prepare.materialize(self.output, self.repo)
 
+    def test_experimental_series_is_opt_in(self):
+        experimental = self.repo / 'patches/experimental'
+        experimental.mkdir()
+        (experimental / '0003-exp.patch').write_text(
+            'diff --git a/drivers/example.c b/drivers/example.c\n'
+            '--- a/drivers/example.c\n+++ b/drivers/example.c\n'
+            '@@ -1 +1 @@\n-new\n+exp\n')
+        (experimental / 'series').write_text('# on top of patches/series\n0003-exp.patch\n')
+        prepare.materialize(self.output, self.repo)
+        self.assertEqual((self.output / 'drivers/example.c').read_bytes(), b'new\n')
+        other = self.repo / 'experimental-overlay'
+        prepare.materialize(other, self.repo, experimental=True)
+        self.assertEqual((other / 'drivers/example.c').read_bytes(), b'exp\n')
+        (experimental / 'series').write_text('../0002-test.patch\n')
+        with self.assertRaisesRegex(ValueError, 'Invalid patch name'):
+            prepare.materialize(self.repo / 'third', self.repo, experimental=True)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
