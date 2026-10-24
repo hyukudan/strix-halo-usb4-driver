@@ -27,6 +27,21 @@ top of them and have not run on hardware yet. `overlay/` is an immutable capture
 of the original source (pristine + 0001) and is *not* the current driver on its
 own. Changes per release: [CHANGELOG.md](CHANGELOG.md).
 
+## At a glance
+
+**Purpose:** Connect two AMD Strix Halo Linux machines with low-overhead USB4 data exchange for distributed inference. This is a **research kernel patch series**, not a generic USB4 replacement driver or a plug-and-play networking product.
+
+| Question | Answer |
+|---|---|
+| What does it provide? | USB4 stream character devices, an experimental DMA-BUF GPU-direct path, and AMD USB4 controller lifecycle/recovery fixes. |
+| What does it replace? | The inference application's bulk/activation exchange path in the tested topology; it does **not** turn two GPUs into a single shared-memory GPU. |
+| Where was it tested? | One physical pair of Ryzen AI Max+ 395 machines, with the exact kernel baseline and cable conditions described below. |
+| Is it upstream? | No. The patches are out of tree and tied to a specific Linux commit. |
+| Which patches are installed by default? | Only [the stable series](patches/series); patches under [experimental](patches/experimental/) must not be treated as hardware-qualified. |
+| How do I reproduce it safely? | Read [Deployment and safety](#deployment-and-safety), then [Install and test](docs/INSTALL-AND-TEST.md) and [Benchmarks](docs/BENCHMARKS.md). |
+
+**Reading the measurements:** Bulk throughput, a single GPU-direct ring, small-message latency and end-to-end inference exchange overhead measure **different workloads**. Do not compare them as if they were one interchangeable benchmark. Where a measurement is not yet available, no result is implied. Figures apply to the stated hardware, stream count, directionality and driver configuration—not arbitrary USB4 PCs.
+
 ## Highlights
 
 - **~37 Gb/s per direction** sustained over two USB4 40 Gb/s cables with four
