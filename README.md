@@ -585,6 +585,25 @@ Diagnostics: `python3 tools/usb4_diagnose.py --logs` on both hosts (as root, add
 `python3 tools/lab/usb4stream_describe.py --logs --summary` for the cable
 topology.
 
+### Link status collector
+
+`python3 tools/usb4_linkstat.py [--journal] [--cursor CURSOR]` prints one JSON
+document per host for monitoring, without root and without touching a stream:
+trained speed and lanes per direction of every link with a flag below the Gen3
+x2 full rate (20 Gb/s per lane, two lanes), the published layout's streams with
+their configured mode and two live checks (device node present, service bound
+to `thunderbolt_stream`), the readable module parameters (write-only ones are
+listed, never opened), the interrupt counts of each host interface split into
+control and data vectors, and, with `--journal`, kernel evidence lines of the
+running boot (host interface reset, reset pending, quarantine, leaked rings,
+retained contexts, hop deactivation failures, CLOSE not sent) counted per kind.
+Pass the report's `cursor` back with `--cursor` to read only newer entries; the
+tool continues only from that exact entry and otherwise rescans the boot.
+Stream devices are only `lstat()`ed, configfs and debugfs are never read, every
+read is bounded and the run has one deadline (`--deadline`, 5 s).
+`--self-check` verifies the parsers against a synthetic tree; `--root DIR`
+reads an offline copy of `/sys`, `/proc` and `/run`.
+
 ## Limitations
 
 - **Host-memory bandwidth is bounded per ring**, not by the link: 9–12 Gb/s per
@@ -635,7 +654,7 @@ topology.
 | `base/` | Hash-pinned upstream files that the capture did not include |
 | `provenance/` | Source manifests, pinned hashes, reference patch |
 | `config/usb4-gpu.fragment` | Kconfig options needed by the driver |
-| `tools/` | `apply-series.sh`, `prepare_overlay.py`, `validate_native.py`, `update_validation_manifest.py`, `check_kconfig.py`, `check_build_log.py`, `usb4_diagnose.py`, `pingpong.c` (latency), `stream_mem_bench.c` (bandwidth) |
+| `tools/` | `apply-series.sh`, `prepare_overlay.py`, `validate_native.py`, `update_validation_manifest.py`, `check_kconfig.py`, `check_build_log.py`, `usb4_diagnose.py`, `usb4_linkstat.py` (read-only link status JSON), `pingpong.c` (latency), `stream_mem_bench.c` (bandwidth) |
 | `tools/lab/` | Stream setup service, USB4NET modprobe policy, topology report (`usb4stream_describe.py`) and its hotplug refresh, multi-stream bandwidth runner |
 | `tests/` | Offline regression tests |
 | `docs/` | Design and fix reports per patch range |
