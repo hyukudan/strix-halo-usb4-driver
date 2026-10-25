@@ -119,6 +119,16 @@ class LinkstatTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             linkstat.main(['--cursor', 'bad cursor\n'])
 
+    def test_printed_output_never_exceeds_the_cap(self):
+        big = {'schema': 'usb4-linkstat-v1', 'links': [],
+               'journal': {'recent': [{'ts': 1.0, 'kind': 'host_reset', 'message': 'x' * 200}] * 2000}}
+        with mock.patch.object(linkstat.Collector, 'collect', lambda self, payload: linkstat.cap(big)):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                linkstat.main(['--root', self.root])
+        self.assertLessEqual(len(out.getvalue()), linkstat.MAX_OUTPUT)
+        self.assertTrue(json.loads(out.getvalue())['truncated'])
+
     def test_stream_devices_and_configfs_are_never_opened(self):
         write(self.root, '/run/usb4stream-layout.json', json.dumps({
             '0-2.0/data0': {'device': '/sys/kernel/config/x', 'index': 0, 'config': {'gpu_timing': 'none'}},
