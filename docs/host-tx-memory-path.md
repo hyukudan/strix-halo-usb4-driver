@@ -36,7 +36,43 @@ Risks:
   driver or reboot if a ring stalls. It has no effect if the NHI's PCIe
   `DevCtl.EnNoSnoop` is clear.
 
-Status: built and CPU-tested only; not installed or measured on hardware. The
-measurement session (each `tx_copy` mode and frame size against the default,
-interleaved A/B/A x3 in both directions on one Gen3 ring, with read-only ring
-captures) is under review and has not run. `tx_no_snoop` is excluded from it.
+Status: experimental; measured on hardware on 2026-10-25. The measurement
+plan was executed for the copy modes and frame sizes below, except
+`tx_no_snoop`, which was not measured (needs the core flag). One host stream,
+one Gen3 host ring, machine A → machine B, with 0001–0048 + experimental 0051
+loaded only for the measurement window; the stable 0001–0048 module was
+restored afterwards. Every arm used A/B/A × 3 against the default (cached
+copy, 4096-byte TX frames), with bytes verified. Medians:
+
+| Arm | Send Gb/s | Ratio vs default | Receive ratio |
+|---|---|---|---|
+| Default (`tx_copy=0`, 4096-byte frames) | 9.18 (18 runs, 9.15–9.33) | 1 | 1 (9.12 Gb/s) |
+| `tx_copy` non-temporal | 7.79 | 0.850 | 0.854 |
+| `tx_copy` write back (`clwb`) | 9.09 | 0.992 | — |
+| `tx_copy` write back and evict (`clflushopt`) | 7.78 | 0.849 | 0.862 |
+| `tx_frame_bytes=1024` | 10.00 | 1.085 | — |
+| `tx_frame_bytes=2048` | 9.70 | 1.052 | — |
+| Default on the Gen2 cable | 8.95 | 0.999 vs its own default | — |
+| Default, both rings of one Gen3 cable at once | 20.98 (2 × 10.5) | — | — |
+
+A live register capture during the default send showed the sender's TX ring
+always full (p50 1021 of 1024 frames posted, never empty) and the receiver
+always supplied (p50 1022 of 1023 RX descriptors posted).
+
+One host Gen3 ring: 9.18 Gb/s send; non-temporal copy / `clflushopt` −15 %
+(the controller reads cached payload lines faster than DRAM), `clwb` −0.8 %;
+1024-byte TX frames +8.5 %, 2048 +5.2 % on one ring, send only: a candidate,
+not a default. The sender's TX ring stays full, so the per-ring limit is the
+controller's TX read path, not software or the receiver. The earlier per-ring
+gains of contiguous buffers (0045) and GPU-direct rings (~12.1 Gb/s) are
+consistent with this (less read latency per frame), but were measured on other
+days.
+
+Decisions:
+
+* `tx_copy` 1 and 3 stay off: inherently slower reads from DRAM.
+* `tx_copy` 2 stays off (neutral); `tx_copy` 0 stays the default.
+* `tx_frame_bytes` 1024/2048 is a candidate, not a default. Still to measure:
+  receive direction, four streams at once, the engines' message sizes and
+  interaction with `contig_buffers`.
+* `tx_no_snoop` is not measured (needs the core flag). 0051 stays experimental.

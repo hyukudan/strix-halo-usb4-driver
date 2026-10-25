@@ -23,7 +23,8 @@ The series applies to Linux `72d3fcf802c45d00b300f25b848a93c3a2bd7c7e`
 (**7.3-rc5**). The **48 stable patches** in [`patches/series`](patches/series)
 (0001–0048) are the driver and the default install path. Three **experimental**
 patches in [`patches/experimental/`](patches/experimental/) (0049–0051) apply on
-top of them and have not run on hardware yet. `overlay/` is an immutable capture
+top of them. Only 0051 has been measured on hardware, during one measurement
+window; the stable module was restored afterwards. `overlay/` is an immutable capture
 of the original source (pristine + 0001) and is *not* the current driver on its
 own. Changes per release: [CHANGELOG.md](CHANGELOG.md).
 
@@ -107,14 +108,14 @@ Use the complete [install-and-test guide](docs/INSTALL-AND-TEST.md) for stream s
 
 ## Status
 
-As of 2026-10-24.
+As of 2026-10-25.
 
 | Part | Patches | Status | On hardware |
 |---|---|---|---|
 | Stable series | 0001–0048, [`patches/series`](patches/series) | **Stable**, default install path. 0047 and 0048 are opt-in and off by default | The `thunderbolt_stream` module loaded on both lab machines since 2026-10-23 is the 0001–0048 build: rebuilding this tree reproduces its srcversion `3A05C2B1A13ABAEF9B767EF` |
 | Bounded RX poll window | 0049, [`patches/experimental/`](patches/experimental/) | **Experimental** | Built (core and stream modules together) and CPU-tested; not installed, not measured |
 | Paced RX descriptor polls | 0050, same directory | **Experimental** | Built (stream module) and CPU-tested; not installed, not measured |
-| TX memory-path experiments | 0051, same directory | **Experimental, under review** | Built (stream module) and CPU-tested; its hardware measurement plan is under review. No results yet |
+| TX memory-path experiments | 0051, same directory | **Experimental** | Measured 2026-10-25 on one Gen3 host ring: cache-bypassing copies −15 %, 1024-byte TX frames +8.5 % (send only, a candidate, not a default); not installed by default |
 
 What each experimental patch still needs is listed under
 [Experimental patches](#experimental-patches).
@@ -252,10 +253,12 @@ receiver, without CPU latency QoS unless stated. Their raw logs are not in this
 repository; [docs/BENCHMARKS.md](docs/BENCHMARKS.md) lists what a reproducible
 measurement must record. Do not mix percentiles of different runs.
 
-### Current figures, stable series
+### Current figures
 
 Both machines, `thunderbolt_stream` 0001–0048, four host streams (one per data
 ring: cable A trained Gen3 × 2, cable B Gen2 × 2), every byte verified.
+The 0051 row used 0001–0048 + experimental 0051 for one measurement window;
+the stable module was restored afterwards.
 
 | Measurement | Date and conditions | Result |
 |---|---|---|
@@ -263,6 +266,7 @@ ring: cable A trained Gen3 × 2, cable B Gen2 × 2), every byte verified.
 | One Gen3 host ring, interrupt RX, `contig_buffers=3` | 2026-10-23, long transfers, sender and receiver pinned | **12.11–12.23 Gb/s** |
 | Same ring, RX-only polling (0047 `rx_busy_poll=1`) | 2026-10-23, same session | 11.17–11.21 Gb/s (−7 to −9 %, receiver side only) |
 | 0048 batch budgets (RX 64, or RX and TX 64) | 2026-10-23, four streams, `contig_buffers=3`, sum of the per-stream rates | unchanged: 42.62 Gb/s with and without |
+| One Gen3 host ring, TX memory-path experiments (0051) | 2026-10-25, one stream, A/B/A × 3 | Default 9.18 Gb/s send; non-temporal or evicting copy −15 %; `clwb` −0.8 %; 1024-byte frames 10.00 Gb/s (+8.5 %), 2048-byte +5.2 % (send only, a candidate, not a default); sender TX ring always full |
 
 Through both cables with both directions busy, the measured common-window
 throughput is **~37 Gb/s per direction** (36.9–37.1 Gb/s, 2026-10-22, see
@@ -438,14 +442,15 @@ behaviour change.
 [`patches/experimental/series`](patches/experimental/series) lists 0049–0051.
 They apply only on top of 0001–0048 and only in this order
 (`tools/apply-series.sh --with-experimental`). Every new setting defaults to
-off, and with the defaults the code paths are unchanged. None of them has been
-installed or measured on hardware.
+off, and with the defaults the code paths are unchanged. 0049 and 0050 have not
+been installed or measured on hardware; 0051 was loaded for one measurement
+window (results in its row).
 
 | Patch | Adds | Built and tested | Still to measure |
 |---|---|---|---|
 | `0049-host-bounded-rx-poll-window` | Bounded RX polling window (poll lease): configfs `rx_window_bytes` / `rx_window_us` and BEGIN/END ioctls in the new UAPI `linux/strix_host_stream.h`. BEGIN masks one RX ring's interrupt while the reader polls; END or a hard timer (≤ 10 ms) unmasks it. Changes the core (`tb_ring` layout, new exports): core and stream modules must be rebuilt and installed together, which means a kernel change | CPU tests that run the actual core and stream functions under ASan/UBSan (51 cases). [docs/host-rx-poll-window.md](docs/host-rx-poll-window.md) | Interrupts and BEGIN/END cost per exchange; decode with one window per decode step against interrupts and against RX-only polling, with bit-exact model gates |
 | `0050-host-paced-rx-descriptor-polls` | `rx_poll_pace_ns` (0–10000): after an empty RX poll, leave the descriptor ring alone that long. Polled RX only (`busy_poll` / `rx_busy_poll`) | Stream module only; CPU tests. [docs/host-rx-poll-pace.md](docs/host-rx-poll-pace.md) | Bandwidth and latency against unpaced RX-only polling and interrupt RX, interleaved: does it recover the 7–9 % polled-mode loss, and at what latency cost |
-| `0051-host-tx-memory-path-experiments` | Module parameters `tx_copy` (cached / non-temporal / write back / write back and evict), `tx_frame_bytes` (256–4096) and `tx_no_snoop` (needs the core flag `RING_FLAG_NO_SNOOP`) | Stream module (without `tx_no_snoop`); CPU tests. [docs/host-tx-memory-path.md](docs/host-tx-memory-path.md) | **Under review.** Each copy mode and frame size against the default on one Gen3 ring, both directions, A/B/A × 3, to test whether the CPU-cache state of the TX buffers limits the 9–12 Gb/s host ring. The measurement plan is in review; `tx_no_snoop` is not part of it. No results are claimed |
+| `0051-host-tx-memory-path-experiments` | Module parameters `tx_copy` (cached / non-temporal / write back / write back and evict), `tx_frame_bytes` (256–4096) and `tx_no_snoop` (needs the core flag `RING_FLAG_NO_SNOOP`) | Stream module (without `tx_no_snoop`); CPU tests. [docs/host-tx-memory-path.md](docs/host-tx-memory-path.md) | Measured 2026-10-25, one Gen3 host ring, A/B/A × 3: default 9.18 Gb/s send; non-temporal / `clflushopt` −15 %, `clwb` −0.8 %; 1024-byte frames +8.5 %, 2048-byte +5.2 % (send only, a candidate, not a default). The sender's TX ring stayed full. `tx_copy` 1 and 3 stay off (slower reads from DRAM), 2 stays off (neutral), 0 stays the default. Still to measure for smaller frames: receive direction, four streams at once, the engines' message sizes and interaction with `contig_buffers`; `tx_no_snoop` is not measured (needs the core flag). 0051 stays experimental |
 
 Design rule throughout: a timeout, process exit, failed MMIO read or missing
 PCI device is **never** treated as proof that DMA has stopped. Memory the
@@ -465,7 +470,7 @@ cleanly on 7.3-rc5.
 | `prepare_overlay.py` vs applying the series | byte-identical |
 | Offline unit tests | see [Build and install](#build-and-install); CI runs them on every push against the stable tree and against the tree with the experimental patches. 2026-10-24: stable tree 314 run, OK (10 skipped: 9 experimental-only cases and one optional bundle check); with 0049–0051 314 run, OK (2 skipped) |
 | Modules with `W=1`, `USB4_GPU_STREAM=y` and `=n` | 0 warnings, 0 errors; `tools/check_build_log.py` makes any diagnostic in this series' files fatal |
-| On hardware | 0001–0042 has been the default kernel of both machines since 2026-10-21 (distributed inference over host streams and GPU-direct); 0001–0045 booted since 2026-10-22 with 0044/0045 off unless stated; the 0001–0048 stream module is loaded on both since 2026-10-23, with 0047/0048 off. 0049–0051: not on hardware |
+| On hardware | 0001–0042 has been the default kernel of both machines since 2026-10-21 (distributed inference over host streams and GPU-direct); 0001–0045 booted since 2026-10-22 with 0044/0045 off unless stated; the 0001–0048 stream module is loaded on both since 2026-10-23, with 0047/0048 off. 0049–0050: not on hardware; 0051 loaded for one measurement window on 2026-10-25 (stable module restored) |
 | Link negotiation | Gen3 × 2 kept across module reloads and controller resets; one port trained Gen2 (see [Limitations](#limitations)) |
 | GPU-to-GPU on hardware | one-way and full duplex with slot reuse (up to 8 operations per direction), live session recovery, controller group reset with and without USB4NET: every window verified |
 | Stream open/close stress | 80 cycles across all 4 streams and both directions, zero failures, zero kernel warnings |
@@ -515,8 +520,9 @@ make -j"$(nproc)" W=1
 ```
 
 Add `--with-experimental` to also apply 0049–0051 on top. Not for production:
-0049 changes the core module, so it needs a complete new kernel, and none of the
-three has been measured on hardware.
+0049 changes the core module, so it needs a complete new kernel. 0049 and 0050
+are not installed, not measured; 0051 was measured during one hardware window
+and stays experimental.
 
 The fragment's `LOCALVERSION` is a placeholder that `check_kconfig.py` rejects:
 every build needs its own identity under `-strix-gpu-bosgame-`, so it never
@@ -609,7 +615,10 @@ reads an offline copy of `/sys`, `/proc` and `/run`.
 - **Host-memory bandwidth is bounded per ring**, not by the link: 9–12 Gb/s per
   host ring and two data rings per NHI, so a Gen3 cable carries ~22–24 Gb/s of
   its ~37 Gb/s. A GPU-direct ring measures ~12.1 Gb/s, like a host ring with
-  contiguous buffers; two reach ~23 Gb/s together.
+  contiguous buffers; two reach ~23 Gb/s together. On 2026-10-25 the sender's
+  TX ring stayed full while one ring moved 9.2 Gb/s, smaller TX frames helped
+  and cache-bypassing copies hurt: the per-ring limit is the controller's TX
+  read path, not software or the receiver.
 - **Polled RX costs bandwidth on Gen3:** RX-only and full polling receive
   7–9 % less per Gen3 ring than interrupt RX (2026-10-23); Gen2 rings are
   link-bound and do not show it.
@@ -617,6 +626,10 @@ reads an offline copy of `/sys`, `/proc` and `/run`.
   exchange with interrupts; only busy polling (a spinning core per stream)
   removes most of it. No module setting without a global CPU latency QoS moved
   it in our measurements.
+- **RX CRC error after a DMA teardown:** after a DMA teardown on process exit,
+  the next process can see an RX CRC error at its first exchange (probe). It is
+  detected by the CRC and the run fails; no silent corruption. Seen three times
+  between 2026-10-24 and 2026-10-25; under investigation.
 - **Link training:** on the tested pair one rear port trained at Gen2 × 2,
   because that router advertised no Gen3 support for the second link; 0035 can
   retrain only when every side advertises Gen3. Check the link speed after every

@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-10-25
+
+- Tooling: `tools/usb4_linkstat.py`, a read-only link status collector printing
+  one JSON document: trained rate per direction, stream layout with live
+  checks, module parameters, ring interrupts, and kernel log evidence with a
+  per-boot cursor.
+- Experimental **0051** measured on hardware, one Gen3 host ring, A/B/A × 3:
+  default 9.18 Gb/s send; cache-bypassing copies −15 %, `clwb` neutral
+  (−0.8 %); 1024-byte TX frames +8.5 %, 2048-byte +5.2 % (send only, a
+  candidate, not a default). The sender's TX ring stayed full; the per-ring
+  limit is the controller's TX read path, not software or the receiver.
+  `tx_copy=0` stays the default; 0051 stays experimental.
+- Known issue: after a DMA teardown on process exit, the next process can see
+  an RX CRC error at its first exchange (probe). It is detected by the CRC and
+  the run fails; no silent corruption. Seen three times between 2026-10-24 and
+  2026-10-25; under investigation.
+- The stable series and the module on the lab machines are unchanged:
+  0001–0048, srcversion `3A05C2B1A13ABAEF9B767EF`. The stable module was
+  restored after the measurement window.
+
 ## 2026-10-24
 
 Stable series 0001–0048; experimental 0049–0051 in a separate directory.
