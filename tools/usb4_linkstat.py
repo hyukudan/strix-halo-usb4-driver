@@ -831,10 +831,10 @@ def self_check():
         "/proc/sys/kernel/random/boot_id": "01234567-89ab-cdef-0123-456789abcdef",
         "/sys/bus/thunderbolt/devices/0-2/rx_speed": "20.0 Gb/s", "/sys/bus/thunderbolt/devices/0-2/rx_lanes": "2",
         "/sys/bus/thunderbolt/devices/0-2/tx_speed": "20.0 Gb/s", "/sys/bus/thunderbolt/devices/0-2/tx_lanes": "2",
-        "/sys/bus/thunderbolt/devices/0-2/device_name": "peer-a",
+        "/sys/bus/thunderbolt/devices/0-2/device_name": "halo-2",
         "/sys/bus/thunderbolt/devices/1-2/rx_speed": "10.0 Gb/s", "/sys/bus/thunderbolt/devices/1-2/rx_lanes": "2",
         "/sys/bus/thunderbolt/devices/1-2/tx_speed": "10.0 Gb/s", "/sys/bus/thunderbolt/devices/1-2/tx_lanes": "2",
-        "/sys/bus/thunderbolt/devices/1-2/device_name": "peer-a",
+        "/sys/bus/thunderbolt/devices/1-2/device_name": "halo-2",
         "/sys/module/thunderbolt/parameters/dma_credits": "14",
         "/sys/module/thunderbolt_stream/parameters/spin_us": "0",
         "/proc/interrupts": "           CPU0       CPU1\n"
