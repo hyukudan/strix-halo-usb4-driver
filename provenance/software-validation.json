@@ -29,7 +29,7 @@
     "include/trace/events/thunderbolt_latency.h": "29f04bd3a152b2de09bc7b4b3376fccee9a2bc4c6ca2074e059c0599e0436a75",
     "include/uapi/linux/strix_gpu_stream.h": "6e50637e07be4197d8ae85291dff079ed32cb5d157c322650f436d3bd53f815b"
   },
-  "engine_commit": "9211b07e13c64ab80ae04fcbfcbeab50fe0cbf04",
+  "engine_commit": "15ab5060239e9aa7c0bd1fce47609a3531d2ab2d",
   "engine_files_sha256": {
     "include/strix/linux_direct_gpu_stream_uapi.h": "6e50637e07be4197d8ae85291dff079ed32cb5d157c322650f436d3bd53f815b",
     "src/linux_gpu_queue.cpp": "d930225f70bd49d9399a3fa483b0f2579ea0750cb9b59936e0147be03aed6517",
