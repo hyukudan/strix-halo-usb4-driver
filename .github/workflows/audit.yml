@@ -123,7 +123,7 @@ jobs:
     needs: unit
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    container: rocm/dev-ubuntu-24.04:latest
+    container: rocm/dev-ubuntu-24.04@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054
     steps:
       - run: apt-get update && apt-get install -y cmake ninja-build git python3
       - uses: actions/checkout@v4
