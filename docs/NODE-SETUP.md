@@ -17,6 +17,7 @@ Each node runs the same software:
 | Lab service | `usb4stream-lab.service`: loads the stream module, creates the configfs streams, writes the layout file |
 | Layout file | `/run/usb4stream-layout.json`, written by `usb4stream-describe` at boot (and after hotplug with the optional udev rule) |
 | System settings | `kho=off`, TTM `pages_limit`, the `thunderbolt_net` modprobe rule (section 4) |
+| NPU runtime (optional) | XRT userspace for the on-die XDNA NPU (section 7); nothing in the driver or the engine requires it |
 
 Run the same kernel kind and the same stream module on both nodes.
 
@@ -243,3 +244,27 @@ If a link reports 10 Gb/s per lane (Gen2) or one lane:
 3. If it stays below Gen3, see the link training note in the README [Limitations](../README.md#limitations): a
    port whose router does not advertise Gen3 cannot be retrained, and `thunderbolt.gen3_retrain` (0035, opt-in)
    only acts when every side advertises Gen3.
+
+## 7. Optional: NPU runtime (XRT)
+
+The Ryzen AI Max+ 395 also has an XDNA NPU. Its kernel driver, `amdxdna`, is part of the kernel (no DKMS
+module); with it loaded the device node `/dev/accel/accel0` is present. To run NPU programs, a node
+also needs the XRT userspace. It is optional: the USB4 driver, the stream module and the inference engine do
+not use the NPU, and a node without XRT passes every check in section 6. Install it only on nodes that will run
+NPU work (for example NPU throughput or concurrency measurements next to the GPU).
+
+Install from the Ubuntu 26.04 `universe` packages (XRT 2.21.75, about 10 MB), as root, on each node:
+
+    apt-get install -y libxrt2 libxrt-npu2 libxrt-utils libxrt-utils-npu libxrt-dev
+    printf '* soft memlock unlimited\n* hard memlock unlimited\n' > /etc/security/limits.d/99-npu-memlock.conf
+
+NPU buffers are pinned memory, hence the unlimited `memlock` limit. It applies to new login sessions: log out
+and back in (or open a new SSH session) before the check.
+
+Check, as an ordinary user:
+
+    ulimit -l            # unlimited
+    xrt-smi examine      # lists the NPU (NPU Strix Halo), its firmware version and the XRT version
+
+Remove: `apt-get remove libxrt2 libxrt-npu2 libxrt-utils libxrt-utils-npu libxrt-dev` and delete
+`/etc/security/limits.d/99-npu-memlock.conf`.

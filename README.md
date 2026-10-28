@@ -651,7 +651,7 @@ reads an offline copy of `/sys`, `/proc` and `/run`.
   the IOMMU stays on and both NHIs stay `DMA-FQ`. Measured on one node: +2.9..3.1 % on Qwen 32K prefill with
   identical tokens; it removes the GPU's own DMA containment, so it is not our default kernel. What it is, the
   trade-off, how to enable, verify and roll back: [docs/PERFOPT.md](docs/PERFOPT.md).
-- **Node setup and post-boot check:** [docs/NODE-SETUP.md](docs/NODE-SETUP.md); run `tools/lab/node_check.sh` after every boot.
+- **Node setup and post-boot check:** [docs/NODE-SETUP.md](docs/NODE-SETUP.md); run `tools/lab/node_check.sh` after every boot. The optional NPU runtime (XRT) install is in its section 7.
 - Keep a known-good boot entry and use a distinct `LOCALVERSION` for every
   build.
 - Bring up one machine first, verify both links, run the bandwidth, latency and
