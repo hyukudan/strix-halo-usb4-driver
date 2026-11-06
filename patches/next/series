@@ -4,3 +4,4 @@
 0052-stream-prime-rx-before-enabling-paths.patch
 0053-stream-transactional-hopid-ownership.patch
 0054-stream-fail-closed-rx-repost.patch
+0055-stream-no-close-after-peer-close.patch
