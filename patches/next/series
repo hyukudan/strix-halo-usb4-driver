@@ -1,0 +1,4 @@
+# Next: candidate patches on top of patches/series (0001-0048) only, in this order. Not combined with
+# experimental/ 0049-0051, which reshape tbstream_dev_start() too (a rebased variant is needed for both).
+# Not installed or measured on hardware yet: each is promoted to patches/series after its qualification turn.
+0052-stream-prime-rx-before-enabling-paths.patch
