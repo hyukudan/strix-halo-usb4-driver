@@ -3,3 +3,4 @@
 # Not installed or measured on hardware yet: each is promoted to patches/series after its qualification turn.
 0052-stream-prime-rx-before-enabling-paths.patch
 0053-stream-transactional-hopid-ownership.patch
+0054-stream-fail-closed-rx-repost.patch
