@@ -1,0 +1,531 @@
+Subject: [PATCH next 0053] thunderbolt: stream: transactional HopID ownership
+
+A stream device kept requested and owned HopIDs in the same fields:
+attach ignored allocation failures and left the requested IDs there,
+so an open could enable paths on HopIDs the device never allocated and
+detach/release then freed IDs that belonged to someone else. Replacing
+an ID released the old one before the new one was allocated, so a
+failed write left a released ID behind, and writing the ID the device
+already owned allocated it a second time and failed.
+
+Track ownership per direction (in_owned/out_owned). Acquire before
+release on every replacement and roll back a failed property update,
+treat a write of the owned ID as a no-op, publish and release only owned
+IDs, hand them to the retained GPU context when its paths are still
+pending, and refuse an open without owned IDs. Insert a new device into
+the group list and attach it under one sg->lock (the probe walks the list
+under that lock), make attach idempotent, and deregister the misc device
+only if it was registered.
+
+No data-path change.
+
+---
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -147,8 +147,11 @@
+  * @misc: Character device used for tunneling
+  * @kref: Reference count
+  * @index: Unique identifier for the character device
+- * @in_hopid: In HopID
+- * @out_hopid: Out HopID
++ * @in_hopid: In HopID (configured or published by the peer; owned only when @in_owned)
++ * @out_hopid: Out HopID (configured or published by the peer; owned only when @out_owned)
++ * @in_owned: @in_hopid is allocated on the attached XDomain by this device
++ * @out_owned: @out_hopid is allocated on the attached XDomain by this device
++ * @misc_registered: @misc was registered (item release deregisters only then)
+  * @ring_size: Size of the rings
+  * @throttling: Interrupt throttling rate in ns
+  * @busy_poll: Instead of interrupts, busy poll both rings
+@@ -203,6 +206,9 @@
+ 	int index;
+ 	int in_hopid;
+ 	int out_hopid;
++	bool in_owned;
++	bool out_owned;
++	bool misc_registered;
+ 	unsigned int ring_size;
+ 	unsigned int throttling;
+ 	bool busy_poll;
+@@ -670,9 +676,9 @@
+ 	if (sdev->stream) {
+ 		struct tb_xdomain *xd = tbstream_dev_xdomain(sdev);
+ 
+-		if (sdev->out_hopid > 0)
++		if (sdev->out_owned)
+ 			tb_xdomain_release_out_hopid(xd, sdev->out_hopid);
+-		if (sdev->in_hopid > 0)
++		if (sdev->in_owned)
+ 			tb_xdomain_release_in_hopid(xd, sdev->in_hopid);
+ 
+ 		tbstream_put(sdev->stream);
+@@ -714,7 +720,8 @@
+ 	lockdep_assert_held(&sdev->lock);
+ 	if (!tbstream_valid(stream))
+ 		return -ENXIO;
+-	if (sdev->in_hopid <= 0 || sdev->out_hopid <= 0)
++	if (sdev->in_hopid <= 0 || sdev->out_hopid <= 0 ||
++	    !sdev->in_owned || !sdev->out_owned)
+ 		return -EINVAL;
+ 	return 0;
+ }
+@@ -848,7 +855,7 @@
+ static char fault_at[32];
+ module_param_string(fault_at, fault_at, sizeof(fault_at), 0644);
+ MODULE_PARM_DESC(fault_at,
+-		 "TEST BUILD ONLY: fail this step of the stream start: tx_ring, tx_buffers, rx_ring, rx_buffers, rx_post, enable_paths");
++		 "TEST BUILD ONLY: fail this step: stream start tx_ring, tx_buffers, rx_ring, rx_buffers, rx_post, enable_paths; HopID hopid_in, hopid_out (allocation), hopid_props (publication of a HopID write); properties props_root, props_dir, props_in, props_out, props_add (construction), props_incomplete (install a directory without outhopid); device misc_name, misc_register");
+ 
+ static int tbstream_fault(const char *step)
+ {
+@@ -2162,8 +2169,10 @@
+ static int service_update_properties(struct tb_service *svc, const char *name,
+ 				     int in_hopid, int out_hopid)
+ {
+-	struct tb_property_dir *dir;
+-	struct tb_property *p;
++	struct tb_property_dir *dir, *root = NULL;
++	struct tb_property *p = NULL, *pin, *pout;
++	uuid_t uuid;
++	int ret;
+ 
+ 	guard(mutex)(&svc->lock);
+ 
+@@ -2172,88 +2181,90 @@
+ 		return 0;
+ 	}
+ 
++	if (svc->local_properties)
++		p = tb_property_find(svc->local_properties, name,
++				     TB_PROPERTY_TYPE_DIRECTORY);
++	if (p) {
++		pin = tb_property_find(p->value.dir, "inhopid", TB_PROPERTY_TYPE_VALUE);
++		pout = tb_property_find(p->value.dir, "outhopid", TB_PROPERTY_TYPE_VALUE);
++		if (pin && pout) {
++			pin->value.immediate = in_hopid;
++			pout->value.immediate = out_hopid;
++			dev_dbg(&svc->dev,
++				"updated local directory %s: in HopID %d, out HopID %d\n",
++				name, in_hopid, out_hopid);
++			return 0;
++		}
++		/* An incomplete directory is replaced by a complete one below */
++	}
++
++	/*
++	 * Build the complete directory first and install it only on success:
++	 * a failure leaves the published properties exactly as they were.
++	 */
+ 	if (!svc->local_properties) {
+ 		/*
+ 		 * Add the service directory first time we
+ 		 * populate the entries.
+ 		 */
+-		svc->local_properties = tb_property_copy_dir(tbstream_dir);
+-		if (!svc->local_properties)
++		root = tbstream_fault("props_root") ? NULL :
++		       tb_property_copy_dir(tbstream_dir);
++		if (!root)
+ 			return -ENOMEM;
+ 	}
+-
+-	p = tb_property_find(svc->local_properties, name,
+-			     TB_PROPERTY_TYPE_DIRECTORY);
++	uuid_gen(&uuid);
++	dir = tbstream_fault("props_dir") ? NULL : tb_property_create_dir(&uuid);
++	if (!dir) {
++		ret = -ENOMEM;
++		goto err_root;
++	}
++	ret = tbstream_fault("props_in") ?:
++	      tb_property_add_immediate(dir, "inhopid", in_hopid);
++	/* props_incomplete (test builds) installs a directory without outhopid */
++	if (!ret && !tbstream_fault("props_incomplete"))
++		ret = tbstream_fault("props_out") ?:
++		      tb_property_add_immediate(dir, "outhopid", out_hopid);
++	if (!ret)
++		ret = tbstream_fault("props_add") ?:
++		      tb_property_add_dir(root ? root : svc->local_properties,
++					  name, dir);
++	if (ret)
++		goto err_dir;
+ 	if (p) {
+-		dir = p->value.dir;
+-
+-		p = tb_property_find(dir, "inhopid", TB_PROPERTY_TYPE_VALUE);
+-		if (p && p->value.immediate != in_hopid)
+-			p->value.immediate = in_hopid;
+-		p = tb_property_find(dir, "outhopid", TB_PROPERTY_TYPE_VALUE);
+-		if (p && p->value.immediate != out_hopid)
+-			p->value.immediate = out_hopid;
+-
+-		dev_dbg(&svc->dev,
+-			"updated local directory %s: in HopID %d, out HopID %d\n",
+-			name, in_hopid, out_hopid);
+-	} else {
+-		uuid_t uuid;
+-		int ret;
+-
+-		uuid_gen(&uuid);
+-		dir = tb_property_create_dir(&uuid);
+-		if (!dir)
+-			return -ENOMEM;
+-
+-		tb_property_add_immediate(dir, "inhopid", in_hopid);
+-		tb_property_add_immediate(dir, "outhopid", out_hopid);
+-
+-		ret = tb_property_add_dir(svc->local_properties, name, dir);
+-		if (ret) {
+-			tb_property_free_dir(dir);
+-			return ret;
+-		}
+-
+-		dev_dbg(&svc->dev,
+-			"added local directory %s: in HopID %d, out HopID %d\n",
+-			name, in_hopid, out_hopid);
+-	}
+-
++		tb_property_free_dir(p->value.dir);
++		tb_property_remove(p);
++	}
++	if (root)
++		svc->local_properties = root;
++
++	dev_dbg(&svc->dev,
++		"added local directory %s: in HopID %d, out HopID %d\n",
++		name, in_hopid, out_hopid);
+ 	return 0;
+-}
+-
+-static int tbstream_dev_update_properties(struct tbstream_dev *sdev)
+-{
+-	struct tbstream *stream;
+-	int ret;
+-
+-	stream = tbstream_get(sdev->stream);
+-	if (!stream)
+-		return 0;
+-
+-	ret = service_update_properties(stream->svc,
+-					config_item_name(&sdev->group.cg_item),
+-					sdev->in_hopid, sdev->out_hopid);
+-	if (!ret)
+-		tb_service_properties_changed(stream->svc);
+-
+-	tbstream_put(stream);
++
++err_dir:
++	tb_property_free_dir(dir);
++err_root:
++	if (root)
++		tb_property_free_dir(root);
+ 	return ret;
+ }
+ 
+-static int tbstream_dev_alloc_in_hopid(struct tbstream_dev *sdev, int hopid)
++/*
++ * Allocates @hopid (> 0: exactly that one, < 0: any) in one direction of the
++ * attached XDomain. Returns the HopID now owned, or a negative errno with
++ * nothing allocated.
++ */
++static int tbstream_dev_acquire_hopid(struct tbstream_dev *sdev, bool in,
++				      int hopid)
+ {
+ 	struct tb_xdomain *xd = tbstream_dev_xdomain(sdev);
+ 	int ret;
+ 
+-	if (sdev->in_hopid > 0 && sdev->in_hopid != hopid)
+-		tb_xdomain_release_in_hopid(xd, sdev->in_hopid);
+-	if (!hopid) {
+-		sdev->in_hopid = hopid;
+-		return 0;
+-	}
+-	ret = tb_xdomain_alloc_in_hopid(xd, hopid);
++	if (tbstream_fault(in ? "hopid_in" : "hopid_out"))
++		return -EBUSY;
++	ret = in ? tb_xdomain_alloc_in_hopid(xd, hopid) :
++		   tb_xdomain_alloc_out_hopid(xd, hopid);
+ 	if (ret < 0)
+ 		return ret;
+ 	/*
+@@ -2261,32 +2272,82 @@
+ 	 * that one then release and return error instead.
+ 	 */
+ 	if (hopid > 0 && hopid != ret) {
+-		tb_xdomain_release_in_hopid(xd, ret);
++		if (in)
++			tb_xdomain_release_in_hopid(xd, ret);
++		else
++			tb_xdomain_release_out_hopid(xd, ret);
+ 		return -EBUSY;
+ 	}
+-	sdev->in_hopid = ret;
+-	return 0;
+-}
+-
+-static int tbstream_dev_alloc_out_hopid(struct tbstream_dev *sdev, int hopid)
++	return ret;
++}
++
++static void tbstream_dev_free_hopid(struct tbstream_dev *sdev, bool in,
++				    int hopid)
+ {
+ 	struct tb_xdomain *xd = tbstream_dev_xdomain(sdev);
+-	int ret;
+-
+-	if (sdev->out_hopid > 0 && sdev->out_hopid != hopid)
+-		tb_xdomain_release_out_hopid(xd, sdev->out_hopid);
+-	if (!hopid) {
+-		sdev->out_hopid = hopid;
++
++	if (in)
++		tb_xdomain_release_in_hopid(xd, hopid);
++	else
++		tb_xdomain_release_out_hopid(xd, hopid);
++}
++
++/* Releases the HopID this device owns in one direction, if any */
++static void tbstream_dev_release_hopid(struct tbstream_dev *sdev, bool in)
++{
++	if (in && sdev->in_owned)
++		tbstream_dev_free_hopid(sdev, true, sdev->in_hopid);
++	else if (!in && sdev->out_owned)
++		tbstream_dev_free_hopid(sdev, false, sdev->out_hopid);
++	if (in)
++		sdev->in_owned = false;
++	else
++		sdev->out_owned = false;
++}
++
++/*
++ * Sets one HopID of an attached device as one transaction: the new ID is
++ * allocated and published before the old one is released, so a failure
++ * leaves the device exactly as it was (still owning its old ID). Writing
++ * the ID the device already owns changes nothing; 0 releases it.
++ */
++static int tbstream_dev_set_hopid(struct tbstream_dev *sdev, bool in, int hopid)
++{
++	const char *name = config_item_name(&sdev->group.cg_item);
++	struct tbstream *stream = sdev->stream;
++	int cur = in ? sdev->in_hopid : sdev->out_hopid;
++	bool owned = in ? sdev->in_owned : sdev->out_owned;
++	int peer = in ? (sdev->out_owned ? sdev->out_hopid : 0) :
++			(sdev->in_owned ? sdev->in_hopid : 0);
++	int got = 0, ret;
++
++	lockdep_assert_held(&sdev->lock);
++	if (hopid == cur && (hopid == 0 || owned))
+ 		return 0;
+-	}
+-	ret = tb_xdomain_alloc_out_hopid(xd, hopid);
+-	if (ret < 0)
++	if (hopid) {
++		got = tbstream_dev_acquire_hopid(sdev, in, hopid);
++		if (got < 0)
++			return got;
++	}
++	ret = tbstream_fault("hopid_props");
++	if (!ret)
++		ret = service_update_properties(stream->svc, name,
++						in ? got : peer,
++						in ? peer : got);
++	if (ret) {
++		if (got)
++			tbstream_dev_free_hopid(sdev, in, got);
+ 		return ret;
+-	if (hopid > 0 && hopid != ret) {
+-		tb_xdomain_release_out_hopid(xd, ret);
+-		return -EBUSY;
+-	}
+-	sdev->out_hopid = ret;
++	}
++	tbstream_dev_release_hopid(sdev, in);
++	if (in) {
++		sdev->in_hopid = got;
++		sdev->in_owned = got > 0;
++	} else {
++		sdev->out_hopid = got;
++		sdev->out_owned = got > 0;
++	}
++	tb_service_properties_changed(stream->svc);
+ 	return 0;
+ }
+ 
+@@ -2305,14 +2366,10 @@
+ 	guard(mutex)(&sdev->lock);
+ 	if (tbstream_dev_config_busy(sdev))
+ 		return -EBUSY;
+-	if (sdev->stream) {
+-		ret = tbstream_dev_alloc_in_hopid(sdev, in_hopid);
+-		if (ret)
+-			return ret;
+-		ret = tbstream_dev_update_properties(sdev);
+-	} else {
++	if (sdev->stream)
++		ret = tbstream_dev_set_hopid(sdev, true, in_hopid);
++	else
+ 		sdev->in_hopid = in_hopid;
+-	}
+ 	return ret ? ret : count;
+ }
+ CONFIGFS_ATTR(tbstream_dev_, in_hopid);
+@@ -2340,14 +2397,10 @@
+ 	guard(mutex)(&sdev->lock);
+ 	if (tbstream_dev_config_busy(sdev))
+ 		return -EBUSY;
+-	if (sdev->stream) {
+-		ret = tbstream_dev_alloc_out_hopid(sdev, out_hopid);
+-		if (ret)
+-			return ret;
+-		ret = tbstream_dev_update_properties(sdev);
+-	} else {
++	if (sdev->stream)
++		ret = tbstream_dev_set_hopid(sdev, false, out_hopid);
++	else
+ 		sdev->out_hopid = out_hopid;
+-	}
+ 	return ret ? ret : count;
+ }
+ CONFIGFS_ATTR(tbstream_dev_, out_hopid);
+@@ -2517,7 +2570,8 @@
+ 	struct config_group *group = to_config_group(item);
+ 	struct tbstream_dev *sdev = tbstream_dev_from_group(group);
+ 
+-	misc_deregister(&sdev->misc);
++	if (sdev->misc_registered)
++		misc_deregister(&sdev->misc);
+ 	tbstream_dev_put(sdev);
+ }
+ 
+@@ -2564,7 +2618,9 @@
+ {
+ 	const char *name = config_item_name(&sdev->group.cg_item);
+ 	struct tbstream *stream;
+-
++	int ret, in, out;
++
++	lockdep_assert_held(&sg->lock);
+ 	stream = tbstream_get(sg->stream);
+ 	if (!stream)
+ 		return;
+@@ -2576,6 +2632,10 @@
+ 			return; /* never rebind an open/retained DMA endpoint */
+ 		}
+ #endif
++		if (sdev->stream) {
++			tbstream_put(stream);
++			return; /* already attached: keep the IDs it owns */
++		}
+ 		WRITE_ONCE(sdev->stream, stream);
+ 		/*
+ 		 * If there is no existing configuration (or automatic
+@@ -2585,14 +2645,49 @@
+ 		if (sdev->in_hopid <= 0 && sdev->out_hopid <= 0)
+ 			service_get_hopids(stream->svc, name, &sdev->in_hopid,
+ 					   &sdev->out_hopid);
+-		if (sdev->in_hopid)
+-			tbstream_dev_alloc_in_hopid(sdev, sdev->in_hopid);
+-		if (sdev->out_hopid)
+-			tbstream_dev_alloc_out_hopid(sdev, sdev->out_hopid);
+-	}
+-
+-	service_update_properties(stream->svc, name, sdev->in_hopid,
+-				  sdev->out_hopid);
++		/*
++		 * Own only what was allocated: a requested ID that is taken
++		 * stays configured but not owned, so an open fails instead of
++		 * using (and later releasing) someone else's HopID.
++		 */
++		if (sdev->in_hopid) {
++			ret = tbstream_dev_acquire_hopid(sdev, true, sdev->in_hopid);
++			if (ret > 0) {
++				sdev->in_hopid = ret;
++				sdev->in_owned = true;
++			} else {
++				dev_warn(&stream->svc->dev, "%s: in HopID %d not available: %d\n",
++					 name, sdev->in_hopid, ret);
++			}
++		}
++		if (sdev->out_hopid) {
++			ret = tbstream_dev_acquire_hopid(sdev, false, sdev->out_hopid);
++			if (ret > 0) {
++				sdev->out_hopid = ret;
++				sdev->out_owned = true;
++			} else {
++				dev_warn(&stream->svc->dev, "%s: out HopID %d not available: %d\n",
++					 name, sdev->out_hopid, ret);
++			}
++		}
++		/*
++		 * Publish under sdev->lock, like a configfs write, so a
++		 * concurrent write can never be overtaken by an older
++		 * snapshot. If publishing fails, own nothing: the device
++		 * stays unopenable until its HopIDs are written again.
++		 */
++		in = sdev->in_owned ? sdev->in_hopid : 0;
++		out = sdev->out_owned ? sdev->out_hopid : 0;
++		ret = service_update_properties(stream->svc, name, in, out);
++		if (ret) {
++			dev_warn(&stream->svc->dev,
++				 "%s: local properties not published (%d), HopIDs released: write them again to retry\n",
++				 name, ret);
++			tbstream_dev_release_hopid(sdev, true);
++			tbstream_dev_release_hopid(sdev, false);
++		}
++	}
++
+ 	tb_service_properties_changed(stream->svc);
+ 
+ 	/* Notify any openerers that the stream is now attached */
+@@ -2632,13 +2727,16 @@
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+ 		if (!tbstream_gpu_paths_pending(sdev, stream)) {
+ #endif
+-			if (sdev->out_hopid > 0)
++			if (sdev->out_owned)
+ 				tb_xdomain_release_out_hopid(xd, sdev->out_hopid);
+-			if (sdev->in_hopid > 0)
++			if (sdev->in_owned)
+ 				tb_xdomain_release_in_hopid(xd, sdev->in_hopid);
+ #if IS_ENABLED(CONFIG_USB4_GPU_STREAM)
+ 		}
+-#endif
++		/* else the retained GPU context owns them from now on */
++#endif
++		sdev->in_owned = false;
++		sdev->out_owned = false;
+ 	}
+ 
+ 	service_update_properties(stream->svc, name, 0, 0);
+@@ -2708,16 +2806,26 @@
+ 
+ 	config_group_init_type_name(&sdev->group, name, &tbstream_dev_type);
+ 
+-	scoped_guard(mutex, &sg->lock)
++	/*
++	 * Insert and attach under one sg->lock: the stream's probe walks this
++	 * list under the same lock, so the device is attached exactly once.
++	 */
++	scoped_guard(mutex, &sg->lock) {
+ 		list_add_tail(&sdev->list, &sg->dev_list);
+-
+-	tbstream_dev_attach_stream(sdev, sg);
+-
+-	sdev->misc.name = kasprintf(GFP_KERNEL, "tbstream%d", index);
++		tbstream_dev_attach_stream(sdev, sg);
++	}
++
++	sdev->misc.name = tbstream_fault("misc_name") ? NULL :
++			  kasprintf(GFP_KERNEL, "tbstream%d", index);
+ 	sdev->misc.minor = MISC_DYNAMIC_MINOR;
+ 	sdev->misc.fops = &tbstream_dev_fops;
+ 
+-	ret = misc_register(&sdev->misc);
++	if (!sdev->misc.name)
++		ret = -ENOMEM;
++	else
++		ret = tbstream_fault("misc_register") ?: misc_register(&sdev->misc);
++	if (!ret)
++		sdev->misc_registered = true;
+ 	if (ret) {
+ 		tbstream_dev_detach_stream(sdev);
+ 		scoped_guard(mutex, &sg->lock)
