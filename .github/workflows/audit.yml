@@ -37,6 +37,20 @@ jobs:
             drivers/net/thunderbolt
           sparse-checkout-cone-mode: true
       - run: python3 tools/prepare_overlay.py "$RUNNER_TEMP/usb4-source" --kernel-source "$GITHUB_WORKSPACE/pinned-linux" ${{ matrix.series == 'experimental' && '--experimental' || '' }}
+      # Temporary diagnostic during #8 development; removed before merge.
+      - name: Print updated stable source and series digests
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, "tools")
+          import validate_native as v
+          repo = Path.cwd()
+          source = Path(os.environ["RUNNER_TEMP"]) / "usb4-source"
+          print("ISSUE7_SERIES_SHA256=" + v.series_digest(v.series(repo)), flush=True)
+          print("ISSUE7_XDOMAIN_SHA256=" + v.sha256(source / "drivers/thunderbolt/xdomain.c"), flush=True)
+          PY
       # Includes the tools tests (pingpong with ASan/UBSan, describe, manifest,
       # Kconfig check, apply-series) and the shipped manifest vs the reconstruction.
       - run: python3 -m unittest discover -s tests -v
