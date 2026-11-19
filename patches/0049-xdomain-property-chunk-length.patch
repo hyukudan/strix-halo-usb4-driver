@@ -1,0 +1,21 @@
+diff --git a/drivers/thunderbolt/xdomain.c b/drivers/thunderbolt/xdomain.c
+--- a/drivers/thunderbolt/xdomain.c
++++ b/drivers/thunderbolt/xdomain.c
+@@ -367,13 +367,13 @@ static int tb_xdp_properties_request(struct tb_ctl *ctl, u64 route,
+ 		/*
+-		 * Package length includes the whole payload without the
+-		 * XDomain header. Validate first that the package is at
+-		 * least size of the response structure.
++		 * The encoded length excludes the XDomain header even though
++		 * sizeof(*res) includes it. Require at least one data dword
++		 * so a zero-length chunk cannot loop without progress.
+ 		 */
+ 		len = res->hdr.xd_hdr.length_sn & TB_XDOMAIN_LENGTH_MASK;
+-		if (len < sizeof(*res) / 4) {
++		if (len <= (sizeof(*res) - sizeof(res->hdr.xd_hdr)) / 4) {
+ 			ret = -EINVAL;
+ 			goto err;
+ 		}
+ 
+ 		len += sizeof(res->hdr.xd_hdr) / 4;
+ 		len -= sizeof(*res) / 4;
