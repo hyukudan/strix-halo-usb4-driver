@@ -20,8 +20,8 @@ devices are usable on their own. It is experimental, out-of-tree work: not
 submitted upstream, tested on one pair of machines.
 
 The series applies to Linux `72d3fcf802c45d00b300f25b848a93c3a2bd7c7e`
-(**7.3-rc5**). The **48 stable patches** in [`patches/series`](patches/series)
-(0001–0048) are the driver and the default install path. Three **experimental**
+(**7.3-rc5**). The **49 stable patches** in [`patches/series`](patches/series)
+(0001–0049) are the driver and the default install path. Three **experimental**
 patches in [`patches/experimental/`](patches/experimental/) (0049–0051) apply on
 top of them. Only 0051 has been measured on hardware, during one measurement
 window; the stable module was restored afterwards. `overlay/` is an immutable capture
@@ -112,7 +112,7 @@ As of 2026-10-25.
 
 | Part | Patches | Status | On hardware |
 |---|---|---|---|
-| Stable series | 0001–0048, [`patches/series`](patches/series) | **Stable**, default install path. 0047 and 0048 are opt-in and off by default | The `thunderbolt_stream` module loaded on both lab machines since 2026-10-23 is the 0001–0048 build: rebuilding this tree reproduces its srcversion `3A05C2B1A13ABAEF9B767EF` |
+| Stable series | 0001–0049, [`patches/series`](patches/series) | **Stable**, default install path. 0047 and 0048 are opt-in and off by default; 0049 fixes the XDomain short-property response rejection | The `thunderbolt_stream` module loaded on both lab machines since 2026-10-23 is the 0001–0048 build: rebuilding this tree reproduces its srcversion `3A05C2B1A13ABAEF9B767EF` |
 | Bounded RX poll window | 0049, [`patches/experimental/`](patches/experimental/) | **Experimental** | Built (core and stream modules together) and CPU-tested; not installed, not measured |
 | Paced RX descriptor polls | 0050, same directory | **Experimental** | Built (stream module) and CPU-tested; not installed, not measured |
 | TX memory-path experiments | 0051, same directory | **Experimental** | Measured 2026-10-25 on one Gen3 host ring: cache-bypassing copies −15 %, 1024-byte TX frames +8.5 % (send only, a candidate, not a default); not installed by default |
@@ -421,6 +421,7 @@ behaviour change.
 | `0031-gpu-nonblock-submit-does-not-sleep-on-mutex` | default | `O_NONBLOCK` SUBMIT/RX_REPOST return `EAGAIN` instead of sleeping on the device mutex. |
 | `0032-kernel-doc-stream-tbnet-cm-ops-members` | default | Kernel-doc for members `W=1` reported. No code change. |
 | `0033-xdomain-lane-bonding-result-checked` | default | XDomain lane bonding checks its result and retries at most twice. |
+| `0049-xdomain-property-chunk-length` | default | Correct the XDomain property response length check (the encoded size excludes the XDomain header), allowing 45n+1/2-dword property blocks while rejecting zero-data chunks. Fixes [issue #7](https://github.com/hyukudan/strix-halo-usb4-driver/issues/7). Confirmed by the reporter across three paired cold boots; CI checks the pinned kernel build, not live pairing on every machine. |
 | `0034-host-router-reset-result-checked` | default | `tb_start()` checks the host router reset. |
 | `0035-opt-in-gen3-retrain` | opt-in (`gen3_retrain`) | Bounded port reset to bring a new XDomain link from Gen2 to Gen3 when every side advertises Gen3. |
 | `0036-gpu-nonblock-submit-does-not-sleep-on-dma-lock` | default | `O_NONBLOCK` submissions also only try the DMA submission lock. |
@@ -439,7 +440,7 @@ behaviour change.
 
 ### Experimental patches
 
-[`patches/experimental/series`](patches/experimental/series) lists 0049–0051.
+[`patches/experimental/series`](patches/experimental/series) lists 0049–0051 (separate paths from the stable 0049; their names and ordering are independent).
 They apply only on top of 0001–0048 and only in this order
 (`tools/apply-series.sh --with-experimental`). Every new setting defaults to
 off, and with the defaults the code paths are unchanged. 0049 and 0050 have not
@@ -466,7 +467,7 @@ cleanly on 7.3-rc5.
 
 | Check | Result |
 |---|---|
-| Series applies to pristine 7.3-rc5 | `tools/apply-series.sh`: all 48 stable patches; with `--with-experimental` all 51 |
+| Series applies to pristine 7.3-rc5 | `tools/apply-series.sh`: all 49 stable patches; with `--with-experimental` all 52 |
 | `prepare_overlay.py` vs applying the series | byte-identical |
 | Offline unit tests | see [Build and install](#build-and-install); CI runs them on every push against the stable tree and against the tree with the experimental patches. 2026-10-24: stable tree 314 run, OK (10 skipped: 9 experimental-only cases and one optional bundle check); with 0049–0051 314 run, OK (2 skipped) |
 | Modules with `W=1`, `USB4_GPU_STREAM=y` and `=n` | 0 warnings, 0 errors; `tools/check_build_log.py` makes any diagnostic in this series' files fatal |
