@@ -1,9 +1,9 @@
 {
   "schema": "usb4-software-validation-v2",
   "kernel": "72d3fcf802c45d00b300f25b848a93c3a2bd7c7e",
-  "patch_count": 48,
-  "last_patch": "0048-host-opt-in-descriptor-batching.patch",
-  "series_sha256": "4912542992b7e8a05218c12fd429a05b85618e198f95308763b95465aa404344",
+  "patch_count": 49,
+  "last_patch": "0049-xdomain-property-chunk-length.patch",
+  "series_sha256": "0fd32d19b37e4edbb9fb75ab55eb3f0bec5cebbc580af51d20dd8c67ec1fd27d",
   "materialized_files": {
     "drivers/net/thunderbolt/dma_recovery.h": "1fb352bbee0ba4802b03ba0a24317f6849cacb8fb8810866e030c62cdca1bcb0",
     "drivers/net/thunderbolt/main.c": "a4bbc4bc58aab75c79a4606c04d5eefd57f1e1d682a35b13a674d25c89394944",
@@ -23,7 +23,7 @@
     "drivers/thunderbolt/tb.c": "b62564a0cf9975a54acca1dcb279e73cc079e40d7f0d794f047c4f652a9dc1ac",
     "drivers/thunderbolt/tb.h": "dacb823e05d3dd6606b194053e8081a39ecdf2a7401e20ea8afdd4354318bd43",
     "drivers/thunderbolt/tunnel.c": "0a831db8ba17a89aaff1ae49f7750837abddd695c6895e2d5a7ef905e16fac41",
-    "drivers/thunderbolt/xdomain.c": "457a8c9a1c281aedc978048f0ab43daaf08780ac20891b659f29de0fa158964e",
+    "drivers/thunderbolt/xdomain.c": "6f4bb64f3b36fc452b2bf8ea25db18a09b45ebc7ee86f5f6fbe4a8209ea7040c",
     "drivers/thunderbolt/xdomain_notify.h": "96ddb040e6c9d964bc875554cb42325943436f2215748d0b4fb0019db767586b",
     "include/linux/thunderbolt.h": "16d9da1b7f68d686e4f8d5370ebd6da4e51901c5c9a6042f40e46b4a843e887e",
     "include/trace/events/thunderbolt_latency.h": "29f04bd3a152b2de09bc7b4b3376fccee9a2bc4c6ca2074e059c0599e0436a75",
