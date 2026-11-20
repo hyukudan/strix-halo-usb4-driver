@@ -441,7 +441,7 @@ behaviour change.
 ### Experimental patches
 
 [`patches/experimental/series`](patches/experimental/series) lists 0049–0051 (separate paths from the stable 0049; their names and ordering are independent).
-They apply only on top of 0001–0048 and only in this order
+They apply only on top of the current stable 0001–0049 series and only in this order
 (`tools/apply-series.sh --with-experimental`). Every new setting defaults to
 off, and with the defaults the code paths are unchanged. 0049 and 0050 have not
 been installed or measured on hardware; 0051 was loaded for one measurement
@@ -665,8 +665,8 @@ reads an offline copy of `/sys`, `/proc` and `/run`.
 
 | Path | Content |
 |---|---|
-| `patches/series` | The stable series, 0001–0048, in order: the default install path |
-| `patches/audit-series` | Patches applied on top of the captured overlay (0002–0048) |
+| `patches/series` | The stable series, 0001–0049, in order: the default install path |
+| `patches/audit-series` | Patches applied on top of the captured overlay (0002–0049) |
 | `patches/experimental/` | Experimental 0049–0051 and their `series`, applied on top only on request |
 | `patches/kernel-backports/` | Unmodified upstream fixes applied after the series |
 | `overlay/` | Immutable original source capture (pristine + 0001) |
