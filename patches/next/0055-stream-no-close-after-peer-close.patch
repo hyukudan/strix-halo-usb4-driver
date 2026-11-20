@@ -1,0 +1,156 @@
+Subject: [PATCH next 0055] thunderbolt: stream: no CLOSE of our own after the peer's valid CLOSE
+
+The last release (and a detach with open files) always sent a CLOSE
+frame, even when the peer had already closed: its valid CLOSE was
+delivered as EOF, and its rings were stopped or already restarted for a
+new session. Our CLOSE then either waited out the 500 ms TX flush in the
+stop, because nothing on the peer takes it, or arrived on the peer's new
+rings and ended that session early.
+
+Skip our CLOSE once a valid peer CLOSE was delivered (sdev->closed, which
+a damaged CLOSE never sets since 0037). Data queued before still drains
+in the stop exactly as before. No change when we close first. Test builds
+get fault_at=rx_damage_close, which marks a received CLOSE as damaged in
+the RX callback, to prove that a damaged CLOSE still fails the stream and
+our own CLOSE is still sent.
+
+---
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -171,7 +171,8 @@
+  * @irq_pinned: Ring IRQs moved to @irq_cpu (0 = none)
+  * @irq_saved: Affinity of those IRQs before they were moved
+  * @users: Number of times @cdev has been opened
+- * @closed: CLOSE packet was received
++ * @closed: A valid CLOSE packet was received and delivered as EOF; the
++ *	    release then sends no CLOSE of its own
+  * @rx_failed: A received frame was damaged (CRC error or buffer overrun),
+  *	       or a delivered RX slot could not be re-posted: the byte stream
+  *	       has a hole or the ring lost a slot, reads fail with -EIO until
+@@ -752,6 +753,8 @@
+ 	return READ_ONCE(sdev->detached);
+ }
+ 
++static int tbstream_fault(const char *step);
++
+ static void
+ tbstream_dev_rx_callback(struct tb_ring *ring, struct ring_frame *frame,
+ 			 bool canceled)
+@@ -762,6 +765,8 @@
+ 	if (canceled)
+ 		return;
+ 
++	if (sf->frame.eof == TBSTREAM_CLOSE && tbstream_fault("rx_damage_close"))
++		sf->frame.flags |= RING_DESC_CRC_ERROR;
+ 	sf->completed = true;
+ 	sdev->rx_ring.prod++;
+ 	trace_tb_latency(ring, frame, 9, sf->frame.size);
+@@ -800,8 +805,6 @@
+ 				DMA_FROM_DEVICE);
+ 	return sf;
+ }
+-
+-static int tbstream_fault(const char *step);
+ 
+ /* All bookkeeping precedes publication: callbacks may run immediately. */
+ static int tbstream_dev_submit_batch(struct tb_ring *ring, struct list_head *batch)
+@@ -894,7 +897,7 @@
+ static char fault_at[32];
+ module_param_string(fault_at, fault_at, sizeof(fault_at), 0644);
+ MODULE_PARM_DESC(fault_at,
+-		 "TEST BUILD ONLY: fail this step: stream start tx_ring, tx_buffers, rx_ring, rx_buffers, rx_post, enable_paths; HopID hopid_in, hopid_out (allocation), hopid_props (publication of a HopID write); properties props_root, props_dir, props_in, props_out, props_add (construction), props_incomplete (install a directory without outhopid); device misc_name, misc_register; RX rx_repost (re-post of delivered RX slots: single-frame, batch threshold and final flush)");
++		 "TEST BUILD ONLY: fail this step: stream start tx_ring, tx_buffers, rx_ring, rx_buffers, rx_post, enable_paths; HopID hopid_in, hopid_out (allocation), hopid_props (publication of a HopID write); properties props_root, props_dir, props_in, props_out, props_add (construction), props_incomplete (install a directory without outhopid); device misc_name, misc_register; RX rx_repost (re-post of delivered RX slots: single-frame, batch threshold and final flush); CLOSE rx_damage_close (mark a received CLOSE damaged), close_always (send our CLOSE even after a valid peer CLOSE, as before 0055)");
+ 
+ static int tbstream_fault(const char *step)
+ {
+@@ -1135,6 +1138,39 @@
+ 
+ #define TBSTREAM_DEV_CLOSE_WAIT_MS	500
+ 
++#ifdef TBSTREAM_FAULT_TEST
++/* Test builds: every CLOSE send attempt and its enqueue result */
++static void tbstream_test_close_attempt(struct tbstream_dev *sdev, int ret)
++{
++	pr_info("%s: TEST BUILD CLOSE attempt, enqueue %d\n", sdev->misc.name, ret);
++}
++
++/*
++ * Test builds: TX state at the last release, before any CLOSE and the
++ * stop. Busy polling first reaps completions already done (the stop would
++ * too), so "outstanding" is what the hardware still holds.
++ */
++static void tbstream_test_release_state(struct tbstream_dev *sdev)
++{
++	struct tbstream_ring *ring = &sdev->tx_ring;
++	unsigned long free_slots;
++
++	if (!ring->ring) {
++		pr_info("%s: TEST BUILD last release: closed %d, no TX ring\n",
++			sdev->misc.name, tbstream_dev_closed(sdev));
++		return;
++	}
++	tbstream_dev_poll_ring(sdev, ring);
++	free_slots = ring->prod - ring->cons;
++	pr_info("%s: TEST BUILD last release: closed %d, TX outstanding %lu, free %lu\n",
++		sdev->misc.name, tbstream_dev_closed(sdev),
++		tb_ring_size(ring->ring) - 1 - free_slots, free_slots);
++}
++#else
++static inline void tbstream_test_close_attempt(struct tbstream_dev *sdev, int ret) { }
++static inline void tbstream_test_release_state(struct tbstream_dev *sdev) { }
++#endif
++
+ /*
+  * CLOSE tells the peer's reader that the stream ended (EOF). It needs a TX
+  * slot like data does: wait for one, at most TBSTREAM_DEV_CLOSE_WAIT_MS,
+@@ -1146,8 +1182,10 @@
+ 	struct tbstream_frame *sf;
+ 	int ret;
+ 
+-	if (!sdev->tx_ring.ring)
++	if (!sdev->tx_ring.ring) {
++		tbstream_test_close_attempt(sdev, -ENODEV);
+ 		return -ENODEV;
++	}
+ 
+ 	if (sdev->busy_poll) {
+ 		/*
+@@ -1176,6 +1214,7 @@
+ 		ret = PTR_ERR(sf);
+ 	else
+ 		ret = tb_ring_tx(sdev->tx_ring.ring, &sf->frame);
++	tbstream_test_close_attempt(sdev, ret);
+ 	if (ret)
+ 		pr_warn_ratelimited("%s: CLOSE not sent (%d): the peer sees no EOF\n",
+ 				    sdev->misc.name, ret);
+@@ -1857,9 +1896,17 @@
+ 			/*
+ 			 * Send CLOSE tunneled packet to notify the other
+ 			 * end that we are closing the file, waiting a
+-			 * bounded time for a TX slot.
++			 * bounded time for a TX slot. Not after the peer's
++			 * own valid CLOSE (sdev->closed; a damaged one never
++			 * sets it): the peer has stopped or restarted its
++			 * rings, so ours could only wait out the TX flush
++			 * in the stop, or end the peer's next session. Data
++			 * queued before still drains in the stop.
+ 			 */
+-			tbstream_dev_send_close(sdev);
++			tbstream_test_release_state(sdev);
++			if (!tbstream_dev_closed(sdev) ||
++			    tbstream_fault("close_always"))
++				tbstream_dev_send_close(sdev);
+ 			tbstream_dev_stop(sdev);
+ 		}
+ 	}
+@@ -2769,7 +2816,9 @@
+ 			 * known; an unplugged XDomain skips the CM part. A
+ 			 * peer that is still there gets a CLOSE first.
+ 			 */
+-			if (tbstream_valid(stream))
++			if (tbstream_valid(stream) &&
++			    (!tbstream_dev_closed(sdev) ||
++			     tbstream_fault("close_always")))
+ 				tbstream_dev_send_close(sdev);
+ 			tbstream_dev_stop(sdev);
+ 			WRITE_ONCE(sdev->detached, true);

@@ -1,0 +1,184 @@
+Subject: [PATCH next 0054] thunderbolt: stream: fail the stream when a delivered RX slot cannot be re-posted
+
+With the default single-frame re-post (rx_repost_batch 0), a failed
+tb_ring_rx() of a delivered RX slot only ended the read: the consumer
+index had already moved past the slot, the slot was not back on the
+ring, and nothing was latched. The ring silently lost a slot; once the
+consumer index wrapped to it the reader waited forever, with no error.
+The batched path latched rx_failed but did not wake other waiters.
+
+Latch rx_failed and wake every waiter on any failed re-post of a
+delivered slot, in both modes, through one helper, and let a blocked
+reader's wait condition see the latch (another reader may have consumed
+the last completion). A damaged frame latches the same way. Bytes already
+copied are still returned (never redelivered), and the slot stays owned by
+the driver until the rings are freed. The CLOSE frame's re-post is exempt
+in both modes, including a batch flush that carries only that slot: after
+a valid CLOSE nothing more arrives on these rings and EOF must stay EOF.
+Test builds get fault_at=rx_repost, which fails the single-frame re-post,
+the batch threshold submit and the final flush like a real failure; TX
+batches are not affected.
+
+No change on the healthy path.
+
+---
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -172,8 +172,10 @@
+  * @irq_saved: Affinity of those IRQs before they were moved
+  * @users: Number of times @cdev has been opened
+  * @closed: CLOSE packet was received
+- * @rx_failed: A received frame was damaged (CRC error or buffer overrun):
+- *	       the byte stream has a hole, reads fail with -EIO until close
++ * @rx_failed: A received frame was damaged (CRC error or buffer overrun),
++ *	       or a delivered RX slot could not be re-posted: the byte stream
++ *	       has a hole or the ring lost a slot, reads fail with -EIO until
++ *	       close
+  * @removed: Userspace removed the ConfigFS group underneath.
+  * @detached: The open files lost their rings: the stream went away (the
+  *	      rings were stopped then) or a resume could not restart them.
+@@ -799,6 +801,8 @@
+ 	return sf;
+ }
+ 
++static int tbstream_fault(const char *step);
++
+ /* All bookkeeping precedes publication: callbacks may run immediately. */
+ static int tbstream_dev_submit_batch(struct tb_ring *ring, struct list_head *batch)
+ {
+@@ -838,7 +842,42 @@
+ 		list_add_tail(&sf->frame.list, batch);
+ 		return 0;
+ 	}
++	if (tbstream_fault("rx_repost"))
++		return -ESHUTDOWN;
+ 	return tb_ring_rx(sdev->rx_ring.ring, &sf->frame);
++}
++
++/*
++ * A delivered slot that is not back on the ring never completes: once the
++ * consumer index wraps to it, the reader would wait forever. Latch the
++ * stream as failed instead and wake every waiter; the bytes already copied
++ * are still returned, and the slot stays ours until the rings are freed.
++ */
++static void tbstream_dev_rx_repost_failed(struct tbstream_dev *sdev, int err)
++{
++	lockdep_assert_held(&sdev->lock);
++	if (!sdev->rx_failed)
++		pr_warn_ratelimited("%s: RX re-post failed (%d), stream failed until close\n",
++				    sdev->misc.name, err);
++	/* Read locklessly by the reader's wait condition */
++	WRITE_ONCE(sdev->rx_failed, true);
++	wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLERR);
++}
++
++/*
++ * Publishes the reader's RX re-post batch; test builds can fail it
++ * (fault_at=rx_repost) through the same cleanup as a real failure. TX
++ * batches keep calling tbstream_dev_submit_batch() directly.
++ */
++static int tbstream_dev_submit_rx_batch(struct tbstream_dev *sdev,
++					struct list_head *batch)
++{
++	if (!list_empty(batch) && tbstream_fault("rx_repost")) {
++		while (!list_empty(batch))
++			list_del_init(batch->next);
++		return -ESHUTDOWN;
++	}
++	return tbstream_dev_submit_batch(sdev->rx_ring.ring, batch);
+ }
+ 
+ static int tbstream_dev_consume_rx(struct tbstream_dev *sdev)
+@@ -855,7 +894,7 @@
+ static char fault_at[32];
+ module_param_string(fault_at, fault_at, sizeof(fault_at), 0644);
+ MODULE_PARM_DESC(fault_at,
+-		 "TEST BUILD ONLY: fail this step: stream start tx_ring, tx_buffers, rx_ring, rx_buffers, rx_post, enable_paths; HopID hopid_in, hopid_out (allocation), hopid_props (publication of a HopID write); properties props_root, props_dir, props_in, props_out, props_add (construction), props_incomplete (install a directory without outhopid); device misc_name, misc_register");
++		 "TEST BUILD ONLY: fail this step: stream start tx_ring, tx_buffers, rx_ring, rx_buffers, rx_post, enable_paths; HopID hopid_in, hopid_out (allocation), hopid_props (publication of a HopID write); properties props_root, props_dir, props_in, props_out, props_add (construction), props_incomplete (install a directory without outhopid); device misc_name, misc_register; RX rx_repost (re-post of delivered RX slots: single-frame, batch threshold and final flush)");
+ 
+ static int tbstream_fault(const char *step)
+ {
+@@ -1352,6 +1391,7 @@
+ 	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+ 	LIST_HEAD(repost);
+ 	unsigned int repost_count = 0;
++	bool close_consumed = false;
+ 	size_t nbytes;
+ 	int ret;
+ 
+@@ -1410,6 +1450,7 @@
+ 			ret = wait_event_interruptible(sdev->wait,
+ 					tbstream_ring_available(&sdev->rx_ring) ||
+ 					READ_ONCE(sdev->rx_poll_pending) ||
++					READ_ONCE(sdev->rx_failed) ||
+ 					!tbstream_dev_attached(sdev) ||
+ 					tbstream_dev_detached(sdev) ||
+ 					tbstream_dev_closed(sdev) ||
+@@ -1438,7 +1479,8 @@
+ 		 * before the PDF is trusted: a damaged CLOSE is no EOF.
+ 		 */
+ 		if (tbstream_frame_damaged(sf)) {
+-			sdev->rx_failed = true;
++			WRITE_ONCE(sdev->rx_failed, true);
++			wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLERR);
+ 			if (!nbytes)
+ 				ret = -EIO;
+ 			break;
+@@ -1451,9 +1493,19 @@
+ 		 */
+ 		if (sf->frame.eof == TBSTREAM_CLOSE) {
+ 			if (!nbytes) {
++				/*
++				 * After a valid CLOSE the peer sends nothing
++				 * more on these rings and the next open starts
++				 * new ones: a failed re-post of this slot loses
++				 * nothing, and EOF stays EOF. In batch mode the
++				 * slot rides the final flush: nothing else was
++				 * consumed in this call (nbytes is 0), so that
++				 * flush carries only this slot.
++				 */
+ 				tbstream_dev_consume_rx_batch(sdev,
+ 						sdev->rx_repost_batch ? &repost : NULL);
+ 				sdev->closed = true;
++				close_consumed = true;
+ 			}
+ 			break;
+ 		}
+@@ -1477,18 +1529,17 @@
+ 				break;
+ 			}
+ 		} else {
+-			/* Delivered; a failed re-post shows on the next call */
++			/* Delivered; a failed re-post fails the stream from the next call */
+ 			ret = sdev->rx_repost_batch ?
+ 				tbstream_dev_consume_rx_batch(sdev, &repost) :
+ 				tbstream_dev_consume_rx(sdev);
+ 			if (!ret && sdev->rx_repost_batch &&
+ 			    ++repost_count >= sdev->rx_repost_batch) {
+-				ret = tbstream_dev_submit_batch(sdev->rx_ring.ring, &repost);
++				ret = tbstream_dev_submit_rx_batch(sdev, &repost);
+ 				repost_count = 0;
+ 			}
+ 			if (ret) {
+-				if (sdev->rx_repost_batch)
+-					sdev->rx_failed = true;
++				tbstream_dev_rx_repost_failed(sdev, ret);
+ 				break;
+ 			}
+ 		}
+@@ -1496,10 +1547,11 @@
+ 
+ 	/* Also flush on partial copies, CLOSE and faults; never hold credits. */
+ 	if (!list_empty(&repost)) {
+-		int flush_ret = tbstream_dev_submit_batch(sdev->rx_ring.ring, &repost);
+-
+-		if (flush_ret) {
+-			sdev->rx_failed = true;
++		int flush_ret = tbstream_dev_submit_rx_batch(sdev, &repost);
++
++		/* A CLOSE-only flush is exempt like the single-frame CLOSE */
++		if (flush_ret && !close_consumed) {
++			tbstream_dev_rx_repost_failed(sdev, flush_ret);
+ 			if (!ret)
+ 				ret = flush_ret;
+ 		}

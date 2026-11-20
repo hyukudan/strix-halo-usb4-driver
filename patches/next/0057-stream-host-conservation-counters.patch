@@ -1,0 +1,292 @@
+Subject: [PATCH next 0057] thunderbolt: stream: host conservation counters
+
+When a host stream stalls or fails, nothing tells whether frames were
+lost in DMA, never harvested, never re-posted or never read. Add per
+stream counters, read through a new read-only ConfigFS attribute
+'counters': sessions, RX posted / completed / canceled / damaged /
+delivered / failed re-posts, TX posted / completed / canceled, and the
+first terminal RX error of the session with the number of frames
+delivered before it.
+
+Each counter has exactly one writer context (the RX callback, the TX
+callback, or code holding sdev->lock), so a plain WRITE_ONCE() increment
+is enough; the attribute reads them with READ_ONCE() and takes no lock.
+No lock or atomic is added to any data path. Documented invariant, at
+settled points (after a stop returned, before the next start):
+posted == completed + canceled and delivered <= completed. Failed
+re-posts are counted per frame. Each field is read without a lock: no
+coherent multi-field snapshot.
+
+---
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -152,6 +152,7 @@
+  * @in_owned: @in_hopid is allocated on the attached XDomain by this device
+  * @out_owned: @out_hopid is allocated on the attached XDomain by this device
+  * @misc_registered: @misc was registered (item release deregisters only then)
++ * @ctr: Host data-path conservation counters, see struct tbstream_counters
+  * @ring_size: Size of the rings
+  * @throttling: Interrupt throttling rate in ns
+  * @busy_poll: Instead of interrupts, busy poll both rings
+@@ -201,6 +202,58 @@
+  * @gpu_last_epoch: Last accepted peer-agreed DMA epoch (when enabled)
+  * @gpu_context: Open or quarantined DMA context (when enabled)
+  */
++/**
++ * struct tbstream_counters - Host data-path conservation counters of a stream
++ * @sessions: Start attempts of the host rings (opens and resumes, failed
++ *	      attempts included); each resets the first_error fields
++ * @rx_posted: RX frames given to the ring: priming and successful re-posts
++ * @rx_completed: RX frames completed by the controller
++ * @rx_canceled: RX frames canceled when the ring stopped
++ * @rx_damaged: Completed RX frames with a CRC error or buffer overrun
++ * @rx_delivered: RX frames fully consumed by read() (CLOSE included)
++ * @rx_repost_failed: Delivered RX frames whose re-post failed (per frame:
++ *		      a failed batch of n counts n; CLOSE included)
++ * @tx_posted: TX frames given to the ring (CLOSE included)
++ * @tx_completed: TX frames completed by the controller
++ * @tx_canceled: TX frames canceled when the ring stopped
++ * @first_error: First terminal RX error the reader met since the last start
++ *		 attempt (-EIO: damaged frame, latched before it is consumed;
++ *		 else the re-post error, after delivery), 0 if none. Damage
++ *		 nobody read and start/TX errors are not recorded here.
++ * @first_error_rx: @rx_delivered (a lifetime total, not per session) when
++ *		    @first_error was recorded
++ *
++ * Totals since the stream device was created, except the first_error fields.
++ * Each counter has exactly one writer context: the RX callback (or its NAPI /
++ * manual-poll equivalents, serialized by rx_lock / sdev->lock), the TX
++ * callback, or code holding sdev->lock. Each field is read with READ_ONCE()
++ * without a lock: no torn value, but no coherent snapshot across fields.
++ * Posted counts are incremented after publication, so a callback can run
++ * first: conservation holds at settled points only. After a stop has
++ * returned and before the next start, rx_posted == rx_completed +
++ * rx_canceled and rx_delivered <= rx_completed; the same holds for TX.
++ */
++struct tbstream_counters {
++	u64 sessions;
++	u64 rx_posted;
++	u64 rx_completed;
++	u64 rx_canceled;
++	u64 rx_damaged;
++	u64 rx_delivered;
++	u64 rx_repost_failed;
++	u64 tx_posted;
++	u64 tx_completed;
++	u64 tx_canceled;
++	s64 first_error;
++	u64 first_error_rx;
++};
++
++/* One writer per counter (see struct tbstream_counters): no atomics needed */
++static inline void tbstream_count(u64 *counter, u64 n)
++{
++	WRITE_ONCE(*counter, *counter + n);
++}
++
+ struct tbstream_dev {
+ 	struct config_group group;
+ 	struct tbstream *stream;
+@@ -212,6 +265,7 @@
+ 	bool in_owned;
+ 	bool out_owned;
+ 	bool misc_registered;
++	struct tbstream_counters ctr;
+ 	unsigned int ring_size;
+ 	unsigned int throttling;
+ 	bool busy_poll;
+@@ -762,17 +816,21 @@
+ 	struct tbstream_frame *sf = container_of(frame, typeof(*sf), frame);
+ 	struct tbstream_dev *sdev = sf->sdev;
+ 
+-	if (canceled)
++	if (canceled) {
++		tbstream_count(&sdev->ctr.rx_canceled, 1);
+ 		return;
++	}
+ 
+ 	if (sf->frame.eof == TBSTREAM_CLOSE && tbstream_fault("rx_damage_close"))
+ 		sf->frame.flags |= RING_DESC_CRC_ERROR;
++	tbstream_count(&sdev->ctr.rx_completed, 1);
+ 	sf->completed = true;
+ 	sdev->rx_ring.prod++;
+ 	trace_tb_latency(ring, frame, 9, sf->frame.size);
+ 
+ 	/* read() fails the stream when it reaches this frame */
+ 	if (sf->frame.flags & (RING_DESC_CRC_ERROR | RING_DESC_BUFFER_OVERRUN)) {
++		tbstream_count(&sdev->ctr.rx_damaged, 1);
+ 		pr_warn_ratelimited("%s: RX %s, reads fail from this frame on\n",
+ 				    sdev->misc.name,
+ 				    sf->frame.flags & RING_DESC_CRC_ERROR ?
+@@ -827,10 +885,11 @@
+ {
+ 	struct device *dma_dev = tb_ring_dma_device(sdev->rx_ring.ring);
+ 	struct tbstream_frame *sf;
+-	int index;
++	int index, ret;
+ 
+ 	index = sdev->rx_ring.cons % tb_ring_size(sdev->rx_ring.ring);
+ 	sdev->rx_ring.cons++;
++	tbstream_count(&sdev->ctr.rx_delivered, 1);
+ 
+ 	sf = &sdev->rx_ring.frames[index];
+ 	sf->completed = false;
+@@ -845,9 +904,14 @@
+ 		list_add_tail(&sf->frame.list, batch);
+ 		return 0;
+ 	}
+-	if (tbstream_fault("rx_repost"))
+-		return -ESHUTDOWN;
+-	return tb_ring_rx(sdev->rx_ring.ring, &sf->frame);
++	ret = tbstream_fault("rx_repost") ? -ESHUTDOWN :
++	      tb_ring_rx(sdev->rx_ring.ring, &sf->frame);
++	/* Per frame, CLOSE included; the stream latch is the caller's */
++	if (ret)
++		tbstream_count(&sdev->ctr.rx_repost_failed, 1);
++	else
++		tbstream_count(&sdev->ctr.rx_posted, 1);
++	return ret;
+ }
+ 
+ /*
+@@ -862,6 +926,10 @@
+ 	if (!sdev->rx_failed)
+ 		pr_warn_ratelimited("%s: RX re-post failed (%d), stream failed until close\n",
+ 				    sdev->misc.name, err);
++	if (!sdev->ctr.first_error) {
++		WRITE_ONCE(sdev->ctr.first_error_rx, sdev->ctr.rx_delivered);
++		WRITE_ONCE(sdev->ctr.first_error, err);
++	}
+ 	/* Read locklessly by the reader's wait condition */
+ 	WRITE_ONCE(sdev->rx_failed, true);
+ 	wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLERR);
+@@ -875,12 +943,22 @@
+ static int tbstream_dev_submit_rx_batch(struct tbstream_dev *sdev,
+ 					struct list_head *batch)
+ {
+-	if (!list_empty(batch) && tbstream_fault("rx_repost")) {
++	size_t n = list_count_nodes(batch);
++	int ret;
++
++	if (n && tbstream_fault("rx_repost")) {
+ 		while (!list_empty(batch))
+ 			list_del_init(batch->next);
+-		return -ESHUTDOWN;
+-	}
+-	return tbstream_dev_submit_batch(sdev->rx_ring.ring, batch);
++		ret = -ESHUTDOWN;
++	} else {
++		ret = tbstream_dev_submit_batch(sdev->rx_ring.ring, batch);
++	}
++	/* Per frame: a failed batch of n frames counts n, CLOSE included */
++	if (ret)
++		tbstream_count(&sdev->ctr.rx_repost_failed, n);
++	else
++		tbstream_count(&sdev->ctr.rx_posted, n);
++	return ret;
+ }
+ 
+ static int tbstream_dev_consume_rx(struct tbstream_dev *sdev)
+@@ -966,6 +1044,7 @@
+ 			ret = tb_ring_rx(sdev->rx_ring.ring, &sf->frame);
+ 		if (ret)
+ 			return ret;
++		tbstream_count(&sdev->ctr.rx_posted, 1);
+ 	}
+ 
+ 	return 0;
+@@ -978,9 +1057,12 @@
+ 	struct tbstream_frame *sf = container_of(frame, typeof(*sf), frame);
+ 	struct tbstream_dev *sdev = sf->sdev;
+ 
+-	if (canceled)
++	if (canceled) {
++		tbstream_count(&sdev->ctr.tx_canceled, 1);
+ 		return;
+-
++	}
++
++	tbstream_count(&sdev->ctr.tx_completed, 1);
+ 	sdev->tx_ring.prod++;
+ 	trace_tb_latency(ring, frame, 10, 0);
+ 	if (sf->frame.eof == TBSTREAM_DATA) {
+@@ -1084,6 +1166,8 @@
+ 	if (ret) {
+ 		iov_iter_revert(from, size);
+ 		sdev->tx_ring.cons--;
++	} else {
++		tbstream_count(&sdev->ctr.tx_posted, 1);
+ 	}
+ 	return ret;
+ }
+@@ -1120,6 +1204,7 @@
+ 		sdev->tx_ring.cons -= count;
+ 		return ret;
+ 	}
++	tbstream_count(&sdev->ctr.tx_posted, count);
+ 	return bytes;
+ }
+ 
+@@ -1218,6 +1303,8 @@
+ 	if (ret)
+ 		pr_warn_ratelimited("%s: CLOSE not sent (%d): the peer sees no EOF\n",
+ 				    sdev->misc.name, ret);
++	else
++		tbstream_count(&sdev->ctr.tx_posted, 1);
+ 	return ret;
+ }
+ 
+@@ -1239,6 +1326,9 @@
+ 			   sdev->cfg_spin_us;
+ 	sdev->rx_poll_pending = false;
+ 	sdev->rx_failed = false;
++	tbstream_count(&sdev->ctr.sessions, 1);
++	WRITE_ONCE(sdev->ctr.first_error, 0);
++	WRITE_ONCE(sdev->ctr.first_error_rx, 0);
+ 	ring = tbstream_fault("tx_ring") ? NULL :
+ 	       tb_ring_alloc_tx(xd->tb->nhi, -1, sdev->ring_size, flags);
+ 	if (!ring) {
+@@ -1518,6 +1608,10 @@
+ 		 * before the PDF is trusted: a damaged CLOSE is no EOF.
+ 		 */
+ 		if (tbstream_frame_damaged(sf)) {
++			if (!sdev->ctr.first_error) {
++				WRITE_ONCE(sdev->ctr.first_error_rx, sdev->ctr.rx_delivered);
++				WRITE_ONCE(sdev->ctr.first_error, -EIO);
++			}
+ 			WRITE_ONCE(sdev->rx_failed, true);
+ 			wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLERR);
+ 			if (!nbytes)
+@@ -2227,6 +2321,24 @@
+ }
+ CONFIGFS_ATTR_RO(tbstream_dev_, index);
+ 
++/* Lockless snapshot: every counter is a single-writer u64 (READ_ONCE) */
++static ssize_t tbstream_dev_counters_show(struct config_item *item, char *buf)
++{
++	struct config_group *group = to_config_group(item);
++	struct tbstream_dev *sdev = tbstream_dev_from_group(group);
++	const struct tbstream_counters *c = &sdev->ctr;
++
++	return sysfs_emit(buf,
++			  "sessions %llu\nrx_posted %llu\nrx_completed %llu\nrx_canceled %llu\nrx_damaged %llu\nrx_delivered %llu\nrx_repost_failed %llu\ntx_posted %llu\ntx_completed %llu\ntx_canceled %llu\nfirst_error %lld\nfirst_error_rx %llu\n",
++			  READ_ONCE(c->sessions), READ_ONCE(c->rx_posted),
++			  READ_ONCE(c->rx_completed), READ_ONCE(c->rx_canceled),
++			  READ_ONCE(c->rx_damaged), READ_ONCE(c->rx_delivered),
++			  READ_ONCE(c->rx_repost_failed), READ_ONCE(c->tx_posted),
++			  READ_ONCE(c->tx_completed), READ_ONCE(c->tx_canceled),
++			  READ_ONCE(c->first_error), READ_ONCE(c->first_error_rx));
++}
++CONFIGFS_ATTR_RO(tbstream_dev_, counters);
++
+ static ssize_t tbstream_dev_in_hopid_show(struct config_item *item, char *buf)
+ {
+ 	struct config_group *group = to_config_group(item);
+@@ -2660,6 +2772,7 @@
+ 	&tbstream_dev_attr_in_hopid,
+ 	&tbstream_dev_attr_out_hopid,
+ 	&tbstream_dev_attr_ring_size,
++	&tbstream_dev_attr_counters,
+ 	&tbstream_dev_attr_throttling,
+ 	NULL,
+ };

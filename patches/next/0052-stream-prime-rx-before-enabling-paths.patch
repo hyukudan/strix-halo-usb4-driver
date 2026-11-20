@@ -1,0 +1,170 @@
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -839,10 +839,32 @@
+ 	return tbstream_dev_consume_rx_batch(sdev, NULL);
+ }
+ 
++#ifdef TBSTREAM_FAULT_TEST
++/*
++ * Test builds only (-DTBSTREAM_FAULT_TEST): fail the named step of
++ * tbstream_dev_start() once per open, to walk every error path. Never
++ * compiled into a production module.
++ */
++static char fault_at[32];
++module_param_string(fault_at, fault_at, sizeof(fault_at), 0644);
++MODULE_PARM_DESC(fault_at,
++		 "TEST BUILD ONLY: fail this step of the stream start: tx_ring, tx_buffers, rx_ring, rx_buffers, rx_post, enable_paths");
++
++static int tbstream_fault(const char *step)
++{
++	if (!sysfs_streq(fault_at, step))
++		return 0;
++	pr_info("thunderbolt_stream: fault_at=%s injected\n", step);
++	return -EIO;
++}
++#else
++static inline int tbstream_fault(const char *step) { return 0; }
++#endif
++
+ static int tbstream_dev_alloc_rx_buffers(struct tbstream_dev *sdev)
+ {
+ 	size_t ring_size = tb_ring_size(sdev->rx_ring.ring);
+-	int i;
++	int i, ret;
+ 
+ 	/*
+ 	 * Bookkeeping only (the DMA buffers are separate pages): up to
+@@ -855,8 +877,10 @@
+ 		return -ENOMEM;
+ 
+ 	/*
+-	 * The paths and the ring are up already: a frame can complete as soon
+-	 * as its descriptor is posted, and its callback counts it in prod.
++	 * The ring is running but the DMA paths are not enabled yet: every
++	 * frame is enqueued (the hardware holds ring size - 1 descriptors,
++	 * one waits in software) before the peer can send anything. The
++	 * counters are set first: a callback counts its frame in prod.
+ 	 */
+ 	sdev->rx_ring.cons = 0;
+ 	sdev->rx_ring.prod = 0;
+@@ -887,7 +911,12 @@
+ 		sf->sdev = sdev;
+ 		sf->frame.callback = tbstream_dev_rx_callback;
+ 
+-		tb_ring_rx(sdev->rx_ring.ring, &sf->frame);
++		/* A ring that is not fully primed must not get a path. */
++		ret = tbstream_fault("rx_post");
++		if (!ret)
++			ret = tb_ring_rx(sdev->rx_ring.ring, &sf->frame);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	return 0;
+@@ -1125,14 +1154,17 @@
+ 			   sdev->cfg_spin_us;
+ 	sdev->rx_poll_pending = false;
+ 	sdev->rx_failed = false;
+-	ring = tb_ring_alloc_tx(xd->tb->nhi, -1, sdev->ring_size, flags);
++	ring = tbstream_fault("tx_ring") ? NULL :
++	       tb_ring_alloc_tx(xd->tb->nhi, -1, sdev->ring_size, flags);
+ 	if (!ring) {
+ 		ret = -ENOMEM;
+ 		goto err_report;
+ 	}
+ 	sdev->tx_ring.ring = ring;
+ 
+-	ret = tbstream_dev_alloc_tx_buffers(sdev);
++	ret = tbstream_fault("tx_buffers");
++	if (!ret)
++		ret = tbstream_dev_alloc_tx_buffers(sdev);
+ 	if (ret)
+ 		goto err_free_tx_buffers;
+ 
+@@ -1144,7 +1176,8 @@
+ 	if (sdev->rx_busy_poll)
+ 		flags |= RING_FLAG_NO_INTERRUPT;
+ 
+-	ring = tb_ring_alloc_rx(xd->tb->nhi, -1, sdev->ring_size, flags,
++	ring = tbstream_fault("rx_ring") ? NULL :
++	       tb_ring_alloc_rx(xd->tb->nhi, -1, sdev->ring_size, flags,
+ 				e2e_tx_hop, sof_mask, eof_mask,
+ 				sdev->rx_napi ? tbstream_rx_start_poll : NULL,
+ 				sdev->rx_napi ? sdev : NULL);
+@@ -1154,13 +1187,12 @@
+ 	}
+ 	sdev->rx_ring.ring = ring;
+ 
+-	ret = tb_xdomain_enable_paths(xd, sdev->out_hopid,
+-				     sdev->tx_ring.ring->hop,
+-				     sdev->in_hopid,
+-				     sdev->rx_ring.ring->hop);
+-	if (ret)
+-		goto err_free_rx;
+-
++	/*
++	 * Start both rings and post every RX buffer BEFORE the DMA paths
++	 * exist, as thunderbolt_net does: with the paths up first, the
++	 * peer can send into an RX ring that has no descriptors (no E2E
++	 * credits), and a reopen can stall with zero credits.
++	 */
+ 	tb_ring_throttling(sdev->tx_ring.ring, sdev->throttling);
+ 	tb_ring_throttling(sdev->rx_ring.ring, sdev->throttling);
+ 
+@@ -1168,31 +1200,43 @@
+ 	tb_ring_start(sdev->rx_ring.ring);
+ 	tbstream_dev_irq_affinity(sdev);
+ 
+-	ret = tbstream_dev_alloc_rx_buffers(sdev);
++	ret = tbstream_fault("rx_buffers");
++	if (!ret)
++		ret = tbstream_dev_alloc_rx_buffers(sdev);
++	if (ret)
++		goto err_stop;
++
++	/*
++	 * Last. A failed software-CM approval rolls its tunnel back and
++	 * xd->ntunnels counts only successes, so the error path must not
++	 * disable paths (that could undercount or tear down another tunnel).
++	 * A failed ICM request (e.g. a timeout) does not prove that firmware
++	 * built nothing; that was already so before this ordering.
++	 */
++	ret = tbstream_fault("enable_paths");
++	if (!ret)
++		ret = tb_xdomain_enable_paths(xd, sdev->out_hopid,
++					      sdev->tx_ring.ring->hop,
++					      sdev->in_hopid,
++					      sdev->rx_ring.ring->hop);
+ 	if (ret)
+ 		goto err_stop;
+ 	tbstream_qos_acquire(sdev, &sdev->qos);
+ 	return 0;
+ 
+ err_stop:
++	/* The paths were never enabled here: nothing to disable. */
+ 	if (sdev->rx_napi)
+ 		tb_ring_poll_complete(sdev->rx_ring.ring);
+ 	tb_ring_stop(sdev->rx_ring.ring);
+ 	tb_ring_stop(sdev->tx_ring.ring);
++	tbstream_dev_irq_affinity_restore(sdev);
+ 	/*
+-	 * The DMA tunnel is up at this point. Leaving it behind keeps its
+-	 * NHI ring hops and HopIDs reserved in the connection manager, so
+-	 * every later open would fail to build its own tunnel (-ENOMEM,
+-	 * with no log) until the module is reloaded.
++	 * Posted RX buffers were canceled by the stop: unmap and free them
++	 * (also a partially populated array, and frames mapped but not
++	 * posted).
+ 	 */
+-	tb_xdomain_disable_paths(xd, sdev->out_hopid,
+-				 sdev->tx_ring.ring->hop,
+-				 sdev->in_hopid,
+-				 sdev->rx_ring.ring->hop);
+-	tbstream_dev_irq_affinity_restore(sdev);
+-	/* Posted RX buffers were canceled by the stop: unmap and free them. */
+ 	tbstream_ring_free(&sdev->rx_ring);
+-err_free_rx:
+ 	tb_ring_free(sdev->rx_ring.ring);
+ 	sdev->rx_ring.ring = NULL;
+ err_free_tx_buffers:

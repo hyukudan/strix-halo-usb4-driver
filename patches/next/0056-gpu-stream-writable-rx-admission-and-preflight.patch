@@ -1,0 +1,171 @@
+Subject: [PATCH next 0056] thunderbolt: gpu_stream: writable-RX admission and a no-traffic PREFLIGHT
+
+An RX import maps a DMA-BUF that the controller then writes, but the
+import did not check that the exporter granted write access: a DMA-BUF
+file opened read-only was accepted. Refuse it with EACCES in the shared
+window mapper, so IMPORT and the new PREFLIGHT apply the same rule. KFD
+exports a writable allocation O_RDWR, so ordinary engine buffers pass.
+
+Add SGU_IOC_PREFLIGHT: it maps one buffer through exactly the validator
+IMPORT uses (identity, size, write access for RX, SG coverage, frame
+containment, DMA mask, TX/RX aliasing), reports aggregate geometry only
+(SG entries, mapped bytes, min/max segment, ring frames) and releases the
+mapping before returning. It changes no ring, descriptor, path or import
+state and is refused once the context is armed or started. Advertised as
+SGU_CAP_PREFLIGHT through SGU_IOC_QUEUE; abi_minor stays 0 (additive,
+like the terminal header).
+
+---
+--- a/drivers/thunderbolt/gpu_stream.c
++++ b/drivers/thunderbolt/gpu_stream.c
+@@ -660,6 +660,13 @@
+     if (w->buffer->size != b->full_bytes || huge_encode_dev(inode->i_sb->s_dev) != b->fd_device ||
+         inode->i_ino != b->fd_inode)
+         goto fail;
++    /* The controller writes RX payloads: the exporter must have granted write
++     * access (a DMA-BUF file opened for writing, e.g. KFD exports a writable
++     * allocation O_RDWR). */
++    if (direction == SGU_DIRECTION_RX && !(w->buffer->file->f_mode & FMODE_WRITE)) {
++        ret = -EACCES;
++        goto fail;
++    }
+     if (direction == SGU_DIRECTION_RX && ctx->windows[SGU_DIRECTION_TX].buffer &&
+         (w->buffer == ctx->windows[SGU_DIRECTION_TX].buffer ||
+          w->buffer->resv == ctx->windows[SGU_DIRECTION_TX].buffer->resv))
+@@ -1424,6 +1431,43 @@
+     }
+ }
+ 
++/* Aggregate DMA geometry of a mapped window (PREFLIGHT, test-build IMPORT log) */
++static void sgu_window_geometry(const struct sgu_window *w, struct sgu_preflight *g)
++{
++    struct scatterlist *sg;
++    u32 i;
++
++    g->sg_entries = w->mapping->nents;
++    g->mapped_bytes = 0;
++    g->min_segment_bytes = U64_MAX;
++    g->max_segment_bytes = 0;
++    for_each_sg(w->mapping->sgl, sg, w->mapping->nents, i) {
++        u64 bytes = sg_dma_len(sg);
++
++        g->mapped_bytes += bytes;
++        g->min_segment_bytes = min(g->min_segment_bytes, bytes);
++        g->max_segment_bytes = max(g->max_segment_bytes, bytes);
++    }
++}
++
++#ifdef TBSTREAM_FAULT_TEST
++/* Test builds: the committed import's geometry, to compare with PREFLIGHT */
++static void sgu_log_import_geometry(struct tbstream_gpu_context *ctx)
++{
++    struct sgu_preflight geometry;
++    u32 d;
++
++    for (d = SGU_DIRECTION_TX; d <= SGU_DIRECTION_RX; ++d) {
++        sgu_window_geometry(&ctx->windows[d], &geometry);
++        pr_info("%s: TEST BUILD import %s geometry: sg_entries %u mapped_bytes %llu min %llu max %llu\n",
++                ctx->sdev->misc.name, d == SGU_DIRECTION_TX ? "tx" : "rx", geometry.sg_entries,
++                geometry.mapped_bytes, geometry.min_segment_bytes, geometry.max_segment_bytes);
++    }
++}
++#else
++static inline void sgu_log_import_geometry(struct tbstream_gpu_context *ctx) { }
++#endif
++
+ static int sgu_import_windows(struct tbstream_gpu_context *ctx, struct sgu_import *request)
+ {
+     int ret;
+@@ -1463,6 +1507,7 @@
+     ctx->identity.import_generation = ++ctx->import_counter;
+     request->fence = ctx->identity;
+     ctx->imported = true;
++    sgu_log_import_geometry(ctx);
+     WRITE_ONCE(ctx->stopped, false);
+     return 0;
+ free_rx:
+@@ -2263,7 +2308,7 @@
+     q.maximum_depth = SGU_MAX_QUEUE_DEPTH;
+     q.features = SGU_CAP_MULTI_OP | SGU_CAP_NONBLOCK_SUBMIT | SGU_CAP_SYNC_FILE |
+                  SGU_CAP_SESSION_RECOVERY | SGU_CAP_DMA_TIMEOUT | SGU_CAP_STATS | SGU_CAP_IDLE_RESET | SGU_CAP_GROUP_RESET |
+-                 SGU_CAP_TERMINAL_HEADER;
++                 SGU_CAP_TERMINAL_HEADER | SGU_CAP_PREFLIGHT;
+     if (copy_to_user(user, &q, sizeof(q)))
+         return -EFAULT;
+     spin_lock_irqsave(&ctx->lock, flags);
+@@ -2347,6 +2392,35 @@
+ 
+ #include "gpu_group_reset.h"
+ 
++/* PREFLIGHT: one buffer through IMPORT's own mapper/validator, aggregate
++ * geometry out, mapping released before returning. Under sdev->lock. */
++static int sgu_preflight(struct tbstream_dev *sdev, struct tbstream_gpu_context *ctx,
++                         void __user *user)
++{
++    struct sgu_preflight request;
++    struct sgu_window w = {};
++    int ret;
++
++    if (copy_from_user(&request, user, sizeof(request)))
++        return -EFAULT;
++    if (request.fence.abi_major != SGU_ABI_MAJOR || request.fence.abi_minor != SGU_ABI_MINOR ||
++        request.direction > SGU_DIRECTION_RX || request.sg_entries || request.mapped_bytes ||
++        request.min_segment_bytes || request.max_segment_bytes || request.frames ||
++        request.reserved)
++        return -EINVAL;
++    if (tbstream_dev_valid(sdev))
++        return -ENXIO;
++    if (ctx->armed || ctx->started || READ_ONCE(ctx->failed))
++        return -EBUSY;
++    ret = sgu_window_map(ctx, &w, &request.buffer, request.direction);
++    if (ret)
++        return ret;
++    sgu_window_geometry(&w, &request);
++    request.frames = sdev->ring_size;
++    sgu_window_free(&w);
++    return copy_to_user(user, &request, sizeof(request)) ? -EFAULT : 0;
++}
++
+ static long tbstream_gpu_ioctl(struct file *file, unsigned int command, unsigned long argument)
+ {
+     struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
+@@ -2414,6 +2488,8 @@
+             WRITE_ONCE(ctx->failed, true); /* retained mapping/generation despite lost reply */
+             ret = -EFAULT;
+         }
++    } else if (command == SGU_IOC_PREFLIGHT) {
++        ret = sgu_preflight(sdev, ctx, user);
+     } else if (command == SGU_IOC_PREPARE) {
+         struct sgu_prepare request;
+ 
+--- a/include/uapi/linux/strix_gpu_stream.h
++++ b/include/uapi/linux/strix_gpu_stream.h
+@@ -298,6 +298,28 @@
+     struct sgu_reset_member members[SGU_MAX_RESET_MEMBERS];
+ };
+ #define SGU_IOC_RESET_GROUP _IOWR(0xb7, 0x51, struct sgu_reset_group)
++
++/* PREFLIGHT (optional, additive): maps one buffer through exactly the validator
++ * IMPORT uses (identity, size, write access for RX, SG coverage, frame
++ * containment, DMA mask, TX/RX aliasing) and reports aggregate geometry only,
++ * then releases the mapping. It changes no ring, descriptor, path or import
++ * state, and is refused (EBUSY) once the context is armed or started. Input:
++ * fence ABI major/minor, buffer, direction; every output field zero.
++ * Discovery: SGU_IOC_QUEUE reports SGU_CAP_PREFLIGHT. */
++#define SGU_CAP_PREFLIGHT 512U
++struct sgu_preflight {
++    struct sgu_fence fence;
++    struct sgu_buffer buffer;
++    __u32 direction;
++    __u32 sg_entries;
++    __aligned_u64 mapped_bytes;
++    __aligned_u64 min_segment_bytes;
++    __aligned_u64 max_segment_bytes;
++    __u32 frames;
++    __u32 reserved;
++};
++
++#define SGU_IOC_PREFLIGHT _IOWR(0xb7, 0x52, struct sgu_preflight)
+ 
+ /* Kernel-validated terminal frame (optional, additive extension).
+  *
