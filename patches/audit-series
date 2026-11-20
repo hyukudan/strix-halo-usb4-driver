@@ -45,3 +45,4 @@
 0046-host-completion-latency-tracepoints.patch
 0047-host-rx-only-polled-completion.patch
 0048-host-opt-in-descriptor-batching.patch
+0049-xdomain-property-chunk-length.patch

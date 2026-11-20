@@ -30,7 +30,7 @@ instead of continuing and reporting success on a partially patched tree.
 Apply all series entries, not just 0001. Do not reapply anything from
 `provenance/reference-patches/`: that change is already in 0001.
 
-`patches/series` (0001–0048) is the stable driver. The experimental patches in
+`patches/series` (0001–0049) is the stable driver. The experimental patches in
 `patches/experimental/` (0049–0051) are applied on top only with
 `tools/apply-series.sh --with-experimental` (or
 `tools/prepare_overlay.py --experimental`); 0049 changes the core module, so it
